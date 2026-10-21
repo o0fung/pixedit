@@ -1,0 +1,137 @@
+/* PixEdit — dark editor chrome. Values are intentional, not a generic purple theme. */
+
+QMainWindow, QDialog, QWidget {
+    background: #16191e;
+    color: #e7edf2;
+    font-size: 13px;
+}
+
+QMenuBar {
+    background: #12151a;
+    color: #d5dee6;
+    border-bottom: 1px solid #2a313a;
+    padding: 2px;
+}
+
+QMenuBar::item:selected, QMenu::item:selected {
+    background: #243846;
+    color: #f4fbff;
+}
+
+QMenu {
+    background: #1c2128;
+    color: #e7edf2;
+    border: 1px solid #313a46;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 22px;
+}
+
+QStatusBar {
+    background: #101318;
+    color: #9aabba;
+    border-top: 1px solid #2a313a;
+}
+
+QToolButton, QPushButton {
+    background: #232a33;
+    color: #e7edf2;
+    border: 1px solid #343e4a;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+
+QToolButton:hover, QPushButton:hover {
+    background: #2c3642;
+    border-color: #3ec6ff;
+}
+
+QToolButton:checked {
+    background: #143544;
+    color: #d8f6ff;
+    border: 1px solid #3ec6ff;
+}
+
+QToolButton:disabled, QPushButton:disabled {
+    color: #66727f;
+    background: #1b2128;
+}
+
+QListWidget {
+    background: #12161b;
+    border: 1px solid #2c343e;
+    border-radius: 6px;
+    outline: none;
+}
+
+QListWidget::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+}
+
+QListWidget::item:selected {
+    background: #1d4254;
+    color: #f3fbff;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #2c3642;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    width: 14px;
+    margin: -6px 0;
+    background: #3ec6ff;
+    border-radius: 7px;
+}
+
+QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QPlainTextEdit {
+    background: #10141a;
+    color: #e7edf2;
+    border: 1px solid #343e4a;
+    border-radius: 6px;
+    padding: 4px 6px;
+    selection-background-color: #1d4254;
+}
+
+QComboBox QAbstractItemView {
+    background: #1c2128;
+    color: #e7edf2;
+    selection-background-color: #1d4254;
+}
+
+QCheckBox {
+    spacing: 8px;
+}
+
+QScrollArea {
+    border: none;
+    background: transparent;
+}
+
+QSplitter::handle {
+    background: #2a313a;
+}
+
+QLabel#hint {
+    color: #93a4b3;
+}
+
+QLabel#section {
+    color: #8fdfff;
+    font-weight: 600;
+}
+
+QFrame#panel {
+    background: #1a1f26;
+    border-right: 1px solid #2a313a;
+}
+
+QFrame#layers {
+    background: #1a1f26;
+    border-left: 1px solid #2a313a;
+}
