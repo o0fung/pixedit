@@ -61,7 +61,7 @@ A redaction in a project stays a mask. The source layer's pixels in the file are
 | `Ctrl+Shift+E` | Merge down |
 | `Ctrl+0` `Ctrl+1` `Ctrl++` `Ctrl+-` | Fit, 100%, zoom in, zoom out |
 
-Help → Keyboard shortcuts lists these inside the app.
+Help → Keyboard shortcuts lists these inside the app. The left toolbar shows the same letter on each tool button, for example Brush (B). Marker is an example plugin and has no shortcut.
 
 ## Plugins
 
