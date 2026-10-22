@@ -60,8 +60,9 @@ class Tool:
     def pointer_up(self, session, event: PointerEvent) -> None:
         return None
 
-    def pointer_cancel(self, session) -> None:
-        return None
+    def pointer_cancel(self, session) -> bool:
+        """Cancel an in-progress gesture. True means a drag was actually cancelled."""
+        return False
 
     def overlays(self, session) -> list[Overlay]:
         return []

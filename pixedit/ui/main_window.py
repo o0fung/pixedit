@@ -19,8 +19,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSplitter,
     QStatusBar,
+    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -44,10 +46,18 @@ from pixedit.ui.dialogs import (
     ShortcutsDialog,
     TextDialog,
 )
-from pixedit.ui.icons import icon_for_tool
+from pixedit.ui.icons import icon_for_tool, icon_named
 from pixedit.ui.panels import LayerPanel, ToolOptions
 
 _OPEN_FILTER = "Images and projects (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf *.pix);;All files (*)"
+_PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf);;All files (*)"
+
+# Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
+_TOOL_GROUPS = (
+    ("move", "hand", "zoom", "select", "eyedropper"),
+    ("brush", "eraser", "fill", "shape", "text"),
+    ("crop", "redact"),
+)
 
 
 class MainWindow(QMainWindow):
@@ -87,6 +97,15 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel()
         self._status_label.setObjectName("statusInfo")
         status.addWidget(self._status_label, 1)
+        # File actions sit in their own strip. The left column stays the
+        # canvas tools (Move, Brush, and the rest), grouped separately.
+        self.file_toolbar = QToolBar("File")
+        self.file_toolbar.setObjectName("fileToolbar")
+        self.file_toolbar.setMovable(False)
+        self.file_toolbar.setFloatable(False)
+        self.file_toolbar.setIconSize(QSize(18, 18))
+        self.file_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.file_toolbar)
         shell = QWidget()
         self.setCentralWidget(shell)
         row = QHBoxLayout(shell)
@@ -105,10 +124,22 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.tool_host)
         self.swatch = QPushButton("Foreground")
         self.swatch.clicked.connect(self._choose_color)
+        self.swatch.setToolTip("Foreground color. Opacity applies to the brush, shapes, and fill.")
         left_layout.addWidget(self.swatch)
+        opacity_row = QWidget()
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 4, 0, 0)
+        self.opacity_label = QLabel("Opacity")
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setToolTip("Opacity of the foreground color. Brush, shape, and fill use it.")
+        self.opacity_slider.valueChanged.connect(self._set_foreground_opacity)
+        opacity_layout.addWidget(self.opacity_label)
+        opacity_layout.addWidget(self.opacity_slider, 1)
+        left_layout.addWidget(opacity_row)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.options = ToolOptions(self.session)
+        self.options = ToolOptions(self.session, self._on_tool_option)
         scroll.setWidget(self.options)
         left_layout.addWidget(scroll, 1)
 
@@ -144,25 +175,44 @@ class MainWindow(QMainWindow):
         for button in list(self._buttons.values()):
             self._button_group.removeButton(button)
         self._buttons.clear()
-        for tool in self.tools:
-            button = QToolButton()
-            caption = tool.button_caption()
-            button.setText(caption)
-            button.setIcon(icon_for_tool(tool.id))
-            button.setIconSize(QSize(18, 18))
-            button.setCheckable(True)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.setAccessibleName(caption)
-            button.setToolTip(f"{caption}\n{tool.hint}" if tool.hint else caption)
-            button.clicked.connect(lambda _checked=False, chosen=tool: self.set_tool(chosen))
-            self._button_group.addButton(button)
-            self.tool_layout.addWidget(button)
-            self._buttons[tool.id] = button
+        # Move/Hand/Zoom/Select/Eyedrop, then paint tools, then crop and
+        # redaction, then Marker and any other plugins. A line separates groups.
+        grouped: list[list[Tool]] = []
+        placed: set[str] = set()
+        for ids in _TOOL_GROUPS:
+            group = [self.tool_by_id[tool_id] for tool_id in ids if tool_id in self.tool_by_id]
+            if group:
+                grouped.append(group)
+                placed.update(tool.id for tool in group)
+        extras = [tool for tool in self.tools if tool.id not in placed]
+        if extras:
+            grouped.append(extras)
+        for index, group in enumerate(grouped):
+            if index:
+                self.tool_layout.addWidget(_tool_separator())
+            for tool in group:
+                button = QToolButton()
+                caption = tool.button_caption()
+                button.setText(caption)
+                button.setIcon(icon_for_tool(tool.id))
+                button.setIconSize(QSize(18, 18))
+                button.setCheckable(True)
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                button.setAccessibleName(caption)
+                button.setToolTip(f"{caption}\n{tool.hint}" if tool.hint else caption)
+                button.clicked.connect(lambda _checked=False, chosen=tool: self.set_tool(chosen))
+                self._button_group.addButton(button)
+                self.tool_layout.addWidget(button)
+                self._buttons[tool.id] = button
         self.tool_layout.addStretch(1)
         self.set_tool(self.tool_by_id.get(current_id, self.tools[0]))
 
     def _build_menus(self) -> None:
+        # Drop the old action objects before building new ones. The file
+        # strip holds the same objects as the File menu, so clear it first.
+        if hasattr(self, "file_toolbar"):
+            self.file_toolbar.clear()
         for action in self._owned_actions:
             action.setShortcut(QKeySequence())
             action.deleteLater()
@@ -180,18 +230,63 @@ class MainWindow(QMainWindow):
         help_menu = bar.addMenu("Help")
 
         self._action(file_menu, "New…", self._new, QKeySequence.StandardKey.New)
-        self._action(file_menu, "Open…", self._open, QKeySequence.StandardKey.Open)
+        self._open_action = self._file_action(
+            file_menu,
+            "Open…",
+            "Open",
+            self._open,
+            QKeySequence.StandardKey.Open,
+            "open",
+            "Open a file and replace the current document",
+        )
+        self._place_action = self._file_action(
+            file_menu,
+            "Place…",
+            "Place",
+            self._place,
+            QKeySequence("Ctrl+Shift+O"),
+            "place",
+            "Place an image as new layers on the current document",
+        )
         file_menu.addSeparator()
-        self._action(file_menu, "Save project", self._save, QKeySequence.StandardKey.Save)
+        self._save_action = self._file_action(
+            file_menu,
+            "Save project",
+            "Save",
+            self._save,
+            QKeySequence.StandardKey.Save,
+            "save",
+            "Save the project to its .pix file",
+        )
         self._action(file_menu, "Save project as…", self._save_as, QKeySequence("Ctrl+Shift+S"))
-        self._action(file_menu, "Export flattened…", self._export, QKeySequence("Ctrl+E"))
+        self._export_action = self._file_action(
+            file_menu,
+            "Export flattened…",
+            "Export",
+            self._export,
+            QKeySequence("Ctrl+E"),
+            "export",
+            "Export a flattened PNG, JPEG, or WebP",
+        )
         file_menu.addSeparator()
         self._action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
+        self._populate_file_toolbar()
 
         self.undo_action = self._action(edit_menu, "Undo", self.session.undo, QKeySequence.StandardKey.Undo)
         self.redo_action = self._action(edit_menu, "Redo", self.session.redo, QKeySequence.StandardKey.Redo)
         edit_menu.addSeparator()
-        self._action(edit_menu, "Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
+        # One action shared by Edit, Select, and Layer so Ctrl+X / Ctrl+C fire once.
+        # Line edits accept the shortcut override and still cut or copy text.
+        self._cut_action = self._make_action(
+            "Cut selection to new layer", self.session.cut_selection_to_layer, QKeySequence("Ctrl+X")
+        )
+        self._copy_action = self._make_action(
+            "Copy selection to new layer", self.session.copy_selection_to_layer, QKeySequence("Ctrl+C")
+        )
+        self._deselect_action = self._make_action("Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
+        edit_menu.addAction(self._cut_action)
+        edit_menu.addAction(self._copy_action)
+        edit_menu.addAction(self._deselect_action)
         # WidgetShortcut displays Delete in the menu. It only fires when the
         # window itself has focus, so a line edit still receives the key.
         # Canvas and this window handle Delete while the user is editing.
@@ -237,9 +332,13 @@ class MainWindow(QMainWindow):
         self._action(image_menu, "Invert", lambda: self.session.run_filter("Invert", invert))
 
         self._action(layer_menu, "New layer", self.session.add_blank_layer, QKeySequence("Ctrl+Shift+N"))
+        self._action(layer_menu, "Place image…", self._place)
         self._action(layer_menu, "Duplicate", self.session.duplicate_active, QKeySequence("Ctrl+J"))
         self._action(layer_menu, "Delete", self.session.delete_active)
         self._action(layer_menu, "Rename…", self._rename_layer)
+        layer_menu.addSeparator()
+        layer_menu.addAction(self._cut_action)
+        layer_menu.addAction(self._copy_action)
         layer_menu.addSeparator()
         self._action(layer_menu, "Merge down", self.session.merge_down_active, QKeySequence("Ctrl+Shift+E"))
         self._action(layer_menu, "Flatten image", self.session.flatten)
@@ -253,8 +352,11 @@ class MainWindow(QMainWindow):
         self._action(layer_menu, "Flip vertical", lambda: self.session.transform_active("flip-v"))
 
         self._action(select_menu, "All", self.session.select_all, QKeySequence.StandardKey.SelectAll)
-        self._action(select_menu, "Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
+        select_menu.addAction(self._deselect_action)
         self._action(select_menu, "Invert", self.session.invert_selection, QKeySequence("Ctrl+Shift+I"))
+        select_menu.addSeparator()
+        select_menu.addAction(self._cut_action)
+        select_menu.addAction(self._copy_action)
         select_menu.addSeparator()
         self._action(select_menu, "Rectangular", lambda: self._select_mode("rect"))
         self._action(select_menu, "Elliptical", lambda: self._select_mode("ellipse"))
@@ -305,13 +407,38 @@ class MainWindow(QMainWindow):
         self._action(help_menu, "Keyboard shortcuts", lambda: ShortcutsDialog(self).exec())
         self._action(help_menu, "About PixEdit", self._about)
 
-    def _action(self, menu, label: str, slot, shortcut=None) -> QAction:
+    def _file_action(self, menu, label: str, short_label: str, slot, shortcut, icon_name: str, summary: str) -> QAction:
+        """A File-menu action that also appears on the file toolbar.
+
+        ``short_label`` is the button caption. The menu keeps ``label``.
+        The tooltip includes the shortcut so the strip matches the menu.
+        """
+        action = self._action(menu, label, slot, shortcut)
+        action.setIconText(short_label)
+        action.setIcon(icon_named(icon_name))
+        keys = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        action.setToolTip(f"{summary} ({keys})" if keys else summary)
+        action.setStatusTip(action.toolTip())
+        return action
+
+    def _populate_file_toolbar(self) -> None:
+        # Save, Open, Place, Export — the same QAction objects as File, so
+        # each shortcut fires once and the button runs that menu handler.
+        self.file_toolbar.clear()
+        for action in (self._save_action, self._open_action, self._place_action, self._export_action):
+            self.file_toolbar.addAction(action)
+
+    def _make_action(self, label: str, slot, shortcut=None) -> QAction:
         action = QAction(label, self)
         if shortcut is not None:
             action.setShortcut(shortcut)
         action.triggered.connect(lambda _checked=False: slot())
-        menu.addAction(action)
         self._owned_actions.append(action)
+        return action
+
+    def _action(self, menu, label: str, slot, shortcut=None) -> QAction:
+        action = self._make_action(label, slot, shortcut)
+        menu.addAction(action)
         return action
 
     def _install_shortcuts(self) -> None:
@@ -376,12 +503,29 @@ class MainWindow(QMainWindow):
         mark = " •" if self.session.dirty else ""
         self.setWindowTitle(f"PixEdit — {name}{mark}")
 
-    def _update_swatch(self) -> None:
+    def _update_swatch(self, *, sync_slider: bool = True) -> None:
         r, g, b, a = self.session.foreground
-        self.swatch.setText(f"  #{r:02X}{g:02X}{b:02X}")
+        percent = int(round(a * 100 / 255))
+        self.swatch.setText(f"  #{r:02X}{g:02X}{b:02X}  {percent}%")
         self.swatch.setStyleSheet(
             f"background: rgba({r}, {g}, {b}, {a}); color: {'#111' if r + g + b > 380 else '#fff'}; text-align: left;"
         )
+        if hasattr(self, "opacity_label"):
+            self.opacity_label.setText(f"Opacity  {percent}%")
+        if sync_slider and hasattr(self, "opacity_slider"):
+            self.opacity_slider.blockSignals(True)
+            self.opacity_slider.setValue(percent)
+            self.opacity_slider.blockSignals(False)
+
+    def _set_foreground_opacity(self, percent: int) -> None:
+        red, green, blue, _alpha = self.session.foreground
+        alpha = int(round(int(percent) * 255 / 100))
+        self.session.foreground = (red, green, blue, alpha)
+        self._update_swatch(sync_slider=False)
+
+    def _on_tool_option(self, key: str, _value: int) -> None:
+        if key == "brush_size":
+            self.canvas.refresh_tool_cursor()
 
     def _update_status(self) -> None:
         doc = self.session.document
@@ -445,6 +589,24 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open", "", _OPEN_FILTER)
         if path:
             self.open_path(path)
+
+    def _place(self) -> None:
+        """Add an image as new layers. The open document stays in place."""
+        path, _ = QFileDialog.getOpenFileName(self, "Place image", "", _PLACE_FILTER)
+        if not path:
+            return
+        pdf_scale = 2.0
+        if Path(path).suffix.lower() == ".pdf":
+            dialog = PdfImportDialog(self)
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+            pdf_scale = dialog.scale()
+        try:
+            incoming = load_path(path, pdf_scale=pdf_scale)
+        except Exception as exc:
+            QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
+            return
+        self.session.place_layers(incoming.layers)
 
     def open_path(self, path: str) -> None:
         pdf_scale = 2.0
@@ -584,6 +746,7 @@ class MainWindow(QMainWindow):
         size = max(1, min(400, size))
         self.session.options["brush_size"] = size
         self.options.sync("brush_size", size)
+        self.canvas.refresh_tool_cursor()
         self._toast(f"Brush size {size}")
 
     def _about(self) -> None:
@@ -600,6 +763,13 @@ class MainWindow(QMainWindow):
             self.session.clear_selection_contents()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
+            tool = self.current
+            busy = bool(tool.pointer_cancel(self.session)) if tool is not None else False
+            if not busy and self.session.document.selection is not None:
+                self.session.deselect()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
@@ -607,6 +777,14 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+
+def _tool_separator() -> QFrame:
+    line = QFrame()
+    line.setObjectName("toolSeparator")
+    line.setFixedHeight(1)
+    line.setAccessibleName("Tool group separator")
+    return line
 
 
 def _app_icon() -> QIcon:

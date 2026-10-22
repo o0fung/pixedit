@@ -16,15 +16,23 @@ pix
 
 **Open.** PNG, JPEG, WebP, TIFF, BMP, and GIF. Multi-frame GIF and TIFF become one layer per frame; only the first frame is visible. Multi-page PDF is rendered with pypdfium2 (File → Open, then pick 72, 144, or 216 DPI). Each page is a layer.
 
+**File toolbar.** A strip under the menu bar has Save, Open, Place, and Export. They run the same actions as the File menu. Save (`Ctrl+S`) writes the `.pix` project, asking for a path the first time. Open (`Ctrl+O`) replaces the current document. Place (`Ctrl+Shift+O`) adds an image as new layers and keeps the document. Export (`Ctrl+E`) writes a flattened PNG, JPEG, or WebP.
+
 **Text.** The Text tool (`T`) asks for the string, font, size, color, and rotation. Click an existing text layer to edit it. Scaling and rotating a text layer keep it editable. Flipping rasterizes it.
 
-**Brush and eraser.** Size, hardness, and opacity. The eraser lowers alpha, or lifts a redaction mask when a redaction layer is active. `[` and `]` change the brush size. A stroke on a new or smaller layer grows a tight RGBA bitmap around the opaque pixels and places it with the layer's `(x, y)`. It is not expanded to a full-canvas transparent sheet. Brushing past that layer's edge grows the bitmap. The background, an imported full-canvas image, and a flattened image keep their size.
+**Brush and eraser.** Size, hardness, and opacity. A fast drag is filled in along the path, so the stroke stays continuous. The pointer is a circle the size of the brush (the eraser uses the same circle). `[` and `]` change the size and the circle updates. The eraser clears pixels on the active raster layer (color and alpha), or lifts a redaction mask when a redaction layer is active. A selection clips it, the same way it clips the brush. A stroke on a new or smaller layer grows a tight RGBA bitmap around the opaque pixels and places it with the layer's `(x, y)`. It is not expanded to a full-canvas transparent sheet. Brushing past that layer's edge grows the bitmap. The background, an imported full-canvas image, and a flattened image keep their size.
 
-**Fill.** Fill (`G`) flood-fills 4-connected pixels on the active layer. Each RGBA channel of a filled pixel is within the tolerance of the pixel you click. Text is rasterized first, the same way the brush does it. A selection limits the fill to that intersection. Clicking outside the layer or the selection reports that in the status bar.
+**Color.** The foreground swatch sits under the tools. Its Opacity slider sets the alpha used by the brush, by shape fill and stroke, and by the fill tool. The brush tool's own Opacity slider multiplies with that.
+
+**Fill.** Fill (`G`) flood-fills 4-connected pixels on the active layer. Each RGBA channel of a filled pixel is within the tolerance of the pixel you click. The fill also covers the soft inner edge of a brush stroke, so a closed outline does not keep a rim of the old background. Text is rasterized first, the same way the brush does it. A selection limits the fill to that intersection. Clicking outside the layer or the selection reports that in the status bar.
+
+**Shapes.** Shape (`U`) drags a rectangle, ellipse, or line. While the mouse is down, the canvas shows the shape that will be committed, including fill, stroke width, color, and opacity.
 
 **Privacy redaction.** Draw a rectangle, ellipse, or freehand region (`R`). The effect is Gaussian blur or a pixelate/mosaic, stored as a mask layer. The pixels underneath are not rewritten. The effect is applied while compositing, so you can hide the layer, change its opacity, or delete it and the original image comes back. Export and Flatten bake the effect.
 
-**Layers.** New, rename (double-click the name), reorder, show/hide, opacity, and blend modes: Normal, Multiply, Screen, Overlay. Duplicate, delete, merge down, and flatten. Merge down bakes the upper layer into the one beneath it, including a redaction mask, as one undo step. New layers start empty and content-sized. Redaction masks stay document-sized, which keeps blur and pixelate aligned with the canvas.
+**Layers.** New, rename (double-click the name), reorder, show/hide, opacity, and blend modes: Normal, Multiply, Screen, Overlay. Duplicate, delete, merge down, and flatten. Merge down bakes the upper layer into the one beneath it, including a redaction mask, as one undo step. New layers start empty and content-sized. Redaction masks stay document-sized, which keeps blur and pixelate aligned with the canvas. File → Place… or Layer → Place image… (`Ctrl+Shift+O`) adds a PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF as new layers centered on the current document. The open document is not replaced. Undo removes the placed layers.
+
+**Selection.** After you draw a selection, the status bar lists what you can do next. Edit, Select, and Layer all have Cut selection to new layer (`Ctrl+X`) and Copy selection to new layer (`Ctrl+C`). Delete or Edit → Clear selection contents clears the pixels. Select → Deselect, Edit → Deselect, `Ctrl+D`, and Esc (when you are not mid-drag) clear the selection. The toolbar groups Move, Hand, Zoom, Select, and Eyedrop together, then the paint tools, then Crop and Redact, then Marker and other plugins.
 
 **Transforms.** Move (`V`) drags the active layer. Corner handles scale it (Shift locks aspect) and the handle above the box rotates it. Layer menu: scale, rotate, flip horizontal, flip vertical. Image menu: rotate or flip the whole canvas, crop to the selection, and trim transparent edges. The Crop tool (`C`) crops the canvas when you release.
 
@@ -55,8 +63,10 @@ A redaction in a project stays a mask. The source layer's pixels in the file are
 | `Ctrl+S` `Ctrl+Shift+S` | Save project, save as |
 | `Ctrl+E` | Export flattened |
 | `Ctrl+Z` `Ctrl+Y` | Undo, redo |
-| `Ctrl+A` `Ctrl+D` `Ctrl+Shift+I` | Select all, deselect, invert selection |
+| `Ctrl+A` `Ctrl+D` `Esc` `Ctrl+Shift+I` | Select all, deselect (`Ctrl+D` or `Esc`), invert selection |
+| `Ctrl+X` `Ctrl+C` | Cut or copy the selection onto a new layer |
 | `Delete` `Backspace` | Clear pixels inside the selection |
+| `Ctrl+Shift+O` | Place an image as new layers |
 | `Ctrl+J` `Ctrl+Shift+N` | Duplicate layer, new layer |
 | `Ctrl+Shift+E` | Merge down |
 | `Ctrl+0` `Ctrl+1` `Ctrl++` `Ctrl+-` | Fit, 100%, zoom in, zoom out |

@@ -145,3 +145,27 @@ QFrame#layers {
     background: #1a1f26;
     border-left: 1px solid #2a313a;
 }
+
+QFrame#toolSeparator {
+    background: #2c3844;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+    margin: 6px 8px;
+}
+
+QToolBar#fileToolbar {
+    background: #12151a;
+    border: none;
+    border-bottom: 1px solid #2a313a;
+    spacing: 6px;
+    padding: 4px 8px;
+}
+
+QToolBar#fileToolbar QToolButton {
+    background: #232a33;
+    color: #e7edf2;
+    border: 1px solid #343e4a;
+    border-radius: 6px;
+    padding: 4px 10px;
+}

@@ -12,9 +12,12 @@ _ICONS = Path(__file__).resolve().parents[1] / "resources" / "icons"
 _ALIASES = {"example.marker": "marker"}
 
 
-def icon_for_tool(tool_id: str) -> QIcon:
-    name = _ALIASES.get(tool_id, tool_id)
+def icon_named(name: str) -> QIcon:
     path = _ICONS / f"{name}.svg"
     if not path.is_file():
         return QIcon()
     return QIcon(str(path))
+
+
+def icon_for_tool(tool_id: str) -> QIcon:
+    return icon_named(_ALIASES.get(tool_id, tool_id))

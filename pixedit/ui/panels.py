@@ -23,9 +23,10 @@ from pixedit.model import BLEND_MODES
 class ToolOptions(QWidget):
     """Builds controls from ``tool.option_schema()`` so plugins get a panel for free."""
 
-    def __init__(self, session) -> None:
+    def __init__(self, session, on_option=None) -> None:
         super().__init__()
         self.session = session
+        self._on_option = on_option
         self._widgets: dict[str, QWidget] = {}
         self._labels: dict[str, QLabel] = {}
         outer = QVBoxLayout(self)
@@ -93,6 +94,8 @@ class ToolOptions(QWidget):
                         float(value),
                         transient=True,
                     )
+                if self._on_option is not None:
+                    self._on_option(key, int(value))
 
             def on_release(key=key):
                 if key == "redact_amount":
