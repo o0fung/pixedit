@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from pixedit.composite import composite, merge_pair
-from pixedit.factory import blank_layer, empty_raster_layer, redaction_layer, text_layer
+from pixedit.factory import blank_layer, empty_raster_layer, raster_layer, redaction_layer, text_layer
 from pixedit.geom import (
     canvas_flip,
     canvas_rotate_ccw,
@@ -29,6 +29,7 @@ from pixedit.geom import (
     trim_rect,
 )
 from pixedit.model import (
+    CompoundCommand,
     DeleteLayerCommand,
     Document,
     DuplicateLayerCommand,
@@ -268,7 +269,8 @@ class Session:
         if introducing:
             self.show_message(
                 "Selection clips brush, fill, shapes, and filters. "
-                "Delete clears pixels · Ctrl+D deselects · Image → Crop to selection."
+                "Ctrl+X cuts it to a new layer · Ctrl+C copies it · Delete clears pixels · "
+                "Ctrl+D or Esc deselects."
             )
 
     def clear_selection_contents(self) -> None:
@@ -321,8 +323,111 @@ class Session:
 
     def deselect(self) -> None:
         if self.document.selection is None:
+            self.show_message("No selection. Draw one with Select (M). Esc or Ctrl+D deselects.")
             return
         self.set_selection(None, name="Deselect")
+        self.show_message("Deselected.")
+
+    def copy_selection_to_layer(self) -> None:
+        """Copy opaque selected pixels onto a new layer above the active one."""
+        self._selection_to_new_layer(clear=False)
+
+    def cut_selection_to_layer(self) -> None:
+        """Move opaque selected pixels onto a new layer and clear them on the source."""
+        self._selection_to_new_layer(clear=True)
+
+    def _selection_to_new_layer(self, *, clear: bool) -> None:
+        # One undo step either duplicates the selected pixels or moves them.
+        # Cut rasterizes text, the same way Delete does, because the source
+        # bitmap changes. Copy leaves a text layer editable.
+        if self.document.selection is None:
+            self.show_message("Draw a selection first. Select (M), then Ctrl+C copies it to a new layer.")
+            return
+        layer = self.active_layer()
+        if layer is None:
+            self.show_message("Choose a layer to copy from.")
+            return
+        if layer.kind == "redaction":
+            self.show_message("A redaction mask is not pixels. Copy the layer underneath it.")
+            return
+        local = selection_for_layer(self.document, layer)
+        if local is None:
+            self.show_message("The selection does not overlap the active layer.")
+            return
+        mask = np.asarray(local) > 0
+        if not bool(mask.any()):
+            self.show_message("The selection does not overlap the active layer.")
+            return
+        source = np.array(layer.image.convert("RGBA"))
+        opaque = mask & (source[..., 3] > 0)
+        ys, xs = np.nonzero(opaque)
+        if len(xs) == 0:
+            self.show_message("The selection has no opaque pixels on the active layer.")
+            return
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        extracted = source.copy()
+        extracted[~mask] = 0
+        placed = raster_layer(
+            f"{layer.name} copy",
+            Image.fromarray(extracted[y0:y1, x0:x1], "RGBA"),
+            layer.x + x0,
+            layer.y + y0,
+        )
+        index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
+        name = "Cut selection" if clear else "Copy selection"
+        commands: list[Any] = []
+        if clear:
+            before = visual_state(layer)
+            cleared = source.copy()
+            cleared[mask, :3] = 0
+            cleared[mask, 3] = 0
+            scratch = layer.clone()
+            scratch.image = Image.fromarray(cleared, "RGBA")
+            scratch.kind = "raster"
+            scratch.text = None
+            full = covers_document(
+                layer.x,
+                layer.y,
+                layer.image.width,
+                layer.image.height,
+                self.document.width,
+                self.document.height,
+            )
+            if not full:
+                tighten_raster_layer(scratch)
+            commands.append(MutateLayerCommand(layer, visual_state(scratch), old_state=before, name=name))
+        commands.append(InsertLayerCommand(self.document, placed, index, name=name))
+        self.commit(CompoundCommand(commands, name))
+        self.layer_index = index
+        verb = "Cut" if clear else "Copied"
+        self.show_message(f"{verb} the selection to a new layer. Esc or Ctrl+D deselects.")
+
+    def place_layers(self, layers: list[Layer]) -> None:
+        """Add image layers on top of the current document, centered.
+
+        The document size and the layers already there stay put. Each placed
+        bitmap is cropped to its opaque pixels, then centered. Transparent
+        padding in a PNG does not become a full-canvas plate. Undo removes
+        every layer this call added.
+        """
+        copies = [layer.clone() for layer in layers if layer.kind != "redaction"]
+        if not copies:
+            self.show_message("That file has no image layers to place.")
+            return
+        index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
+        commands = []
+        for offset, layer in enumerate(copies):
+            tighten_raster_layer(layer)
+            layer.x = int(round((self.document.width - layer.image.width) / 2))
+            layer.y = int(round((self.document.height - layer.image.height) / 2))
+            commands.append(InsertLayerCommand(self.document, layer, index + offset, name="Place image"))
+        self.commit(CompoundCommand(commands, "Place image"))
+        # The first placed frame is the visible one for a multi-frame file.
+        self.layer_index = index
+        count = len(copies)
+        noun = "layer" if count == 1 else "layers"
+        self.show_message(f"Placed {count} {noun}. The current document was kept.")
 
     def invert_selection(self) -> None:
         if self.document.selection is None:

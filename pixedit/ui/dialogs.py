@@ -295,13 +295,17 @@ class ShortcutsDialog(QDialog):
                     "Ctrl+S  Save project Ctrl+Shift+S  Save as",
                     "Ctrl+E  Export flattened image",
                     "Ctrl+Z  Undo         Ctrl+Shift+Z or Ctrl+Y  Redo",
-                    "Ctrl+A  Select all   Ctrl+D  Deselect   Ctrl+Shift+I  Invert selection",
+                    "Ctrl+A  Select all   Ctrl+D or Esc  Deselect   Ctrl+Shift+I  Invert",
+                    "Ctrl+X  Cut selection to a new layer",
+                    "Ctrl+C  Copy selection to a new layer",
                     "Delete or Backspace  Clear pixels inside the selection",
+                    "Ctrl+Shift+O  Place an image as new layers (File → Place, Layer → Place image)",
                     "Ctrl+0  Fit          Ctrl+1  100%       Ctrl++ / Ctrl+-  Zoom",
                     "V Move   B Brush   E Eraser   T Text   R Redact   M Select",
                     "C Crop   G Fill    I Eyedropper   U Shape   H Hand   Z Zoom",
                     "[ and ]  Brush size     Space  Pan     Wheel  Zoom at cursor",
-                    "Escape  Cancel the current drag",
+                    "Escape  Cancel the current drag, or deselect",
+                    "Toolbar  Save, Open, Place, and Export (same as the File menu)",
                 ]
             )
         )

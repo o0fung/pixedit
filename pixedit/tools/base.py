@@ -42,6 +42,12 @@ class Tool:
     cursor = "cross"
     hint = ""
 
+    def button_caption(self) -> str:
+        """Toolbar text. A shortcut is shown beside the name, as in ``Brush (B)``."""
+        if self.shortcut:
+            return f"{self.label} ({self.shortcut})"
+        return self.label
+
     def option_schema(self) -> list[dict[str, Any]]:
         return []
 
@@ -54,8 +60,9 @@ class Tool:
     def pointer_up(self, session, event: PointerEvent) -> None:
         return None
 
-    def pointer_cancel(self, session) -> None:
-        return None
+    def pointer_cancel(self, session) -> bool:
+        """Cancel an in-progress gesture. True means a drag was actually cancelled."""
+        return False
 
     def overlays(self, session) -> list[Overlay]:
         return []

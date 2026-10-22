@@ -173,6 +173,22 @@ class Command:
         raise NotImplementedError
 
 
+class CompoundCommand(Command):
+    """Several document edits that undo and redo as a single step."""
+
+    def __init__(self, commands: list[Command], name: str) -> None:
+        self.commands = list(commands)
+        self.name = name
+
+    def execute(self) -> None:
+        for command in self.commands:
+            command.execute()
+
+    def undo(self) -> None:
+        for command in reversed(self.commands):
+            command.undo()
+
+
 class History:
     def __init__(self, limit: int = 40) -> None:
         self.limit = limit

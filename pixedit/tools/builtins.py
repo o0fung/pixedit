@@ -35,9 +35,10 @@ from pixedit.paint import (
     dab,
     dab_mask,
     draw_shape,
-    fill_where,
+    fill_region,
     interpolate,
     sample_color,
+    stroke_spacing,
 )
 from pixedit.textutil import default_font_path, render_text
 from pixedit.tools.base import Overlay, PointerEvent, Tool
@@ -223,12 +224,14 @@ class MoveTool(Tool):
         apply_visual(layer, start)
         session.apply_layer_image(layer, new_state, "Transform", before=start)
 
-    def pointer_cancel(self, session) -> None:
-        if self._start is not None and 0 <= self._index < len(session.document.layers):
+    def pointer_cancel(self, session) -> bool:
+        active = self._start is not None
+        if active and 0 <= self._index < len(session.document.layers):
             apply_visual(session.document.layers[self._index], self._start)
             session.preview()
         self._mode = None
         self._start = None
+        return active
 
     def overlays(self, session) -> list[Overlay]:
         layer = session.active_layer()
@@ -278,7 +281,7 @@ class _PaintTool(Tool):
     """Shared stroke loop for the brush and the eraser."""
 
     erase = False
-    cursor = "cross"
+    cursor = "brush"
 
     def __init__(self) -> None:
         self._active = False
@@ -324,9 +327,8 @@ class _PaintTool(Tool):
     def pointer_move(self, session, event: PointerEvent) -> None:
         if not self._active or self._last is None:
             return
-        radius, _, _ = _brush_params(session)
-        spacing = max(1.0, radius * 0.35)
-        points = interpolate(self._last, (event.x, event.y), spacing)
+        radius, hardness, _ = _brush_params(session)
+        points = interpolate(self._last, (event.x, event.y), stroke_spacing(radius, hardness))
         for x, y in points:
             self._stamp(session, x, y)
         if points:
@@ -345,10 +347,12 @@ class _PaintTool(Tool):
         name = "Erase" if self.erase else "Brush"
         session.finish_raster_edit(layer, before, created, name)
 
-    def pointer_cancel(self, session) -> None:
-        if self._layer is not None:
+    def pointer_cancel(self, session) -> bool:
+        active = self._layer is not None
+        if active:
             session.cancel_raster_edit(self._layer, self._before, self._created)
         self._reset_stroke_buffers()
+        return active
 
     def _reset_stroke_buffers(self) -> None:
         self._active = False
@@ -438,7 +442,7 @@ class BrushTool(_PaintTool):
     id = "brush"
     label = "Brush"
     shortcut = "B"
-    hint = "Paint on the active layer. The bitmap grows to fit the stroke. [ and ] change the size."
+    hint = "Paint on the active layer. The cursor matches the brush diameter. [ and ] change the size."
 
 
 class EraserTool(_PaintTool):
@@ -446,7 +450,7 @@ class EraserTool(_PaintTool):
     label = "Eraser"
     shortcut = "E"
     erase = True
-    hint = "Erase pixels, or lift a redaction mask when a redaction layer is active."
+    hint = "Erase pixels, or lift a redaction mask when a redaction layer is active. The cursor matches the eraser diameter."
 
 
 class TextTool(Tool):
@@ -584,11 +588,14 @@ class RedactTool(Tool):
         apply_visual(baked, before)
         session.apply_layer_image(baked, new_state, "Redact", before=before)
 
-    def pointer_cancel(self, session) -> None:
+    def pointer_cancel(self, session) -> bool:
+        active = self._dragging or self._layer is not None
         self._dragging = False
         self._points = []
         self._layer = None
-        session.preview()
+        if active:
+            session.preview()
+        return active
 
     def _preview(self, session, event: PointerEvent) -> None:
         if self._layer is None:
@@ -635,7 +642,7 @@ class SelectTool(Tool):
     label = "Select"
     shortcut = "M"
     cursor = "cross"
-    hint = "Drag a selection. Brush, fill, shapes, and filters stay inside it. Delete clears those pixels. Shift adds, Alt subtracts."
+    hint = "Drag a selection. Ctrl+X cuts it to a new layer, Ctrl+C copies it, Delete clears pixels, Esc deselects."
 
     def __init__(self) -> None:
         self._dragging = False
@@ -683,10 +690,13 @@ class SelectTool(Tool):
         combined = combine_selection(session.document.selection, mask, mode)
         session.set_selection(combined)
 
-    def pointer_cancel(self, session) -> None:
+    def pointer_cancel(self, session) -> bool:
+        active = self._dragging
         self._dragging = False
         self._points = []
-        session.preview()
+        if active:
+            session.preview()
+        return active
 
     def _mask(self, session, event: PointerEvent) -> Image.Image:
         doc = session.document
@@ -768,9 +778,12 @@ class CropTool(Tool):
         )
         session.crop_to(left, top, width, height)
 
-    def pointer_cancel(self, session) -> None:
+    def pointer_cancel(self, session) -> bool:
+        active = self._dragging
         self._dragging = False
-        session.preview()
+        if active:
+            session.preview()
+        return active
 
     def overlays(self, session) -> list[Overlay]:
         if not self._dragging:
@@ -814,16 +827,24 @@ class FillTool(Tool):
             session.cancel_raster_edit(layer, before, created)
             session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
             return
-        mask = connected_mask(layer.image, local_x, local_y, int(session.option("tolerance", 32)))
         selection = selection_for_layer(doc, layer)
         if selection is not None:
-            keep = np.minimum(np.asarray(mask), np.asarray(selection))
+            local = connected_mask(layer.image, local_x, local_y, int(session.option("tolerance", 32)))
+            keep = np.minimum(np.asarray(local), np.asarray(selection))
             if not bool(np.any(keep)):
                 session.cancel_raster_edit(layer, before, created)
                 session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
                 return
-            mask = Image.fromarray(keep, "L")
-        layer.image = fill_where(layer.image, mask, session.foreground)
+        # fill_region also pulls the soft inner edge of a brush stroke into the
+        # fill, so a closed outline does not keep a rim of the old background.
+        layer.image = fill_region(
+            layer.image,
+            local_x,
+            local_y,
+            int(session.option("tolerance", 32)),
+            session.foreground,
+            selection,
+        )
         session.finish_raster_edit(layer, before, created, "Fill")
 
 
@@ -848,12 +869,17 @@ class ShapeTool(Tool):
     label = "Shape"
     shortcut = "U"
     cursor = "cross"
-    hint = "Drag a rectangle, ellipse, or line. Shift is not required."
+    hint = "Drag a rectangle, ellipse, or line. The canvas shows the shape, fill, and stroke while you drag."
 
     def __init__(self) -> None:
         self._dragging = False
         self._start = (0.0, 0.0)
         self._end = (0.0, 0.0)
+        self._layer: Layer | None = None
+        self._before: dict | None = None
+        self._created = False
+        self._snap_image: Image.Image | None = None
+        self._snap_xy = (0, 0)
 
     def option_schema(self):
         return [
@@ -869,6 +895,7 @@ class ShapeTool(Tool):
         ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
+        self._cancel_edit(session)
         self._dragging = True
         self._start = (event.x, event.y)
         self._end = (event.x, event.y)
@@ -877,7 +904,9 @@ class ShapeTool(Tool):
         if not self._dragging:
             return
         self._end = (event.x, event.y)
-        session.preview()
+        if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 1:
+            return
+        self._show_preview(session)
 
     def pointer_up(self, session, event: PointerEvent) -> None:
         if not self._dragging:
@@ -885,22 +914,58 @@ class ShapeTool(Tool):
         self._end = (event.x, event.y)
         self._dragging = False
         if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 1:
+            self._cancel_edit(session)
             session.preview()
             return
         box = self._canvas_box(session)
         if box is None:
+            self._cancel_edit(session)
             session.show_message("The shape is outside the canvas.")
             session.preview()
             return
+        # The preview pass paints with the same draw used at commit time, so
+        # release does not change fill, stroke, color, or alpha.
+        self._show_preview(session)
+        layer, before, created = self._take_edit()
+        if layer is None:
+            return
+        session.finish_raster_edit(layer, before, created, "Shape")
+
+    def pointer_cancel(self, session) -> bool:
+        active = self._dragging or self._layer is not None
+        self._dragging = False
+        self._cancel_edit(session)
+        return active
+
+    def _ensure_edit(self, session) -> None:
+        if self._layer is not None:
+            return
         layer, before, created = session.begin_raster_edit(paint_redaction=False)
+        self._layer = layer
+        self._before = before
+        self._created = created
+        # Snapshot after text is rasterized. Each move restores this and
+        # redraws, so dragging does not stack copies of the shape.
+        self._snap_image = layer.image.copy()
+        self._snap_xy = (layer.x, layer.y)
+
+    def _restore_snap(self) -> None:
+        if self._layer is None or self._snap_image is None:
+            return
+        self._layer.image = self._snap_image.copy()
+        self._layer.x, self._layer.y = self._snap_xy
+
+    def _paint(self, session, box: tuple[int, int, int, int]) -> None:
+        layer = self._layer
+        if layer is None:
+            return
         # Grow to the stroke's canvas box first so a small layer can hold it.
         # finish_raster_edit then crops back to the opaque pixels.
         grow_layer_to_cover(layer, box)
         kind = str(session.option("shape_kind", "rect"))
         selection = selection_for_layer(session.document, layer)
-        # Gestures arrive in canvas coordinates. The bitmap is local to the layer.
         ox, oy = float(layer.x), float(layer.y)
-        image = draw_shape(
+        layer.image = draw_shape(
             layer.image,
             kind,
             (self._start[0] - ox, self._start[1] - oy, self._end[0] - ox, self._end[1] - oy),
@@ -910,12 +975,30 @@ class ShapeTool(Tool):
             selection,
             line=((self._start[0] - ox, self._start[1] - oy), (self._end[0] - ox, self._end[1] - oy)),
         )
-        layer.image = image
-        session.finish_raster_edit(layer, before, created, "Shape")
 
-    def pointer_cancel(self, session) -> None:
-        self._dragging = False
+    def _show_preview(self, session) -> None:
+        self._ensure_edit(session)
+        self._restore_snap()
+        box = self._canvas_box(session)
+        if box is None:
+            session.preview()
+            return
+        self._paint(session, box)
         session.preview()
+
+    def _take_edit(self) -> tuple[Layer | None, dict | None, bool]:
+        layer, before, created = self._layer, self._before, self._created
+        self._layer = None
+        self._before = None
+        self._created = False
+        self._snap_image = None
+        return layer, before, created
+
+    def _cancel_edit(self, session) -> None:
+        layer, before, created = self._take_edit()
+        if layer is None:
+            return
+        session.cancel_raster_edit(layer, before, created)
 
     def _canvas_box(self, session) -> tuple[int, int, int, int] | None:
         """Half-open document box covering the shape, including its stroke."""
@@ -926,22 +1009,6 @@ class ShapeTool(Tool):
         x1 = math.ceil(max(self._start[0], self._end[0])) + pad + 1
         y1 = math.ceil(max(self._start[1], self._end[1])) + pad + 1
         return clip_box((int(x0), int(y0), int(x1), int(y1)), session.document.width, session.document.height)
-
-    def overlays(self, session) -> list[Overlay]:
-        if not self._dragging:
-            return []
-        kind = str(session.option("shape_kind", "rect"))
-        if kind == "line":
-            return [Overlay(kind="polyline", points=[self._start, self._end])]
-        x0, y0 = self._start
-        x1, y1 = self._end
-        left, top = min(x0, x1), min(y0, y1)
-        return [
-            Overlay(
-                kind="ellipse" if kind == "ellipse" else "rect",
-                rect=(left, top, abs(x1 - x0), abs(y1 - y0)),
-            )
-        ]
 
 
 class HandTool(Tool):

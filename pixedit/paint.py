@@ -63,7 +63,12 @@ def dab(
         alpha = alpha * (selection[y0:y1, x0:x1].astype(np.float32) / 255.0)
     region = array[y0:y1, x0:x1].astype(np.float32)
     if erase:
-        region[..., 3] *= 1.0 - alpha
+        # Straight alpha: coverage drops, the color stays until coverage is
+        # gone. Zero RGB at that point so a cleared pixel cannot show the old
+        # paint if a viewer treats leftover color as opaque.
+        keep = 1.0 - alpha
+        region[..., 3] *= keep
+        region[region[..., 3] <= 0.5, :3] = 0
     else:
         src_rgb = np.array(color[:3], dtype=np.float32)
         src_a = alpha * (color[3] / 255.0)
@@ -106,6 +111,21 @@ def dab_mask(
     array[y0:y1, x0:x1] = np.clip(np.rint(region), 0, 255).astype(np.uint8)
 
 
+def stroke_spacing(radius: float, hardness: float) -> float:
+    """Distance between brush stamps, in image pixels.
+
+    A fast drag often arrives as one long segment. Stamps have to overlap
+    inside the opaque core — a soft brush's core is smaller than its radius —
+    or the stroke shows up as separate circles. The step stays near a pixel
+    so a large hard brush does not scallop, and below a pixel for a small or
+    soft one so the 1px grid cannot open a hole.
+    """
+    radius = max(0.5, float(radius))
+    hard = min(1.0, max(0.0, float(hardness)))
+    core = max(0.75, radius * max(hard, 0.25))
+    return max(0.35, min(1.5, core * 0.15))
+
+
 def interpolate(
     start: tuple[float, float], end: tuple[float, float], spacing: float
 ) -> list[tuple[float, float]]:
@@ -114,7 +134,9 @@ def interpolate(
     dist = math.hypot(x1 - x0, y1 - y0)
     if dist < 1e-6:
         return []
-    step = max(1.0, float(spacing))
+    # Honor sub-pixel spacing. A 1px floor left small brushes with gaps
+    # whenever the pointer jumped more than one pixel.
+    step = max(0.05, float(spacing))
     count = max(1, int(math.ceil(dist / step)))
     return [
         (x0 + (x1 - x0) * (i / count), y0 + (y1 - y0) * (i / count))
@@ -248,6 +270,172 @@ def fill_where(
     if selected.shape != arr.shape[:2]:
         return image.copy()
     arr[selected] = color
+    return Image.fromarray(arr, "RGBA")
+
+
+def _dilate8(mask: np.ndarray) -> np.ndarray:
+    out = mask.copy()
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
+    out[1:, 1:] |= mask[:-1, :-1]
+    out[1:, :-1] |= mask[:-1, 1:]
+    out[:-1, 1:] |= mask[1:, :-1]
+    out[:-1, :-1] |= mask[1:, 1:]
+    return out
+
+
+def _coverage(arr: np.ndarray, seed: np.ndarray, tolerance: int) -> np.ndarray:
+    """How far each pixel is from the seed, 0 (same) to 1 (fully different).
+
+    A transparent seed stores paint coverage in alpha. An opaque seed has the
+    old color baked into the RGB, so the largest channel change is the coverage.
+    """
+    if int(seed[3]) <= tolerance:
+        return arr[..., 3].astype(np.float32) / 255.0
+    delta = np.max(np.abs(arr[..., :3].astype(np.int16) - seed[:3].astype(np.int16)), axis=-1)
+    return delta.astype(np.float32) / 255.0
+
+
+def _max_neighbor(values: np.ndarray) -> np.ndarray:
+    """Highest 8-connected neighbor, ignoring the pixel itself."""
+    padded = np.pad(values, 1, mode="constant", constant_values=0)
+    stacked = np.stack(
+        [
+            padded[0:-2, 0:-2],
+            padded[0:-2, 1:-1],
+            padded[0:-2, 2:],
+            padded[1:-1, 0:-2],
+            padded[1:-1, 2:],
+            padded[2:, 0:-2],
+            padded[2:, 1:-1],
+            padded[2:, 2:],
+        ],
+        axis=0,
+    )
+    return np.max(stacked, axis=0)
+
+
+def _src_over(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Straight-alpha source over destination. Both are Nx4 float, 0..255."""
+    src_a = np.clip(src[:, 3:4] / 255.0, 0.0, 1.0)
+    dst_a = np.clip(dst[:, 3:4] / 255.0, 0.0, 1.0)
+    out_a = src_a + dst_a * (1.0 - src_a)
+    out_rgb = src[:, :3] * src_a + dst[:, :3] * dst_a * (1.0 - src_a)
+    out_rgb = np.where(out_a > 1e-6, out_rgb / np.maximum(out_a, 1e-6), 0.0)
+    out = np.concatenate([out_rgb, out_a * 255.0], axis=1)
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def _inner_stroke_fringe(
+    arr: np.ndarray,
+    filled: np.ndarray,
+    seed: np.ndarray,
+    tolerance: int,
+) -> np.ndarray:
+    """Pixels of the anti-aliased inner edge of a stroke around ``filled``.
+
+    The bucket stops on a partial dab, so a brush outline keeps a rim of the
+    old background between the fill and the solid paint. Those pixels sit on
+    a short gradient from the seed color up to the stroke. Walk out at most
+    two pixels and take that gradient.
+
+    Do not cross onto seed-colored pixels the flood did not reach — that is
+    the outside of the shape. Do not take a flat patch of a different color,
+    and do not take the solid body of the stroke. A hard outline has no
+    partial pixels, so it is left unchanged.
+    """
+    tolerance = max(0, int(tolerance))
+    seed_vec = np.asarray(seed, dtype=np.int16)
+    delta = np.max(np.abs(arr.astype(np.int16) - seed_vec), axis=-1)
+    seed_like = delta <= tolerance
+    coverage = _coverage(arr, seed_vec, tolerance)
+    # Solid paint is the stroke body (or another opaque object). The rim is
+    # the partial band below that.
+    solid = coverage >= 0.90
+    exterior = seed_like & ~filled
+    touches_outside = _dilate8(exterior)
+    neighbor_cover = _max_neighbor(coverage)
+    # A real dab edge gets more covered toward the stroke. A flat region of
+    # another color does not, so the fill does not nibble its border.
+    rising = neighbor_cover >= coverage + (8.0 / 255.0)
+
+    fringe = np.zeros(filled.shape, dtype=bool)
+    region = filled.copy()
+    for _step in range(2):
+        border = _dilate8(region) & ~region
+        take = border & ~seed_like & ~solid & ~touches_outside & rising
+        take &= (coverage > 0.03) & (coverage < 0.90)
+        if not np.any(take):
+            break
+        fringe |= take
+        region |= take
+    return fringe
+
+
+def _recolor_fringe(
+    arr: np.ndarray,
+    fringe: np.ndarray,
+    seed: np.ndarray,
+    color: tuple[int, int, int, int],
+    tolerance: int,
+) -> None:
+    """Put the fill under the stroke coverage on ``fringe`` pixels.
+
+    Partial dabs on a transparent layer already store the brush color and an
+    alpha. Partial dabs on an opaque background have the old color mixed in;
+    recover the brush color from that mix, then composite it over the fill.
+    Either way the old background stops showing through the edge.
+    """
+    if not np.any(fringe):
+        return
+    original = arr[fringe].astype(np.float32)
+    fill = np.array(color, dtype=np.float32)
+    dst = np.broadcast_to(fill, original.shape).copy()
+    if int(seed[3]) <= max(0, int(tolerance)):
+        arr[fringe] = _src_over(original, dst)
+        return
+    seed_rgb = seed[:3].astype(np.float32)
+    delta = np.max(np.abs(original[:, :3] - seed_rgb), axis=1)
+    cover = np.clip(delta / 255.0, 0.0, 1.0)
+    brush = (original[:, :3] - (1.0 - cover)[:, None] * seed_rgb) / np.maximum(cover, 1e-4)[:, None]
+    brush = np.clip(brush, 0.0, 255.0)
+    src = np.concatenate([brush, cover[:, None] * 255.0], axis=1)
+    arr[fringe] = _src_over(src, dst)
+
+
+def fill_region(
+    image: Image.Image,
+    x: int,
+    y: int,
+    tolerance: int,
+    color: tuple[int, int, int, int],
+    selection: Image.Image | None = None,
+) -> Image.Image:
+    """Flood-fill from ``(x, y)`` and close the gap against a soft stroke.
+
+    ``selection``, when given, is a layer-local mask. Pixels outside it are
+    not recolored, including the anti-aliased rim.
+    """
+    rgba = image.convert("RGBA")
+    mask = connected_mask(rgba, int(x), int(y), tolerance)
+    arr = np.array(rgba)
+    filled = np.asarray(mask.convert("L")) > 0
+    if selection is not None:
+        sel = np.asarray(selection.convert("L"))
+        if sel.shape == filled.shape:
+            filled &= sel > 0
+    if not np.any(filled) or not (0 <= int(y) < arr.shape[0] and 0 <= int(x) < arr.shape[1]):
+        return Image.fromarray(arr, "RGBA")
+    seed = arr[int(y), int(x)].copy()
+    fringe = _inner_stroke_fringe(arr, filled, seed, tolerance)
+    if selection is not None:
+        sel = np.asarray(selection.convert("L"))
+        if sel.shape == fringe.shape:
+            fringe &= sel > 0
+    _recolor_fringe(arr, fringe, seed, color, tolerance)
+    arr[filled] = color
     return Image.fromarray(arr, "RGBA")
 
 

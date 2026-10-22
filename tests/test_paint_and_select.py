@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw
 
-from pixedit.factory import raster_layer
+from pixedit.factory import raster_layer, redaction_layer
 from pixedit.model import new_document
-from pixedit.paint import connected_mask, dab, paint_points
+from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.builtins import BrushTool, EraserTool, EyedropperTool, FillTool, SelectTool, ShapeTool
@@ -343,3 +343,235 @@ def test_clear_selection_contents_and_undo():
     session.undo()
     assert session.active_layer().image.size == (8, 8)
     assert session.active_layer().image.getpixel((4, 4))[3] == 255
+
+
+def _pixel(layer, x: int, y: int):
+    local_x, local_y = x - layer.x, y - layer.y
+    if not (0 <= local_x < layer.image.width and 0 <= local_y < layer.image.height):
+        return (0, 0, 0, 0)
+    return layer.image.getpixel((local_x, local_y))
+
+
+def test_fast_stroke_stays_continuous_for_brush_and_eraser():
+    assert stroke_spacing(12, 0.85) <= 1.5
+    assert len(interpolate((0, 0), (30, 0), 0.4)) >= 60
+
+    session = Session(new_document(80, 80, "transparent"))
+    session.foreground = (255, 0, 0, 255)
+    session.options["brush_size"] = 5
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(session, PointerEvent(5, 5))
+    brush.pointer_up(session, PointerEvent(70, 60))
+    layer = session.active_layer()
+    for step in range(41):
+        x = 5 + (70 - 5) * step / 40
+        y = 5 + (60 - 5) * step / 40
+        assert _pixel(layer, int(round(x)), int(round(y)))[3] > 200
+
+    session.foreground = (0, 180, 0, 255)
+    session.options["brush_size"] = 8
+    brush.pointer_down(session, PointerEvent(10, 40))
+    brush.pointer_up(session, PointerEvent(10, 40))
+    assert _pixel(session.active_layer(), 10, 40)[1] > 150
+    eraser = EraserTool()
+    eraser.pointer_down(session, PointerEvent(4, 40))
+    eraser.pointer_up(session, PointerEvent(70, 40))
+    cleared = session.active_layer()
+    for x in range(8, 66, 4):
+        assert _pixel(cleared, x, 40)[:4] == (0, 0, 0, 0)
+
+
+def test_fill_meets_a_soft_brush_outline_without_a_rim_or_a_leak():
+    def _closed_circle(background: str, hardness: int) -> np.ndarray:
+        session = Session(new_document(90, 90, background))
+        session.foreground = (20, 20, 20, 255)
+        session.options["brush_size"] = 18
+        session.options["brush_hardness"] = hardness
+        session.options["brush_opacity"] = 100
+        tool = BrushTool()
+        cx, cy, radius = 45.0, 45.0, 22.0
+        tool.pointer_down(session, PointerEvent(cx + radius, cy))
+        for index in range(1, 81):
+            angle = 2 * np.pi * index / 80
+            tool.pointer_move(session, PointerEvent(cx + radius * np.cos(angle), cy + radius * np.sin(angle)))
+        tool.pointer_up(session, PointerEvent(cx + radius, cy))
+        session.foreground = (220, 40, 50, 255)
+        session.options["tolerance"] = 32
+        FillTool().pointer_down(session, PointerEvent(45, 45))
+        return np.array(session.active_layer().image)
+
+    def _counts(arr: np.ndarray) -> tuple[int, int, int]:
+        red, green, blue, alpha = (arr[..., i] for i in range(4))
+        fill = (np.abs(red.astype(int) - 220) < 12) & (np.abs(green.astype(int) - 40) < 12) & (alpha > 180)
+        dark = (red < 40) & (green < 40) & (blue < 40) & (alpha > 200)
+        adjacent = np.zeros(fill.shape, dtype=bool)
+        adjacent[1:] |= fill[:-1]
+        adjacent[:-1] |= fill[1:]
+        adjacent[:, 1:] |= fill[:, :-1]
+        adjacent[:, :-1] |= fill[:, 1:]
+        # A leftover rim is a dim or gray pixel sitting on the fill's border.
+        spread = arr[..., :3].max(axis=-1).astype(int) - arr[..., :3].min(axis=-1).astype(int)
+        gray = (spread < 18) & (alpha > 180) & (arr[..., :3].max(axis=-1) > 50) & (arr[..., :3].max(axis=-1) < 210)
+        halo = adjacent & ~fill & ((alpha < 200) | gray)
+        return int(fill.sum()), int(dark.sum()), int(halo.sum())
+
+    fill_count, dark_count, halo = _counts(_closed_circle("white", 85))
+    assert fill_count > 200
+    assert dark_count > 50
+    assert halo == 0
+    fill_count, dark_count, halo = _counts(_closed_circle("transparent", 85))
+    assert fill_count > 200
+    assert dark_count > 50
+    assert halo == 0
+    # A hard outline has no partial edge. The stroke body stays dark.
+    _fill_count, dark_count, halo = _counts(_closed_circle("white", 100))
+    assert dark_count > 200
+    assert halo == 0
+
+    flat = Image.new("RGBA", (40, 40), (255, 255, 255, 255))
+    for x in range(20, 40):
+        for y in range(40):
+            flat.putpixel((x, y), (200, 200, 200, 255))
+    painted = np.array(fill_region(flat, 5, 5, 32, (220, 40, 50, 255)))
+    assert tuple(painted[5, 5]) == (220, 40, 50, 255)
+    assert tuple(painted[0, 0]) == (220, 40, 50, 255)
+    assert tuple(painted[5, 25]) == (200, 200, 200, 255)
+    assert tuple(painted[0, 39]) == (200, 200, 200, 255)
+
+
+def test_eraser_clears_color_and_respects_a_selection():
+    session = Session(new_document(30, 30, "white"))
+    session.foreground = (220, 30, 40, 255)
+    session.options["brush_size"] = 8
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(session, PointerEvent(15, 15))
+    brush.pointer_up(session, PointerEvent(15, 15))
+    assert session.active_layer().image.getpixel((15, 15))[:3] == (220, 30, 40)
+    eraser = EraserTool()
+    eraser.pointer_down(session, PointerEvent(15, 15))
+    eraser.pointer_up(session, PointerEvent(15, 15))
+    assert session.active_layer().image.getpixel((15, 15)) == (0, 0, 0, 0)
+    assert session.active_layer().image.getpixel((1, 1)) == (255, 255, 255, 255)
+
+    session.undo()
+    mask = Image.new("L", (30, 30), 0)
+    mask.paste(255, (0, 0, 15, 30))
+    session.set_selection(mask)
+    eraser.pointer_down(session, PointerEvent(22, 15))
+    eraser.pointer_up(session, PointerEvent(22, 15))
+    assert session.active_layer().image.getpixel((22, 15))[0] > 200
+    eraser.pointer_down(session, PointerEvent(8, 15))
+    eraser.pointer_up(session, PointerEvent(8, 15))
+    assert session.active_layer().image.getpixel((8, 15)) == (0, 0, 0, 0)
+
+
+def test_shape_preview_matches_the_committed_shape_including_alpha():
+    session = Session(new_document(40, 40, "transparent"))
+    session.foreground = (255, 0, 0, 128)
+    session.options["shape_kind"] = "rect"
+    session.options["shape_filled"] = True
+    session.options["stroke_width"] = 2
+    shape = ShapeTool()
+    shape.pointer_down(session, PointerEvent(8, 8))
+    shape.pointer_move(session, PointerEvent(30, 28))
+    preview = session.active_layer().image.getpixel((19, 18))
+    assert abs(preview[3] - 128) <= 8
+    assert preview[0] > 200
+    steps = len(session.history.undo_stack)
+    shape.pointer_up(session, PointerEvent(30, 28))
+    assert session.active_layer().image.getpixel((19, 18)) == preview
+    assert len(session.history.undo_stack) == steps + 1
+    session.undo()
+    assert session.active_layer().image.getpixel((19, 18))[3] == 0
+
+    session.options["shape_filled"] = False
+    session.options["stroke_width"] = 2
+    session.foreground = (0, 0, 255, 255)
+    shape.pointer_down(session, PointerEvent(6, 6))
+    shape.pointer_move(session, PointerEvent(34, 34))
+    assert session.active_layer().image.getpixel((20, 20))[3] == 0
+    # Pillow's stroke sits on the rectangle edge. Width 2 lands just outside the drag box.
+    assert session.active_layer().image.getpixel((3, 20))[2] > 200
+    assert shape.pointer_cancel(session) is True
+    assert session.active_layer().image.getpixel((3, 20))[3] == 0
+    assert len(session.history.undo_stack) == steps
+
+
+def test_cut_and_copy_selection_to_a_new_layer():
+    session = Session(new_document(30, 30, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    session.copy_selection_to_layer()
+    assert any("Draw a selection" in message for message in messages)
+    assert len(session.document.layers) == 1
+
+    image = session.active_layer().image.copy()
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((6, 6, 14, 14), fill=(255, 0, 0, 255))
+    session.active_layer().image = image
+    mask = Image.new("L", (30, 30), 0)
+    mask.paste(255, (6, 6, 12, 12))
+    session.set_selection(mask)
+    session.copy_selection_to_layer()
+    assert len(session.document.layers) == 2
+    copied = session.active_layer()
+    assert copied.name.endswith("copy")
+    assert _pixel(copied, 8, 8)[:3] == (255, 0, 0)
+    assert _pixel(session.document.layers[0], 8, 8)[:3] == (255, 0, 0)
+    assert session.document.selection is not None
+    session.undo()
+    assert len(session.document.layers) == 1
+
+    session.cut_selection_to_layer()
+    assert len(session.document.layers) == 2
+    source = session.document.layers[0]
+    moved = session.document.layers[1]
+    assert _pixel(source, 8, 8) == (0, 0, 0, 0)
+    assert _pixel(moved, 8, 8)[:3] == (255, 0, 0)
+    assert _pixel(source, 13, 13)[:3] == (255, 0, 0)
+    session.undo()
+    assert len(session.document.layers) == 1
+    assert session.document.layers[0].image.getpixel((8, 8))[:3] == (255, 0, 0)
+
+    redacted = redaction_layer("Hide", Image.new("L", (30, 30), 0), "blur", 8)
+    session.add_layer(redacted)
+    session.layer_index = session.document.index_of(redacted.id)
+    messages.clear()
+    before = len(session.history.undo_stack)
+    session.cut_selection_to_layer()
+    assert any("redaction" in message for message in messages)
+    assert len(session.history.undo_stack) == before
+
+
+def test_place_layers_keeps_the_document_and_undoes():
+    session = Session(new_document(40, 30, "white"))
+    green = raster_layer("Green", Image.new("RGBA", (10, 8), (0, 255, 0, 255)))
+    padded = Image.new("RGBA", (20, 20), (0, 0, 0, 0))
+    padded.paste(Image.new("RGBA", (4, 4), (0, 0, 255, 255)), (8, 8))
+    blue = raster_layer("Blue", padded)
+    blue.visible = False
+    session.place_layers([green, blue])
+    assert session.document.width == 40
+    assert session.document.height == 30
+    assert len(session.document.layers) == 3
+    placed = session.document.layers[1]
+    assert placed.image.size == (10, 8)
+    assert (placed.x, placed.y) == (15, 11)
+    assert placed.visible
+    hidden = session.document.layers[2]
+    assert hidden.image.size == (4, 4)
+    assert not hidden.visible
+    assert session.layer_index == 1
+    session.undo()
+    assert len(session.document.layers) == 1
+    assert session.document.layers[0].image.size == (40, 30)
+
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    session.place_layers([redaction_layer("Hide", Image.new("L", (8, 8), 255), "pixelate", 8)])
+    assert any("no image" in message for message in messages)
+    assert len(session.document.layers) == 1

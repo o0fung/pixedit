@@ -7,7 +7,7 @@ import math
 import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPoint, Qt, QRectF, QTimer
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygon
+from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygon
 from PyQt6.QtWidgets import QWidget
 
 from pixedit.composite import composite
@@ -20,6 +20,56 @@ _CURSORS = {
     "ibeam": Qt.CursorShape.IBeamCursor,
     "arrow": Qt.CursorShape.ArrowCursor,
 }
+
+# A brush larger than this, or zoomed far in, would make a pixmap the window
+# system will not use as a cursor. The ring is clamped to this many logical pixels.
+_MAX_BRUSH_CURSOR = 256
+
+
+def brush_circle_cursor(screen_diameter: float, *, device_pixel_ratio: float = 1.0) -> QCursor:
+    """Circle cursor whose diameter is the brush size in screen pixels.
+
+    The white ring is the brush diameter. A black ring one pixel outside it
+    keeps the outline visible on a light canvas. The hotspot is the center.
+    """
+    logical = int(round(max(1.0, float(screen_diameter))))
+    logical = min(_MAX_BRUSH_CURSOR, logical)
+    dpr = max(1.0, float(device_pixel_ratio))
+    physical = max(1, int(round(logical * dpr)))
+    # Pad for the contrast ring and a one-pixel margin so the pen is not clipped.
+    pad = int(math.ceil(2 * dpr)) + 1
+    size = physical + pad * 2
+    if size % 2 == 0:
+        size += 1
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, physical >= 12)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    center = size / 2.0
+
+    def ring(diameter: float, color: QColor) -> None:
+        pen = QPen(color)
+        pen.setWidthF(max(1.0, dpr))
+        painter.setPen(pen)
+        left = center - diameter / 2.0
+        painter.drawEllipse(QRectF(left, left, diameter, diameter))
+
+    ring(physical + max(1.0, dpr), QColor(0, 0, 0, 230))
+    ring(float(physical), QColor(255, 255, 255, 240))
+    # A tiny ring is hard to aim with. A short crosshair marks the center
+    # without changing the circle's diameter.
+    if physical < int(8 * dpr):
+        arm = max(3.0, 4.0 * dpr)
+        pen = QPen(QColor(255, 255, 255, 230))
+        pen.setWidthF(max(1.0, dpr))
+        painter.setPen(pen)
+        painter.drawLine(int(center - arm), int(center), int(center + arm), int(center))
+        painter.drawLine(int(center), int(center - arm), int(center), int(center + arm))
+    painter.end()
+    pixmap.setDevicePixelRatio(dpr)
+    hot = int(round(center / dpr))
+    return QCursor(pixmap, hot, hot)
 
 
 def pil_to_pixmap(image: Image.Image) -> QPixmap:
@@ -55,6 +105,9 @@ class CanvasView(QWidget):
         self._ant_timer = QTimer(self)
         self._ant_timer.setInterval(120)
         self._ant_timer.timeout.connect(self._advance_ants)
+        self._cursor_name = "arrow"
+        self._brush_cursor_key: tuple[int, int] | None = None
+        self._brush_cursor: QCursor | None = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
@@ -68,7 +121,39 @@ class CanvasView(QWidget):
         return 22 if self.session.option("rulers", True) else 0
 
     def set_tool_cursor(self, name: str) -> None:
+        self._cursor_name = name
+        self._apply_cursor()
+
+    def refresh_tool_cursor(self) -> None:
+        """Rebuild the brush circle after a size or zoom change."""
+        self._brush_cursor_key = None
+        self._apply_cursor()
+
+    def _apply_cursor(self) -> None:
+        # Pan grabs the cursor for the gesture. Space shows an open hand
+        # until the key is released, then the tool cursor comes back.
+        if self._panning:
+            return
+        if self._space:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        tool = self.tool_getter()
+        if tool is not None and tool.id in {"brush", "eraser"}:
+            self.setCursor(self._circle_cursor())
+            return
+        name = self._cursor_name
+        if tool is not None and name in {"", "brush"}:
+            name = tool.cursor
         self.setCursor(_CURSORS.get(name, Qt.CursorShape.ArrowCursor))
+
+    def _circle_cursor(self) -> QCursor:
+        diameter = float(self.session.option("brush_size", 24)) * float(self.zoom)
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        key = (int(round(diameter * 10)), int(round(dpr * 100)))
+        if self._brush_cursor is None or self._brush_cursor_key != key:
+            self._brush_cursor = brush_circle_cursor(diameter, device_pixel_ratio=dpr)
+            self._brush_cursor_key = key
+        return self._brush_cursor
 
     def widget_to_canvas(self, wx: float, wy: float) -> tuple[float, float]:
         ruler = self.ruler()
@@ -83,6 +168,7 @@ class CanvasView(QWidget):
         self.session.view_zoom = self.zoom
         self.update()
         self._report_status(wx, wy)
+        self.refresh_tool_cursor()
 
     def zoom_100(self) -> None:
         center = self.widget_to_canvas(self.width() / 2, self.height() / 2)
@@ -92,6 +178,7 @@ class CanvasView(QWidget):
         self.offset_y = (self.height() / 2 - ruler) - center[1]
         self.session.view_zoom = self.zoom
         self.update()
+        self.refresh_tool_cursor()
 
     def fit(self) -> None:
         doc = self.session.document
@@ -103,6 +190,7 @@ class CanvasView(QWidget):
         self.offset_y = (self.height() - ruler - doc.height * self.zoom) / 2
         self.session.view_zoom = self.zoom
         self.update()
+        self.refresh_tool_cursor()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -376,9 +464,14 @@ class CanvasView(QWidget):
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
         if event.key() == Qt.Key.Key_Escape:
+            # A half-drawn shape or stroke is cancelled first. Escape with
+            # nothing in progress clears the selection, which is the step
+            # people look for after Select.
             tool = self.tool_getter()
-            if tool is not None:
-                tool.pointer_cancel(self.session)
+            busy = bool(tool.pointer_cancel(self.session)) if tool is not None else False
+            if not busy and self.session.document.selection is not None:
+                self.session.deselect()
+            event.accept()
             return
         if _is_clear_shortcut(event):
             self.session.clear_selection_contents()
