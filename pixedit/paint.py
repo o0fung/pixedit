@@ -206,36 +206,36 @@ def draw_shape(
 
 
 def connected_mask(image: Image.Image, x: int, y: int, tolerance: int) -> Image.Image:
-    """L mask of pixels flood-filled from ``(x, y)``.
+    """L mask of pixels 4-connected to ``(x, y)`` and within tolerance of it.
 
-    Tolerance is the maximum per-channel absolute difference from the seed,
-    which is how Pillow's ``floodfill(..., thresh=)`` decides membership.
-    A sentinel color marks visited pixels so a high tolerance cannot hide
-    pixels that already happened to equal the fill color.
+    Tolerance is the maximum per-channel absolute RGBA difference from the
+    seed (0 = exact match). Pillow's ``floodfill(thresh=)`` cannot be used
+    directly: its threshold is the sum of channel deltas, and it returns
+    without filling when the seed is already within that distance of the
+    replacement color. A transparent pixel is only 10 away from a dark
+    sentinel, so the default tolerance of 32 used to fill nothing.
+
+    Membership is decided here. Pillow only walks the binary mask, with a
+    fill value (128) that matches neither candidate (255) nor blocked (0).
     """
     rgba = image.convert("RGBA")
     width, height = rgba.size
-    if not (0 <= x < width and 0 <= y < height):
-        return Image.new("L", (width, height), 0)
-    arr = np.array(rgba)
-    seed = arr[y, x].copy()
-    sentinel = np.array([1, 2, 3, 4], dtype=np.uint8)
-    if np.array_equal(seed, sentinel):
-        sentinel = np.array([8, 9, 10, 11], dtype=np.uint8)
-    alt = sentinel.copy()
-    alt[0] = np.uint8(int(sentinel[0]) + 1)
-    # Move any pre-existing sentinel pixels out of the way so "equals sentinel"
-    # after the fill means "this pixel was visited", not "it was already that color".
-    already = np.all(arr == sentinel, axis=-1)
-    arr[already] = alt
-    # Pillow images backed by a numpy buffer are read-only. floodfill writes
-    # through the pixel accessor and silently no-ops on a read-only image, so
-    # copy onto an owned buffer before filling.
-    work = Image.fromarray(arr, "RGBA").copy()
-    ImageDraw.floodfill(work, (int(x), int(y)), tuple(int(v) for v in sentinel), thresh=int(tolerance))
-    after = np.array(work)
-    visited = np.all(after == sentinel, axis=-1)
-    return Image.fromarray(visited.astype(np.uint8) * 255, "L")
+    if width < 1 or height < 1 or not (0 <= x < width and 0 <= y < height):
+        return Image.new("L", (max(width, 1), max(height, 1)), 0)
+    arr = np.asarray(rgba)
+    seed = arr[int(y), int(x)].astype(np.int16)
+    # Max, not sum: tolerance 32 means each channel may differ by 32, which
+    # is the paint-bucket convention. Alpha is included so transparent and
+    # opaque pixels stay distinct unless the tolerance is wide enough.
+    delta = np.max(np.abs(arr.astype(np.int16) - seed), axis=-1)
+    similar = delta <= max(0, int(tolerance))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[similar] = 255
+    # fromarray() shares a buffer floodfill will not write. copy() owns it.
+    work = Image.fromarray(mask, "L").copy()
+    ImageDraw.floodfill(work, (int(x), int(y)), 128, thresh=0)
+    filled = np.asarray(work) == 128
+    return Image.fromarray(filled.astype(np.uint8) * 255, "L")
 
 
 def fill_where(

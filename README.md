@@ -18,15 +18,17 @@ pix
 
 **Text.** The Text tool (`T`) asks for the string, font, size, color, and rotation. Click an existing text layer to edit it. Scaling and rotating a text layer keep it editable. Flipping rasterizes it.
 
-**Brush and eraser.** Size, hardness, and opacity. The eraser lowers alpha, or lifts a redaction mask when a redaction layer is active. `[` and `]` change the brush size.
+**Brush and eraser.** Size, hardness, and opacity. The eraser lowers alpha, or lifts a redaction mask when a redaction layer is active. `[` and `]` change the brush size. A stroke on a new or smaller layer grows a tight RGBA bitmap around the opaque pixels and places it with the layer's `(x, y)`. It is not expanded to a full-canvas transparent sheet. Brushing past that layer's edge grows the bitmap. The background, an imported full-canvas image, and a flattened image keep their size.
+
+**Fill.** Fill (`G`) flood-fills 4-connected pixels on the active layer. Each RGBA channel of a filled pixel is within the tolerance of the pixel you click. Text is rasterized first, the same way the brush does it. A selection limits the fill to that intersection. Clicking outside the layer or the selection reports that in the status bar.
 
 **Privacy redaction.** Draw a rectangle, ellipse, or freehand region (`R`). The effect is Gaussian blur or a pixelate/mosaic, stored as a mask layer. The pixels underneath are not rewritten. The effect is applied while compositing, so you can hide the layer, change its opacity, or delete it and the original image comes back. Export and Flatten bake the effect.
 
-**Layers.** New, rename (double-click the name), reorder, show/hide, opacity, and blend modes: Normal, Multiply, Screen, Overlay. Duplicate, delete, merge down, and flatten. Merge down bakes the upper layer into the one beneath it, including a redaction mask, as one undo step.
+**Layers.** New, rename (double-click the name), reorder, show/hide, opacity, and blend modes: Normal, Multiply, Screen, Overlay. Duplicate, delete, merge down, and flatten. Merge down bakes the upper layer into the one beneath it, including a redaction mask, as one undo step. New layers start empty and content-sized. Redaction masks stay document-sized, which keeps blur and pixelate aligned with the canvas.
 
 **Transforms.** Move (`V`) drags the active layer. Corner handles scale it (Shift locks aspect) and the handle above the box rotates it. Layer menu: scale, rotate, flip horizontal, flip vertical. Image menu: rotate or flip the whole canvas, crop to the selection, and trim transparent edges. The Crop tool (`C`) crops the canvas when you release.
 
-**Selection, paint, and adjustments.** Rectangular, elliptical, and freehand selections, plus a magic wand (contiguous pixels within a per-channel tolerance). Shift adds, Alt subtracts. Fill (`G`), eyedropper (`I`), and rectangle / ellipse / line shapes (`U`). Brightness/contrast, levels, hue/saturation, desaturate, invert, blur, sharpen, and pixelate. A selection limits brush, fill, shapes, and filters to the selected pixels. No selection means the whole layer.
+**Selection, paint, and adjustments.** Rectangular, elliptical, and freehand selections, plus a magic wand (contiguous pixels within a per-channel tolerance). Shift adds, Alt subtracts. The selection is a tint plus a marching outline. After you draw one, the status bar notes that brush, fill, shapes, and filters stay inside it. Delete or Backspace clears those pixels on the active raster layer (text is rasterized). That does not delete the layer — the layer panel's Delete button does. Ctrl+D deselects. Image → Crop to selection crops the canvas. Edit → Clear selection contents is the same clear. Eyedropper (`I`) and rectangle / ellipse / line shapes (`U`). Brightness/contrast, levels, hue/saturation, desaturate, invert, blur, sharpen, and pixelate. No selection means the whole layer.
 
 **View.** Scroll to zoom, Space or the Hand tool (`H`) to pan, rulers, Fit (`Ctrl+0`), and actual pixels (`Ctrl+1`).
 
@@ -54,6 +56,7 @@ A redaction in a project stays a mask. The source layer's pixels in the file are
 | `Ctrl+E` | Export flattened |
 | `Ctrl+Z` `Ctrl+Y` | Undo, redo |
 | `Ctrl+A` `Ctrl+D` `Ctrl+Shift+I` | Select all, deselect, invert selection |
+| `Delete` `Backspace` | Clear pixels inside the selection |
 | `Ctrl+J` `Ctrl+Shift+N` | Duplicate layer, new layer |
 | `Ctrl+Shift+E` | Merge down |
 | `Ctrl+0` `Ctrl+1` `Ctrl++` `Ctrl+-` | Fit, 100%, zoom in, zoom out |
@@ -68,7 +71,7 @@ Plugins register commands and canvas tools without editing the editor. `register
 2. The shipped example, if that entry point is not installed yet.
 3. Every `*.py` file in `~/.pixedit/plugins/`.
 
-The shipped example adds **Filter → Vignette** and a **Marker** tool. Source: `pixedit/plugins/examples/basic.py`.
+The shipped example adds **Filter → Vignette** and a **Marker** tool. Marker is a stamp demo, not a second editing mode: each click draws a plus (and a small ring) on the active raster or text layer and the status bar says “Stamped marker”. There is no next step. Source: `pixedit/plugins/examples/basic.py`.
 
 A user plugin is a single file:
 
