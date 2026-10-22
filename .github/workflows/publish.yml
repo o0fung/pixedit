@@ -1,0 +1,76 @@
+name: Publish PyPI
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-pypi:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pixedit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The git tag is the release the operator asked for. PyPI stores the
+      # version baked into the sdist, which setuptools reads from
+      # pixedit.__version__. Reject the job before upload when those differ:
+      # PyPI will not replace files for a version that already exists.
+      - name: Match tag to pixedit.__version__
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          import pathlib
+          import sys
+
+          tag = os.environ["TAG"]
+          if not tag.startswith("v") or not tag[1:2].isdigit():
+              print(f"Tag must look like v0.1.0, got: {tag!r}", file=sys.stderr)
+              sys.exit(1)
+          expected = tag[1:]
+
+          tree = ast.parse(pathlib.Path("pixedit/__init__.py").read_text())
+          version = None
+          for node in tree.body:
+              if not isinstance(node, ast.Assign):
+                  continue
+              for target in node.targets:
+                  if isinstance(target, ast.Name) and target.id == "__version__":
+                      if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                          version = node.value.value
+          if version is None:
+              print("Could not find a string __version__ in pixedit/__init__.py", file=sys.stderr)
+              sys.exit(1)
+          if version != expected:
+              print(
+                  f"Git tag version {expected!r} does not match pixedit.__version__ {version!r}.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          print(f"Version {version} matches tag {tag}")
+          PY
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          verbose: true

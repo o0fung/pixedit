@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pixedit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "PixEdit is a layered desktop image editor launched with the pix command."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,9 @@ pix = "pixedit.cli:main"
 # The callable must be `register(api)`.
 [project.entry-points."pixedit.plugins"]
 basic = "pixedit.plugins.examples.basic:register"
+
+[tool.setuptools.dynamic]
+version = { attr = "pixedit.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["pixedit*"]

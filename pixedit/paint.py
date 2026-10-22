@@ -183,7 +183,14 @@ def draw_shape(
     if kind == "line" and line is not None:
         draw.line([line[0], line[1]], fill=color, width=stroke)
     else:
-        box = [rect[0], rect[1], rect[2], rect[3]]
+        # Same Pillow constraint as the selection masks: the second corner
+        # must sit down and to the right of the first.
+        box = [
+            min(rect[0], rect[2]),
+            min(rect[1], rect[3]),
+            max(rect[0], rect[2]),
+            max(rect[1], rect[3]),
+        ]
         if kind == "ellipse":
             if filled:
                 draw.ellipse(box, fill=color, outline=color, width=stroke)

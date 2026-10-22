@@ -267,7 +267,7 @@ class CanvasView(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position()
-        self._report_status(pos.x(), pos.y)
+        self._report_status(pos.x(), pos.y())
         if self._panning and self._pan_last is not None:
             self.offset_x += pos.x() - self._pan_last.x()
             self.offset_y += pos.y() - self._pan_last.y()

@@ -5,6 +5,7 @@ PixEdit is a layered desktop image editor. Install the package, then launch it w
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 pip install -e .
 pix
 ```
@@ -117,7 +118,10 @@ The document (canvas size, ordered layers, selection) lives in `pixedit/model.py
 ## Tests and headless use
 
 ```bash
-pip install -e ".[dev]"
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
 pytest
 pix --check
 ```
@@ -128,4 +132,4 @@ pix --check
 
 ## Requirements
 
-Python 3.10 or newer. PyQt6, Pillow, numpy, and pypdfium2, declared in `pyproject.toml`.
+Python 3.10 or newer. PyQt6, Pillow, numpy, pypdfium2, and pytest are listed in both `requirements.txt` and `pyproject.toml`. Change a dependency in both files.

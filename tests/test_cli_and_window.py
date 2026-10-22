@@ -53,3 +53,33 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
     window.session.redo()
     window.close()
     app.processEvents()
+
+
+def test_canvas_mouse_move_reports_cursor():
+    """A hover must report canvas coordinates. Passing ``pos.y`` without calling it aborted the process."""
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+    local = QPointF(120, 90)
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        local,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(window.canvas, move)
+    app.processEvents()
+    expected_x, expected_y = window.canvas.widget_to_canvas(local.x(), local.y())
+    assert window._cursor == pytest.approx((expected_x, expected_y))
+    assert f"{expected_x:.0f}, {expected_y:.0f}" in window.statusBar().currentMessage()
+    window.close()
+    app.processEvents()

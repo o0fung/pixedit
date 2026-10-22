@@ -114,6 +114,36 @@ def test_rect_selection_shift_adds():
     assert selection.getpixel((10, 10)) == 0
 
 
+def test_inverted_drag_still_fills_rect_and_ellipse():
+    """A drag up and to the left used to abort: Pillow requires x1 >= x0."""
+    session = Session(new_document(30, 30, "white"))
+    session.options["select_mode"] = "rect"
+    tool = SelectTool()
+    tool.pointer_down(session, PointerEvent(18, 18))
+    tool.pointer_up(session, PointerEvent(2, 2))
+    selection = session.document.selection
+    assert selection.getpixel((10, 10)) == 255
+    assert selection.getpixel((0, 0)) == 0
+
+    session.options["select_mode"] = "ellipse"
+    tool.pointer_down(session, PointerEvent(18, 18))
+    tool.pointer_up(session, PointerEvent(2, 2))
+    selection = session.document.selection
+    assert selection.getpixel((10, 10)) == 255
+    assert selection.getpixel((0, 0)) == 0
+
+    session.foreground = (255, 0, 0, 255)
+    session.options["shape_kind"] = "rect"
+    session.options["shape_filled"] = True
+    session.options["stroke_width"] = 1
+    shape = ShapeTool()
+    shape.pointer_down(session, PointerEvent(18, 18))
+    shape.pointer_up(session, PointerEvent(2, 2))
+    pixel = session.active_layer().image.getpixel((10, 10))
+    assert pixel[:3] == (255, 0, 0)
+    assert session.active_layer().image.getpixel((0, 0))[:3] == (255, 255, 255)
+
+
 def test_eyedropper_reads_composite():
     session = Session(new_document(8, 8, "black"))
     tool = EyedropperTool()

@@ -448,12 +448,21 @@ def combine_selection(
     return Image.fromarray(out, "L")
 
 
+def _ordered_box(x0: float, y0: float, x1: float, y1: float) -> list[float]:
+    """Corners in Pillow's required order.
+
+    ``ImageDraw`` rejects a box when the second corner is above or left of
+    the first. A drag that goes up or left arrives that way.
+    """
+    return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
 def mask_rect(width: int, height: int, x0: float, y0: float, x1: float, y1: float) -> Image.Image:
     from PIL import ImageDraw
 
     image = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(image)
-    draw.rectangle([x0, y0, x1, y1], fill=255)
+    draw.rectangle(_ordered_box(x0, y0, x1, y1), fill=255)
     return image
 
 
@@ -462,7 +471,7 @@ def mask_ellipse(width: int, height: int, x0: float, y0: float, x1: float, y1: f
 
     image = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(image)
-    draw.ellipse([x0, y0, x1, y1], fill=255)
+    draw.ellipse(_ordered_box(x0, y0, x1, y1), fill=255)
     return image
 
 
