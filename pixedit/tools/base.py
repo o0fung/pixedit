@@ -42,6 +42,12 @@ class Tool:
     cursor = "cross"
     hint = ""
 
+    def button_caption(self) -> str:
+        """Toolbar text. A shortcut is shown beside the name, as in ``Brush (B)``."""
+        if self.shortcut:
+            return f"{self.label} ({self.shortcut})"
+        return self.label
+
     def option_schema(self) -> list[dict[str, Any]]:
         return []
 

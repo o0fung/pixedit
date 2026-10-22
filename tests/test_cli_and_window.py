@@ -46,9 +46,13 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
     assert "redact" in window.tool_by_id
     for tool_id, button in window._buttons.items():
         assert not button.icon().isNull(), tool_id
-        assert tool_id == "example.marker" or button.text()
-        tip = button.toolTip()
         tool = window.tool_by_id[tool_id]
+        assert button.text() == tool.button_caption()
+        if tool.shortcut:
+            assert button.text() == f"{tool.label} ({tool.shortcut})"
+        else:
+            assert button.text() == tool.label
+        tip = button.toolTip()
         assert tool.label in tip
         if tool.shortcut:
             assert tool.shortcut in tip
