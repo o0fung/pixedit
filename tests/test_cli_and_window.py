@@ -41,8 +41,19 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
         labels.extend(child.text() for child in menu.actions())
     assert any("Vignette" in label for label in labels)
     assert any("Trim" in label for label in labels)
+    assert any("Clear selection contents" in label for label in labels)
     assert "example.marker" in window.tool_by_id
     assert "redact" in window.tool_by_id
+    for tool_id, button in window._buttons.items():
+        assert not button.icon().isNull(), tool_id
+        assert tool_id == "example.marker" or button.text()
+        tip = button.toolTip()
+        tool = window.tool_by_id[tool_id]
+        assert tool.label in tip
+        if tool.shortcut:
+            assert tool.shortcut in tip
+        if tool.hint:
+            assert tool.hint in tip
     path = tmp_path / "photo.png"
     Image.new("RGBA", (12, 9), (20, 30, 40, 255)).save(path)
     window.open_path(str(path))
@@ -80,6 +91,39 @@ def test_canvas_mouse_move_reports_cursor():
     app.processEvents()
     expected_x, expected_y = window.canvas.widget_to_canvas(local.x(), local.y())
     assert window._cursor == pytest.approx((expected_x, expected_y))
-    assert f"{expected_x:.0f}, {expected_y:.0f}" in window.statusBar().currentMessage()
+    assert f"{expected_x:.0f}, {expected_y:.0f}" in window._status_label.text()
+    window.close()
+    app.processEvents()
+
+
+def test_delete_clears_selection_pixels():
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.tools.base import PointerEvent
+    from pixedit.tools.builtins import SelectTool
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+    window.session.new_canvas(24, 24, "white")
+    window.session.options["select_mode"] = "rect"
+    tool = SelectTool()
+    tool.pointer_down(window.session, PointerEvent(4, 4))
+    tool.pointer_up(window.session, PointerEvent(12, 12))
+    window.canvas.setFocus()
+    app.processEvents()
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(window.canvas, event)
+    app.processEvents()
+    image = window.session.active_layer().image
+    assert image.getpixel((6, 6))[3] == 0
+    assert image.getpixel((1, 1))[3] == 255
+    assert image.size == (24, 24)
+    window.session.dirty = False
     window.close()
     app.processEvents()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -13,10 +13,12 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QToolButton,
@@ -32,7 +34,7 @@ from pixedit.plugins.api import get_api
 from pixedit.plugins.loader import load_plugins
 from pixedit.session import Session
 from pixedit.tools.base import Tool, builtin_tools
-from pixedit.ui.canvas import CanvasView
+from pixedit.ui.canvas import CanvasView, _is_clear_shortcut
 from pixedit.ui.dialogs import (
     LiveFilterDialog,
     NewDocumentDialog,
@@ -42,6 +44,7 @@ from pixedit.ui.dialogs import (
     ShortcutsDialog,
     TextDialog,
 )
+from pixedit.ui.icons import icon_for_tool
 from pixedit.ui.panels import LayerPanel, ToolOptions
 
 _OPEN_FILTER = "Images and projects (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf *.pix);;All files (*)"
@@ -76,7 +79,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.canvas.setFocus)
 
     def _build(self) -> None:
-        self.setStatusBar(QStatusBar())
+        status = QStatusBar()
+        self.setStatusBar(status)
+        # Permanent readout. Toasts use showMessage, which covers this label
+        # for a few seconds and then reveals it again. Writing the readout
+        # through showMessage used to wipe those toasts on the next mouse move.
+        self._status_label = QLabel()
+        self._status_label.setObjectName("statusInfo")
+        status.addWidget(self._status_label, 1)
         shell = QWidget()
         self.setCentralWidget(shell)
         row = QHBoxLayout(shell)
@@ -137,10 +147,14 @@ class MainWindow(QMainWindow):
         for tool in self.tools:
             button = QToolButton()
             button.setText(tool.label)
+            button.setIcon(icon_for_tool(tool.id))
+            button.setIconSize(QSize(18, 18))
             button.setCheckable(True)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            tip = tool.label if not tool.shortcut else f"{tool.label}  ({tool.shortcut})"
-            button.setToolTip(tip)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setAccessibleName(tool.label)
+            title = tool.label if not tool.shortcut else f"{tool.label} ({tool.shortcut})"
+            button.setToolTip(f"{title}\n{tool.hint}" if tool.hint else title)
             button.clicked.connect(lambda _checked=False, chosen=tool: self.set_tool(chosen))
             self._button_group.addButton(button)
             self.tool_layout.addWidget(button)
@@ -178,6 +192,12 @@ class MainWindow(QMainWindow):
         self.redo_action = self._action(edit_menu, "Redo", self.session.redo, QKeySequence.StandardKey.Redo)
         edit_menu.addSeparator()
         self._action(edit_menu, "Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
+        # WidgetShortcut displays Delete in the menu. It only fires when the
+        # window itself has focus, so a line edit still receives the key.
+        # Canvas and this window handle Delete while the user is editing.
+        clear_action = self._action(edit_menu, "Clear selection contents", self.session.clear_selection_contents)
+        clear_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        clear_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
 
         self._action(image_menu, "Crop to selection", self._crop_selection)
         self._action(image_menu, "Trim transparent edges", self.session.trim)
@@ -327,7 +347,7 @@ class MainWindow(QMainWindow):
             button.setChecked(True)
         self.options.set_tool(tool)
         self.canvas.set_tool_cursor(tool.cursor)
-        self.statusBar().showMessage(tool.hint or tool.label)
+        self._toast(tool.hint or tool.label)
 
     def _on_session(self, kind: str) -> None:
         self.canvas.invalidate()
@@ -368,7 +388,7 @@ class MainWindow(QMainWindow):
         x, y = self._cursor
         tool = self.current.label if self.current else ""
         zoom = int(round(self.canvas.zoom * 100))
-        self.statusBar().showMessage(
+        self._status_label.setText(
             f"{doc.width} × {doc.height} px    {x:.0f}, {y:.0f}    {zoom}%    {tool}"
         )
 
@@ -441,7 +461,7 @@ class MainWindow(QMainWindow):
         project = Path(path).suffix.lower() == ".pix"
         self.session.replace_document(document, path if project else None)
         QTimer.singleShot(0, self.canvas.fit)
-        self.statusBar().showMessage(f"Opened {Path(path).name}")
+        self._toast(f"Opened {Path(path).name}")
 
     def _save(self) -> bool:
         if not self.session.path:
@@ -452,7 +472,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save failed", str(exc))
             return False
         self.session.mark_clean()
-        self.statusBar().showMessage(f"Saved {self.session.path}")
+        self._toast(f"Saved {self.session.path}")
         return True
 
     def _save_as(self) -> bool:
@@ -486,7 +506,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        self.statusBar().showMessage(f"Exported {path}")
+        self._toast(f"Exported {path}")
 
     def _rename_layer(self) -> None:
         layer = self.session.active_layer()
@@ -572,6 +592,15 @@ class MainWindow(QMainWindow):
             "About PixEdit",
             f"PixEdit {__version__}\n\nA layered image editor.\nLaunch it with the pix command.",
         )
+
+    def keyPressEvent(self, event) -> None:
+        # Reaches here when the focused child does not accept the key (the
+        # canvas does accept it). Line edits consume Delete themselves.
+        if _is_clear_shortcut(event):
+            self.session.clear_selection_contents()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():

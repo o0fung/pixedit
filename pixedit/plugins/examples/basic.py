@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
+from pixedit.geom import clip_box, covers_document, grow_layer_to_cover, tighten_raster_layer
 from pixedit.model import MutateLayerCommand, apply_visual, visual_state
 from pixedit.tools.base import Tool
 
@@ -49,13 +50,17 @@ def apply_vignette(session) -> None:
 
 
 class MarkerTool(Tool):
-    """Stamp a plus sign. Demonstrates a plugin canvas tool."""
+    """Stamp a plus sign. Demonstrates a plugin canvas tool.
+
+    Each click is the whole gesture. There is no second step: the status
+    message says the stamp landed.
+    """
 
     id = "example.marker"
     label = "Marker"
     shortcut = ""
     cursor = "cross"
-    hint = "Click to stamp a marker on the active layer."
+    hint = "Example plugin. Each click stamps a plus on the active layer. Nothing else to confirm."
 
     def option_schema(self):
         return [
@@ -72,23 +77,52 @@ class MarkerTool(Tool):
     def pointer_down(self, session, event) -> None:
         layer = session.active_layer()
         if layer is None or layer.kind == "redaction":
-            session.show_message("Select a raster or text layer to mark.")
+            session.show_message("Select a raster or text layer. Marker is an example stamp — each click draws a plus.")
             return
         before = visual_state(layer)
+        if layer.kind == "text":
+            layer.kind = "raster"
+            layer.text = None
+        size = max(1, int(session.option("marker_size", 12)))
+        pad = size + 2
+        cx, cy = int(round(event.x)), int(round(event.y))
+        box = clip_box(
+            (cx - pad, cy - pad, cx + pad + 1, cy + pad + 1),
+            session.document.width,
+            session.document.height,
+        )
+        if box is None:
+            apply_visual(layer, before)
+            session.show_message("Click on the canvas to stamp a marker.")
+            return
+        # Same growth rule as the brush: a small layer expands to the stamp,
+        # and a full-canvas plate (background, import, flatten) keeps its size.
+        grow_layer_to_cover(layer, box)
         image = layer.image.copy()
         draw = ImageDraw.Draw(image)
         x = event.x - layer.x
         y = event.y - layer.y
-        size = int(session.option("marker_size", 12))
         color = session.foreground
-        draw.line([(x - size, y), (x + size, y)], fill=color, width=max(1, size // 6))
-        draw.line([(x, y - size), (x, y + size)], fill=color, width=max(1, size // 6))
+        width = max(1, size // 5)
+        draw.ellipse((x - size, y - size, x + size, y + size), outline=color, width=width)
+        draw.line([(x - size, y), (x + size, y)], fill=color, width=width)
+        draw.line([(x, y - size), (x, y + size)], fill=color, width=width)
         layer.image = image
         layer.kind = "raster"
         layer.text = None
+        if not covers_document(
+            int(before["x"]),
+            int(before["y"]),
+            before["image"].width,
+            before["image"].height,
+            session.document.width,
+            session.document.height,
+        ):
+            tighten_raster_layer(layer)
         new_state = visual_state(layer)
         apply_visual(layer, before)
         session.commit(MutateLayerCommand(layer, new_state, name="Marker"))
+        session.show_message("Stamped marker. Marker is an example plugin: each click stamps a plus, and there is no next step.")
 
 
 def register(api) -> None:

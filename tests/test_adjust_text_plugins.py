@@ -73,5 +73,19 @@ def test_example_plugin_registers_and_darkens_corners():
     session.undo()
     session.foreground = (255, 0, 0, 255)
     session.options["marker_size"] = 8
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
     MarkerTool().pointer_down(session, PointerEvent(20, 20))
     assert session.active_layer().image.getpixel((20, 20))[0] > 200
+    assert any("Stamped marker" in message for message in messages)
+
+    from pixedit.factory import raster_layer
+
+    sprite = raster_layer("Dot", Image.new("RGBA", (3, 3), (0, 255, 0, 255)), 4, 4)
+    session.add_layer(sprite)
+    session.layer_index = session.document.index_of(sprite.id)
+    MarkerTool().pointer_down(session, PointerEvent(30, 22))
+    marked = session.active_layer()
+    assert marked.image.size != (40, 40)
+    assert marked.image.getpixel((4 - marked.x, 4 - marked.y))[1] > 200
+    assert marked.image.getpixel((int(round(30 - marked.x)), int(round(22 - marked.y))))[0] > 200

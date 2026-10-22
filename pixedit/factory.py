@@ -20,7 +20,13 @@ def raster_layer(name: str, image: Image.Image, x: int = 0, y: int = 0) -> Layer
 
 
 def blank_layer(name: str, width: int, height: int, fill: tuple[int, int, int, int] = (0, 0, 0, 0)) -> Layer:
+    """A document-sized plate (flatten, or an explicit full-canvas fill)."""
     return raster_layer(name, Image.new("RGBA", (width, height), fill))
+
+
+def empty_raster_layer(name: str) -> Layer:
+    """A content-sized blank layer. Painting grows it around the new marks."""
+    return raster_layer(name, Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0)
 
 
 def text_layer(name: str, info: TextInfo, x: int, y: int) -> Layer:

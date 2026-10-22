@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 from PIL import Image
-from PyQt6.QtCore import Qt, QRectF
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPoint, Qt, QRectF, QTimer
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygon
 from PyQt6.QtWidgets import QWidget
 
 from pixedit.composite import composite
@@ -44,6 +45,16 @@ class CanvasView(QWidget):
         self._pan_last = None
         self._selection_id = None
         self._selection_pixmap: QPixmap | None = None
+        self._edge_id = None
+        self._edge_xs: np.ndarray | None = None
+        self._edge_ys: np.ndarray | None = None
+        self._ant_phase = 0
+        # March the outline without rebuilding the composite. The edge is a
+        # list of pixels, not a second full-canvas buffer, so a large photo
+        # does not allocate another RGBA frame on every tick.
+        self._ant_timer = QTimer(self)
+        self._ant_timer.setInterval(120)
+        self._ant_timer.timeout.connect(self._advance_ants)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
@@ -110,6 +121,7 @@ class CanvasView(QWidget):
         if self._pixmap is not None and not self._pixmap.isNull():
             painter.drawPixmap(target, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
         self._paint_selection(painter, target)
+        self._paint_ants(painter)
         self._paint_overlays(painter)
         painter.setClipping(False)
         pen = QPen(QColor("#3ec6ff"))
@@ -129,13 +141,14 @@ class CanvasView(QWidget):
         if selection is None:
             self._selection_pixmap = None
             self._selection_id = None
+            self._sync_ants(None)
             return
         # Rebuild only when the selection object changes. Commands replace it,
         # so identity is a reliable cache key.
-        if id(selection) == self._selection_id and self._selection_pixmap is not None:
-            return
-        self._selection_pixmap = pil_to_pixmap(_selection_tint(selection))
-        self._selection_id = id(selection)
+        if id(selection) != self._selection_id or self._selection_pixmap is None:
+            self._selection_pixmap = pil_to_pixmap(_selection_tint(selection))
+            self._selection_id = id(selection)
+        self._sync_ants(selection)
 
     def _paint_checker(self, painter: QPainter, target: QRectF) -> None:
         painter.fillRect(target, QColor("#1b2026"))
@@ -168,6 +181,74 @@ class CanvasView(QWidget):
             self._selection_pixmap,
             QRectF(0, 0, self._selection_pixmap.width(), self._selection_pixmap.height()),
         )
+
+    def _advance_ants(self) -> None:
+        if self.session.document.selection is None or self._edge_xs is None:
+            self._ant_timer.stop()
+            return
+        self._ant_phase = (self._ant_phase + 1) % 8
+        self.update()
+
+    def _sync_ants(self, selection: Image.Image | None) -> None:
+        if selection is None:
+            self._edge_xs = None
+            self._edge_ys = None
+            self._edge_id = None
+            self._ant_timer.stop()
+            return
+        if id(selection) == self._edge_id and self._edge_xs is not None:
+            if not self._ant_timer.isActive():
+                self._ant_timer.start()
+            return
+        self._edge_id = id(selection)
+        mask = np.asarray(selection.convert("L")) > 0
+        # One-pixel boundary: a pixel is an edge when any 4-neighbor is outside.
+        eroded = mask.copy()
+        if mask.shape[0] > 1:
+            eroded[1:, :] &= mask[:-1, :]
+            eroded[:-1, :] &= mask[1:, :]
+        if mask.shape[1] > 1:
+            eroded[:, 1:] &= mask[:, :-1]
+            eroded[:, :-1] &= mask[:, 1:]
+        ys, xs = np.nonzero(mask & ~eroded)
+        # A noisy wand outline can be huge. Keep enough points to read the
+        # shape; the tint underneath still shows the full region.
+        if len(xs) > 12000:
+            step = int(math.ceil(len(xs) / 12000))
+            xs = xs[::step]
+            ys = ys[::step]
+        self._edge_xs = xs
+        self._edge_ys = ys
+        if len(xs) == 0:
+            self._ant_timer.stop()
+            return
+        if not self._ant_timer.isActive():
+            self._ant_timer.start()
+
+    def _paint_ants(self, painter: QPainter) -> None:
+        if self._edge_xs is None or self._edge_ys is None or len(self._edge_xs) == 0:
+            return
+        light = ((self._edge_xs + self._edge_ys + self._ant_phase) & 7) < 4
+        ruler = self.ruler()
+        painter.save()
+        painter.translate(ruler + self.offset_x, ruler + self.offset_y)
+        painter.scale(self.zoom, self.zoom)
+        # At least one screen pixel, and one image pixel when zoomed in.
+        pen_w = max(1.0, 1.0 / max(self.zoom, 0.02))
+        self._draw_ant_points(painter, self._edge_xs[light], self._edge_ys[light], QColor("#f4fbff"), pen_w)
+        self._draw_ant_points(painter, self._edge_xs[~light], self._edge_ys[~light], QColor("#12161c"), pen_w)
+        painter.restore()
+
+    def _draw_ant_points(self, painter: QPainter, xs: np.ndarray, ys: np.ndarray, color: QColor, pen_w: float) -> None:
+        if len(xs) == 0:
+            return
+        pen = QPen(color)
+        pen.setWidthF(pen_w)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        points = [QPoint(int(x), int(y)) for x, y in zip(xs.tolist(), ys.tolist())]
+        painter.drawPoints(QPolygon(points))
 
     def _paint_overlays(self, painter: QPainter) -> None:
         tool = self.tool_getter()
@@ -299,6 +380,10 @@ class CanvasView(QWidget):
             if tool is not None:
                 tool.pointer_cancel(self.session)
             return
+        if _is_clear_shortcut(event):
+            self.session.clear_selection_contents()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
@@ -342,9 +427,18 @@ def _tick_step(zoom: float) -> float:
     return power * 10
 
 
-def _selection_tint(selection: Image.Image) -> Image.Image:
-    import numpy as np
+def _is_clear_shortcut(event) -> bool:
+    """Delete/Backspace clears a selection, but not while a modifier is held."""
+    if event.isAutoRepeat():
+        return False
+    mods = event.modifiers()
+    blocked = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier
+    if mods & blocked:
+        return False
+    return event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
 
+
+def _selection_tint(selection: Image.Image) -> Image.Image:
     mask = np.asarray(selection.convert("L"))
     height, width = mask.shape
     rgba = np.zeros((height, width, 4), dtype=np.uint8)

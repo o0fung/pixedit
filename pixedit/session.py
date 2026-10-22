@@ -10,19 +10,22 @@ from __future__ import annotations
 import copy
 from typing import Any, Callable
 
+import numpy as np
 from PIL import Image
 
 from pixedit.composite import composite, merge_pair
-from pixedit.factory import blank_layer, redaction_layer, text_layer
+from pixedit.factory import blank_layer, empty_raster_layer, redaction_layer, text_layer
 from pixedit.geom import (
     canvas_flip,
     canvas_rotate_ccw,
     canvas_rotate_cw,
+    covers_document,
     crop_document,
-    expand_to_canvas,
     flip_visual,
     rotate_visual,
     scale_visual,
+    selection_for_layer,
+    tighten_raster_layer,
     trim_rect,
 )
 from pixedit.model import (
@@ -165,8 +168,9 @@ class Session:
         self.notify("change")
 
     def add_blank_layer(self) -> None:
+        """Add an empty content-sized layer. The first stroke grows its bitmap."""
         number = len(self.document.layers) + 1
-        layer = blank_layer(f"Layer {number}", self.document.width, self.document.height)
+        layer = empty_raster_layer(f"Layer {number}")
         self.add_layer(layer, name="New layer")
 
     def duplicate_active(self) -> None:
@@ -259,7 +263,57 @@ class Session:
         self.commit(SetLayerAttrCommand(layer, "blend_mode", mode, name="Blend mode"))
 
     def set_selection(self, selection: Image.Image | None, name: str = "Selection") -> None:
+        introducing = self.document.selection is None and selection is not None
         self.commit(SetSelectionCommand(self.document, selection, name=name))
+        if introducing:
+            self.show_message(
+                "Selection clips brush, fill, shapes, and filters. "
+                "Delete clears pixels · Ctrl+D deselects · Image → Crop to selection."
+            )
+
+    def clear_selection_contents(self) -> None:
+        """Erase pixels of the active raster or text layer inside the selection.
+
+        Text is rasterized in the same undo step. A layer that already covers
+        the document keeps its size, so a hole stays a hole in the plate.
+        Smaller layers are cropped back to whatever opaque pixels remain.
+        Redaction masks are left alone.
+        """
+        if self.document.selection is None:
+            self.show_message("No selection. Draw one with Select (M), then Delete clears its pixels.")
+            return
+        layer = self.active_layer()
+        if layer is None:
+            self.show_message("No layer to clear.")
+            return
+        if layer.kind == "redaction":
+            self.show_message("Delete clears pixels on a raster layer. Use the eraser to lift a redaction mask.")
+            return
+        before = visual_state(layer)
+        local = selection_for_layer(self.document, layer)
+        if local is None:
+            self.show_message("The selection does not overlap the active layer.")
+            return
+        selected = np.asarray(local) > 0
+        if not bool(selected.any()):
+            self.show_message("The selection does not overlap the active layer.")
+            return
+        preserve = covers_document(
+            layer.x, layer.y, layer.image.width, layer.image.height, self.document.width, self.document.height
+        )
+        arr = np.array(layer.image.convert("RGBA"))
+        # Zero RGB as well as alpha so a later tight crop and any sampling
+        # of the cleared pixels do not resurrect the old color.
+        arr[selected, :3] = 0
+        arr[selected, 3] = 0
+        layer.image = Image.fromarray(arr, "RGBA")
+        layer.kind = "raster"
+        layer.text = None
+        if not preserve:
+            tighten_raster_layer(layer)
+        new_state = visual_state(layer)
+        apply_visual(layer, before)
+        self.commit(MutateLayerCommand(layer, new_state, name="Clear selection"))
 
     def select_all(self) -> None:
         mask = Image.new("L", (self.document.width, self.document.height), 255)
@@ -354,23 +408,47 @@ class Session:
         layer was inserted immediately for preview and is not yet an undo step;
         ``finish_raster_edit`` turns that into one command. Text layers are
         rasterized after ``before_state`` is captured, so undo restores the text.
+
+        The bitmap is not expanded to the document. Callers grow it around the
+        gesture, and ``finish_raster_edit`` crops transparent margins unless
+        the layer already covered the canvas.
         """
         layer = self.active_layer()
         if layer is not None and layer.kind == "redaction" and paint_redaction:
             return layer, visual_state(layer), False
         if layer is None or layer.kind == "redaction":
-            created = blank_layer(
-                f"Layer {len(self.document.layers) + 1}",
-                self.document.width,
-                self.document.height,
-            )
+            created = empty_raster_layer(f"Layer {len(self.document.layers) + 1}")
             index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
             self.document.layers.insert(index, created)
             self.layer_index = index
             return created, None, True
         before = visual_state(layer)
-        expand_to_canvas(layer, self.document.width, self.document.height)
+        if layer.kind == "text":
+            layer.kind = "raster"
+            layer.text = None
         return layer, before, False
+
+    def _fit_content_unless_full_canvas(self, layer: Layer, before: dict[str, Any] | None) -> None:
+        """Crop a layer to its opaque pixels unless it was already a full-canvas plate.
+
+        Redaction masks stay document-sized. A background, import, or flatten
+        covers the document in ``before`` and keeps that extent even if the
+        gesture only touched a corner.
+        """
+        if layer.kind == "redaction":
+            return
+        if before is not None:
+            image = before["image"]
+            if covers_document(
+                int(before["x"]),
+                int(before["y"]),
+                image.width,
+                image.height,
+                self.document.width,
+                self.document.height,
+            ):
+                return
+        tighten_raster_layer(layer)
 
     def finish_raster_edit(
         self,
@@ -379,6 +457,7 @@ class Session:
         created: bool,
         name: str,
     ) -> None:
+        self._fit_content_unless_full_canvas(layer, before)
         if created:
             try:
                 index = self.document.layers.index(layer)

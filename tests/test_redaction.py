@@ -93,6 +93,7 @@ def test_redact_tool_is_undoable_and_nondestructive():
     assert any(layer.kind == "redaction" for layer in session.document.layers)
     assert np.array_equal(np.array(session.document.layers[0].image), before)
     mask = next(layer for layer in session.document.layers if layer.kind == "redaction").mask
+    assert mask.size == (32, 32)
     assert mask.getpixel((16, 16)) == 255
     assert mask.getpixel((1, 1)) == 0
     session.undo()

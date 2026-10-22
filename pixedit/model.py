@@ -51,9 +51,12 @@ class Layer:
     """One stack entry.
 
     Raster and text layers store straight RGBA pixels in ``image``, placed at
-    ``(x, y)`` on the canvas. A redaction layer stores an ``L`` mask
-    (255 = fully redacted) and does not paint its own color; compositing
-    blurs or pixelates whatever is already underneath the mask.
+    ``(x, y)`` on the canvas. Paint and shapes grow that bitmap around new
+    marks; they do not resize every layer to the document. A layer that
+    already covers the canvas (background, import, flatten) keeps that size.
+    A redaction layer stores an ``L`` mask (255 = fully redacted) in document
+    coordinates and does not paint its own color; compositing blurs or
+    pixelates whatever is already underneath the mask.
     """
 
     id: str

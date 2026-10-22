@@ -296,6 +296,7 @@ class ShortcutsDialog(QDialog):
                     "Ctrl+E  Export flattened image",
                     "Ctrl+Z  Undo         Ctrl+Shift+Z or Ctrl+Y  Redo",
                     "Ctrl+A  Select all   Ctrl+D  Deselect   Ctrl+Shift+I  Invert selection",
+                    "Delete or Backspace  Clear pixels inside the selection",
                     "Ctrl+0  Fit          Ctrl+1  100%       Ctrl++ / Ctrl+-  Zoom",
                     "V Move   B Brush   E Eraser   T Text   R Redact   M Select",
                     "C Crop   G Fill    I Eyedropper   U Shape   H Hand   Z Zoom",

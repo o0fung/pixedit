@@ -16,11 +16,14 @@ from PIL import Image
 from pixedit.composite import composite
 from pixedit.geom import (
     clamp_crop,
+    clip_box,
     combine_selection,
+    grow_layer_to_cover,
     hit_opaque,
     mask_ellipse,
     mask_freehand,
     mask_rect,
+    paint_bounds,
     place_image,
     rotate_visual,
     selection_for_layer,
@@ -69,6 +72,18 @@ def _local_selection(session, origin: tuple[int, int], shape: tuple[int, int]) -
     crop = np.asarray(full.crop((x0, y0, x1, y1)))
     sel[y0 - oy : y0 - oy + crop.shape[0], x0 - ox : x0 - ox + crop.shape[1]] = crop
     return sel
+
+
+def _canvas_selected(document, x: int, y: int) -> bool:
+    """Whether document pixel ``(x, y)`` is inside the current selection."""
+    selection = document.selection
+    if selection is None:
+        return True
+    if selection.size != (document.width, document.height):
+        selection = place_image(selection, 0, 0, document.width, document.height, 0)
+    if not (0 <= x < selection.width and 0 <= y < selection.height):
+        return False
+    return int(selection.getpixel((x, y))) > 0
 
 
 class MoveTool(Tool):
@@ -345,6 +360,9 @@ class _PaintTool(Tool):
     def _stamp(self, session, x: float, y: float) -> None:
         if self._array is None:
             return
+        self._ensure_cover(session, x, y)
+        if self._array is None:
+            return
         radius, hardness, opacity = _brush_params(session)
         local_x = x - self._origin[0]
         local_y = y - self._origin[1]
@@ -363,6 +381,50 @@ class _PaintTool(Tool):
                 self._selection,
             )
 
+    def _ensure_cover(self, session, x: float, y: float) -> None:
+        """Grow the stroke buffer so a dab outside the bitmap still lands.
+
+        Redaction masks stay at their current size (document-sized when the
+        redact tool created them). Raster growth is clipped to the document,
+        with slack so the next moves in a stroke reuse the same buffer.
+        """
+        if self._array is None or self._layer is None or self._mask_mode:
+            return
+        radius, _, _ = _brush_params(session)
+        rad = int(math.ceil(radius)) + 1
+        ix, iy = int(math.floor(x)), int(math.floor(y))
+        dab = (ix - rad, iy - rad, ix + rad + 1, iy + rad + 1)
+        height, width = self._array.shape[:2]
+        ox, oy = self._origin
+        if dab[0] >= ox and dab[1] >= oy and dab[2] <= ox + width and dab[3] <= oy + height:
+            return
+        empty = not bool(np.any(self._array[..., 3]))
+        bounds = paint_bounds(
+            self._origin,
+            (width, height),
+            dab,
+            session.document.width,
+            session.document.height,
+            slack=32,
+            empty=empty,
+        )
+        if bounds is None:
+            return
+        nx0, ny0, nx1, ny1 = bounds
+        new_w, new_h = nx1 - nx0, ny1 - ny0
+        if (nx0, ny0) == (ox, oy) and new_w == width and new_h == height:
+            return
+        grown = np.zeros((new_h, new_w, 4), np.uint8)
+        if not empty:
+            paste_x = ox - nx0
+            paste_y = oy - ny0
+            grown[paste_y : paste_y + height, paste_x : paste_x + width] = self._array
+        self._array = grown
+        self._origin = (nx0, ny0)
+        self._layer.x = nx0
+        self._layer.y = ny0
+        self._selection = _local_selection(session, self._origin, self._array.shape[:2])
+
     def _publish(self) -> None:
         if self._layer is None or self._array is None:
             return
@@ -376,7 +438,7 @@ class BrushTool(_PaintTool):
     id = "brush"
     label = "Brush"
     shortcut = "B"
-    hint = "Paint on the active layer. [ and ] change the size."
+    hint = "Paint on the active layer. The bitmap grows to fit the stroke. [ and ] change the size."
 
 
 class EraserTool(_PaintTool):
@@ -573,7 +635,7 @@ class SelectTool(Tool):
     label = "Select"
     shortcut = "M"
     cursor = "cross"
-    hint = "Drag a selection. Shift adds, Alt subtracts. Wand uses the tolerance."
+    hint = "Drag a selection. Brush, fill, shapes, and filters stay inside it. Delete clears those pixels. Shift adds, Alt subtracts."
 
     def __init__(self) -> None:
         self._dragging = False
@@ -724,7 +786,7 @@ class FillTool(Tool):
     label = "Fill"
     shortcut = "G"
     cursor = "cross"
-    hint = "Click to flood-fill similar connected pixels."
+    hint = "Click to flood-fill connected pixels within tolerance. A selection limits the fill."
 
     def option_schema(self):
         return [
@@ -732,16 +794,34 @@ class FillTool(Tool):
         ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
+        # Outside the canvas, the layer, or the selection: explain and do not
+        # commit. A click outside the selection must not fill a connected
+        # region that merely overlaps the selection somewhere else.
+        doc = session.document
+        px = int(math.floor(event.x))
+        py = int(math.floor(event.y))
+        if not (0 <= px < doc.width and 0 <= py < doc.height):
+            session.show_message("Click is outside the canvas.")
+            return
         layer, before, created = session.begin_raster_edit(paint_redaction=False)
         local_x = int(math.floor(event.x - layer.x))
         local_y = int(math.floor(event.y - layer.y))
         if not (0 <= local_x < layer.image.width and 0 <= local_y < layer.image.height):
             session.cancel_raster_edit(layer, before, created)
+            session.show_message("Click is outside the active layer. Fill recolors connected pixels on that layer.")
+            return
+        if doc.selection is not None and not _canvas_selected(doc, px, py):
+            session.cancel_raster_edit(layer, before, created)
+            session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
             return
         mask = connected_mask(layer.image, local_x, local_y, int(session.option("tolerance", 32)))
-        selection = selection_for_layer(session.document, layer)
+        selection = selection_for_layer(doc, layer)
         if selection is not None:
             keep = np.minimum(np.asarray(mask), np.asarray(selection))
+            if not bool(np.any(keep)):
+                session.cancel_raster_edit(layer, before, created)
+                session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
+                return
             mask = Image.fromarray(keep, "L")
         layer.image = fill_where(layer.image, mask, session.foreground)
         session.finish_raster_edit(layer, before, created, "Fill")
@@ -807,7 +887,15 @@ class ShapeTool(Tool):
         if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 1:
             session.preview()
             return
+        box = self._canvas_box(session)
+        if box is None:
+            session.show_message("The shape is outside the canvas.")
+            session.preview()
+            return
         layer, before, created = session.begin_raster_edit(paint_redaction=False)
+        # Grow to the stroke's canvas box first so a small layer can hold it.
+        # finish_raster_edit then crops back to the opaque pixels.
+        grow_layer_to_cover(layer, box)
         kind = str(session.option("shape_kind", "rect"))
         selection = selection_for_layer(session.document, layer)
         # Gestures arrive in canvas coordinates. The bitmap is local to the layer.
@@ -828,6 +916,16 @@ class ShapeTool(Tool):
     def pointer_cancel(self, session) -> None:
         self._dragging = False
         session.preview()
+
+    def _canvas_box(self, session) -> tuple[int, int, int, int] | None:
+        """Half-open document box covering the shape, including its stroke."""
+        stroke = int(session.option("stroke_width", 4))
+        pad = max(1, stroke)
+        x0 = math.floor(min(self._start[0], self._end[0])) - pad
+        y0 = math.floor(min(self._start[1], self._end[1])) - pad
+        x1 = math.ceil(max(self._start[0], self._end[0])) + pad + 1
+        y1 = math.ceil(max(self._start[1], self._end[1])) + pad + 1
+        return clip_box((int(x0), int(y0), int(x1), int(y1)), session.document.width, session.document.height)
 
     def overlays(self, session) -> list[Overlay]:
         if not self._dragging:

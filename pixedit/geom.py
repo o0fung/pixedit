@@ -359,22 +359,128 @@ def visual_state_like(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def expand_to_canvas(layer: Layer, width: int, height: int) -> None:
-    """Make a raster/text layer cover the whole document so tools can paint anywhere.
+def covers_document(x: int, y: int, width: int, height: int, doc_width: int, doc_height: int) -> bool:
+    """True when a placed bitmap already hides every document pixel.
 
-    Text metadata is dropped because the bitmap is no longer a pure text render.
-    The caller snapshots ``visual_state`` first so undo can bring the text back.
+    Backgrounds, imports, and flattened plates use this so a later paint stroke
+    does not crop them down to the new mark.
     """
-    if (
-        layer.kind == "raster"
-        and layer.x == 0
-        and layer.y == 0
-        and layer.image.size == (width, height)
-    ):
+    return int(x) <= 0 and int(y) <= 0 and int(x) + int(width) >= int(doc_width) and int(y) + int(height) >= int(doc_height)
+
+
+def image_has_opaque(image: Image.Image) -> bool:
+    if image.width < 1 or image.height < 1:
+        return False
+    if image.mode == "L":
+        return bool(int(np.asarray(image).max()) > 0)
+    return bool(int(np.asarray(image.convert("RGBA"))[..., 3].max()) > 0)
+
+
+def clip_box(
+    box: tuple[int, int, int, int], width: int, height: int
+) -> tuple[int, int, int, int] | None:
+    """Clip a half-open box to the document. ``None`` when nothing remains."""
+    x0 = max(0, int(box[0]))
+    y0 = max(0, int(box[1]))
+    x1 = min(int(width), int(box[2]))
+    y1 = min(int(height), int(box[3]))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def paint_bounds(
+    origin: tuple[int, int],
+    size: tuple[int, int],
+    dab: tuple[int, int, int, int],
+    doc_width: int,
+    doc_height: int,
+    *,
+    slack: int,
+    empty: bool,
+) -> tuple[int, int, int, int] | None:
+    """Canvas box a brush buffer needs in order to show ``dab``.
+
+    ``dab`` and the returned box are half-open. The dab is padded by ``slack``
+    so a stroke does not reallocate on every move, then clipped to the
+    document. ``None`` means the dab misses the document entirely.
+
+    An empty bitmap adopts that clipped box instead of staying anchored on a
+    1×1 placeholder (which would union all the way back to the origin). A
+    bitmap that already has pixels keeps those pixels, including any that sit
+    outside the document because the layer was moved.
+    """
+    dab_hit = clip_box(dab, doc_width, doc_height)
+    if dab_hit is None:
+        return None
+    padded = clip_box(
+        (dab[0] - slack, dab[1] - slack, dab[2] + slack, dab[3] + slack),
+        doc_width,
+        doc_height,
+    )
+    target = padded if padded is not None else dab_hit
+    if empty:
+        return target
+    ox, oy = int(origin[0]), int(origin[1])
+    width, height = int(size[0]), int(size[1])
+    return (
+        min(ox, target[0]),
+        min(oy, target[1]),
+        max(ox + width, target[2]),
+        max(oy + height, target[3]),
+    )
+
+
+def grow_layer_to_cover(
+    layer: Layer, box: tuple[int, int, int, int], *, replace_if_empty: bool = True
+) -> None:
+    """Expand a raster bitmap so its placement includes ``box``.
+
+    ``box`` is a half-open canvas rectangle, already clipped to the document.
+    New pixels are transparent. An empty layer is moved onto ``box`` rather
+    than unioned with its old origin.
+    """
+    x0, y0, x1, y1 = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+    if x1 <= x0 or y1 <= y0:
         return
-    layer.image = place_image(layer.image.convert("RGBA"), layer.x, layer.y, width, height)
-    layer.x = 0
-    layer.y = 0
+    if replace_if_empty and not image_has_opaque(layer.image):
+        layer.image = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+        layer.x = x0
+        layer.y = y0
+        return
+    lx0, ly0 = int(layer.x), int(layer.y)
+    lx1, ly1 = lx0 + layer.image.width, ly0 + layer.image.height
+    nx0, ny0 = min(lx0, x0), min(ly0, y0)
+    nx1, ny1 = max(lx1, x1), max(ly1, y1)
+    if (nx0, ny0, nx1, ny1) == (lx0, ly0, lx1, ly1):
+        return
+    canvas = Image.new("RGBA", (nx1 - nx0, ny1 - ny0), (0, 0, 0, 0))
+    canvas.paste(layer.image.convert("RGBA"), (lx0 - nx0, ly0 - ny0))
+    layer.image = canvas
+    layer.x = nx0
+    layer.y = ny0
+
+
+def tighten_raster_layer(layer: Layer) -> None:
+    """Crop transparent margins and shift ``(x, y)`` onto the opaque pixels.
+
+    A fully clear layer becomes a 1×1 transparent image and keeps its origin.
+    Redaction masks are not cropped; they stay in document coordinates.
+    """
+    if layer.kind == "redaction":
+        return
+    box = alpha_bbox(layer.image)
+    if box is None:
+        layer.image = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        layer.kind = "raster"
+        layer.text = None
+        return
+    x0, y0, x1, y1 = box
+    if (x0, y0, x1, y1) == (0, 0, layer.image.width, layer.image.height):
+        return
+    layer.image = layer.image.crop((x0, y0, x1, y1))
+    layer.x += x0
+    layer.y += y0
     layer.kind = "raster"
     layer.text = None
 
