@@ -35,7 +35,7 @@ def vignette_image(image: Image.Image, strength: float = 0.65) -> Image.Image:
 
 
 def apply_vignette(session) -> None:
-    layer = session.active_layer()
+    layer = session.ensure_drawable_layer(allow_redaction=False)
     if layer is None or layer.kind == "redaction":
         session.show_message("Vignette needs a raster or text layer.")
         return
@@ -75,9 +75,12 @@ class MarkerTool(Tool):
         ]
 
     def pointer_down(self, session, event) -> None:
-        layer = session.active_layer()
+        layer = session.ensure_drawable_layer(allow_redaction=False)
+        if layer is None:
+            session.add_blank_layer()
+            layer = session.active_layer()
         if layer is None or layer.kind == "redaction":
-            session.show_message("Select a raster or text layer. Marker is an example stamp — each click draws a plus.")
+            session.show_message("Marker stamps a raster or text layer. It does not draw on a redaction mask.")
             return
         before = visual_state(layer)
         if layer.kind == "text":

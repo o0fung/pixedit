@@ -214,7 +214,14 @@ class LayerPanel(QWidget):
         return f"{layer.name}   {int(round(layer.opacity * 100))}%  {kind}"
 
     def _on_row(self, row: int) -> None:
-        if self._building or row < 0:
+        if self._building:
+            return
+        # Clicking off the rows clears the selection. Paint tools then pick a
+        # visible layer themselves instead of editing a highlight that is gone.
+        if row < 0:
+            if self.session.layer_index != -1:
+                self.session.layer_index = -1
+                self._sync_controls()
             return
         index = len(self.session.document.layers) - 1 - row
         self.session.layer_index = index

@@ -311,3 +311,51 @@ def test_escape_deselects_when_idle_and_cancels_a_shape_first():
     window.session.dirty = False
     window.close()
     app.processEvents()
+
+
+def test_open_image_brush_and_fill_with_and_without_a_layer_selection(tmp_path: Path):
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.tools.base import PointerEvent
+    from pixedit.tools.builtins import BrushTool, FillTool
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(900, 700)
+    window.show()
+    app.processEvents()
+    path = tmp_path / "photo.png"
+    Image.new("RGBA", (32, 24), (255, 255, 255, 255)).save(path)
+    window.open_path(str(path))
+    app.processEvents()
+    assert window.session.layer_index == 0
+    assert window.layers.list.currentRow() == 0
+
+    window.session.foreground = (255, 0, 0, 255)
+    window.session.options["brush_size"] = 6
+    window.session.options["brush_hardness"] = 100
+    window.session.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(window.session, PointerEvent(8, 8))
+    brush.pointer_up(window.session, PointerEvent(8, 8))
+    assert window.session.active_layer().image.getpixel((8, 8))[0] > 200
+
+    window.layers.list.setCurrentRow(-1)
+    app.processEvents()
+    assert window.layers.list.currentRow() == -1
+    assert window.session.layer_index == -1
+    assert window.session.active_layer() is None
+
+    window.session.foreground = (0, 0, 255, 255)
+    window.session.options["tolerance"] = 0
+    FillTool().pointer_down(window.session, PointerEvent(16, 12))
+    app.processEvents()
+    photo = window.session.document.layers[0]
+    assert photo.image.getpixel((16, 12))[:3] == (0, 0, 255)
+    assert window.session.layer_index == 0
+    assert window.layers.list.currentRow() == 0
+    assert len(window.session.document.layers) == 1
+    window.session.dirty = False
+    window.close()
+    app.processEvents()

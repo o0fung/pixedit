@@ -72,11 +72,28 @@ def default_options() -> dict[str, Any]:
     }
 
 
+def _preferred_layer_index(document: Document) -> int:
+    """Which layer to select when a document is opened or replaced.
+
+    Multi-frame imports leave only the first frame visible. Selecting the
+    last layer would send brush and fill at a hidden frame.
+    """
+    if not document.layers:
+        return -1
+    for index, layer in enumerate(document.layers):
+        if layer.visible and layer.kind in {"raster", "text"}:
+            return index
+    for index, layer in enumerate(document.layers):
+        if layer.visible:
+            return index
+    return len(document.layers) - 1
+
+
 class Session:
     def __init__(self, document: Document | None = None) -> None:
         self.document = document or new_document(1280, 800, "white")
         self.history = History()
-        self.layer_index = len(self.document.layers) - 1
+        self.layer_index = _preferred_layer_index(self.document)
         self.foreground: tuple[int, int, int, int] = (20, 24, 28, 255)
         self.options = default_options()
         self.path: str | None = None
@@ -136,10 +153,14 @@ class Session:
         self.notify("change")
 
     def clamp_index(self) -> None:
+        # -1 means nothing is selected. Leave it there so a cleared layer list
+        # does not silently target whichever layer happens to sit at index 0.
         if not self.document.layers:
             self.layer_index = -1
-        else:
-            self.layer_index = max(0, min(self.layer_index, len(self.document.layers) - 1))
+            return
+        if self.layer_index < 0:
+            return
+        self.layer_index = min(self.layer_index, len(self.document.layers) - 1)
 
     def active_layer(self) -> Layer | None:
         self.clamp_index()
@@ -153,10 +174,44 @@ class Session:
     def replace_document(self, document: Document, path: str | None = None) -> None:
         self.document = document
         self.history = History()
-        self.layer_index = len(document.layers) - 1
+        # First visible frame, not the last layer. A GIF, TIFF, or PDF hides
+        # every page after the first; painting the hidden page looks like a no-op.
+        self.layer_index = _preferred_layer_index(document)
         self.path = path
         self.dirty = False
         self.notify("change")
+
+    def ensure_drawable_layer(self, *, allow_redaction: bool = False) -> Layer | None:
+        """Select a layer that brush, fill, shape, and text can edit.
+
+        A raster or text layer that is already active is kept. A redaction
+        mask stays active only for tools that paint the mask. When nothing is
+        selected, the topmost visible raster or text layer is selected so the
+        click still hits the open image. Returns None when the document has
+        no such layer and the caller should create one.
+        """
+        layer = self.active_layer()
+        if layer is not None and layer.kind in {"raster", "text"}:
+            return layer
+        if layer is not None and layer.kind == "redaction" and allow_redaction:
+            return layer
+        if layer is not None and layer.kind == "redaction":
+            # Fill, shape, and text must not rewrite the mask. The caller
+            # adds a raster layer above it.
+            return layer
+        index = self._top_visible_drawable_index()
+        if index is None:
+            return None
+        self.layer_index = index
+        self.notify("change")
+        return self.document.layers[index]
+
+    def _top_visible_drawable_index(self) -> int | None:
+        for index in range(len(self.document.layers) - 1, -1, -1):
+            candidate = self.document.layers[index]
+            if candidate.visible and candidate.kind in {"raster", "text"}:
+                return index
+        return None
 
     def new_canvas(self, width: int, height: int, background: str) -> None:
         self.replace_document(new_document(width, height, background), None)
@@ -654,7 +709,7 @@ class Session:
 
     def run_filter(self, name: str, function: Callable[[Image.Image], Image.Image]) -> None:
         """Apply a pixel function to the active raster or text layer, honoring the selection."""
-        layer = self.active_layer()
+        layer = self.ensure_drawable_layer(allow_redaction=False)
         if layer is None or layer.kind == "redaction":
             self.show_message("Choose a raster or text layer for this filter.")
             return

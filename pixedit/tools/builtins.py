@@ -20,6 +20,7 @@ from pixedit.geom import (
     combine_selection,
     grow_layer_to_cover,
     hit_opaque,
+    image_has_opaque,
     mask_ellipse,
     mask_freehand,
     mask_rect,
@@ -302,6 +303,9 @@ class _PaintTool(Tool):
         ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
+        # No row selected: paint the open image. A redaction layer stays the
+        # target so the eraser can lift the mask.
+        session.ensure_drawable_layer(allow_redaction=True)
         layer, before, created = session.begin_raster_edit(paint_redaction=True)
         self._layer = layer
         self._before = before
@@ -709,7 +713,7 @@ class SelectTool(Tool):
         return mask_rect(doc.width, doc.height, x0, y0, event.x, event.y)
 
     def _wand(self, session, event: PointerEvent) -> None:
-        layer = session.active_layer()
+        layer = session.ensure_drawable_layer(allow_redaction=False)
         if layer is None or layer.kind == "redaction":
             session.show_message("Magic wand samples the active raster or text layer.")
             return
@@ -816,13 +820,28 @@ class FillTool(Tool):
         if not (0 <= px < doc.width and 0 <= py < doc.height):
             session.show_message("Click is outside the canvas.")
             return
+        # Nothing selected: fill the picture that is already open. A redaction
+        # mask is left alone; begin_raster_edit adds a raster layer above it.
+        session.ensure_drawable_layer(allow_redaction=False)
         layer, before, created = session.begin_raster_edit(paint_redaction=False)
         local_x = int(math.floor(event.x - layer.x))
         local_y = int(math.floor(event.y - layer.y))
         if not (0 <= local_x < layer.image.width and 0 <= local_y < layer.image.height):
-            session.cancel_raster_edit(layer, before, created)
-            session.show_message("Click is outside the active layer. Fill recolors connected pixels on that layer.")
-            return
+            # An empty content-sized layer is only 1×1, so almost every click
+            # misses it. Grow a transparent plate to the canvas and fill that,
+            # instead of stopping on a status message. A layer that already
+            # has pixels keeps its bounds: a miss there is reported.
+            if image_has_opaque(layer.image):
+                session.cancel_raster_edit(layer, before, created)
+                session.show_message("Click is outside the active layer. Fill recolors connected pixels on that layer.")
+                return
+            grow_layer_to_cover(layer, (0, 0, doc.width, doc.height))
+            local_x = int(math.floor(event.x - layer.x))
+            local_y = int(math.floor(event.y - layer.y))
+            if not (0 <= local_x < layer.image.width and 0 <= local_y < layer.image.height):
+                session.cancel_raster_edit(layer, before, created)
+                session.show_message("Click is outside the canvas.")
+                return
         if doc.selection is not None and not _canvas_selected(doc, px, py):
             session.cancel_raster_edit(layer, before, created)
             session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
@@ -896,6 +915,7 @@ class ShapeTool(Tool):
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         self._cancel_edit(session)
+        session.ensure_drawable_layer(allow_redaction=False)
         self._dragging = True
         self._start = (event.x, event.y)
         self._end = (event.x, event.y)

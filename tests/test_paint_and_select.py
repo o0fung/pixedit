@@ -5,7 +5,7 @@ from __future__ import annotations
 from PIL import Image, ImageDraw
 
 from pixedit.factory import raster_layer, redaction_layer
-from pixedit.model import new_document
+from pixedit.model import Document, new_document
 from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
@@ -575,3 +575,63 @@ def test_place_layers_keeps_the_document_and_undoes():
     session.place_layers([redaction_layer("Hide", Image.new("L", (8, 8), 255), "pixelate", 8)])
     assert any("no image" in message for message in messages)
     assert len(session.document.layers) == 1
+
+
+def test_paint_and_fill_with_no_layer_selected_and_on_an_empty_layer():
+    visible = raster_layer("Photo", Image.new("RGBA", (20, 16), (255, 255, 255, 255)))
+    hidden = raster_layer("Page 2", Image.new("RGBA", (20, 16), (0, 0, 255, 255)))
+    hidden.visible = False
+    session = Session()
+    session.replace_document(Document(width=20, height=16, layers=[visible, hidden]))
+    assert session.layer_index == 0
+    assert session.active_layer().name == "Photo"
+
+    session.layer_index = -1
+    assert session.active_layer() is None
+    session.foreground = (255, 0, 0, 255)
+    session.options["brush_size"] = 6
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(session, PointerEvent(8, 8))
+    brush.pointer_up(session, PointerEvent(8, 8))
+    assert len(session.document.layers) == 2
+    assert session.layer_index == 0
+    assert session.document.layers[0].image.getpixel((8, 8))[0] > 200
+    assert not session.document.layers[1].visible
+    session.undo()
+    assert session.document.layers[0].image.getpixel((8, 8))[:3] == (255, 255, 255)
+
+    session.layer_index = -1
+    session.foreground = (0, 180, 0, 255)
+    session.options["tolerance"] = 0
+    FillTool().pointer_down(session, PointerEvent(4, 4))
+    assert session.layer_index == 0
+    assert session.document.layers[0].image.getpixel((4, 4))[:3] == (0, 180, 0)
+    assert session.document.layers[1].image.getpixel((4, 4))[2] == 255
+
+    session.add_blank_layer()
+    blank = session.active_layer()
+    assert blank.image.size == (1, 1)
+    session.foreground = (0, 0, 255, 255)
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    FillTool().pointer_down(session, PointerEvent(10, 10))
+    assert not any("outside the active layer" in message for message in messages)
+    filled = session.active_layer()
+    assert _pixel(filled, 10, 10)[2] > 200
+    assert session.document.layers[0].image.getpixel((4, 4))[:3] == (0, 180, 0)
+
+    mask = Image.new("L", (20, 16), 0)
+    redacted = redaction_layer("Hide", mask, "pixelate", 8)
+    session.add_layer(redacted)
+    session.layer_index = session.document.index_of(redacted.id)
+    before_mask = redacted.mask.copy()
+    session.foreground = (255, 128, 0, 255)
+    FillTool().pointer_down(session, PointerEvent(6, 6))
+    assert redacted.kind == "redaction"
+    assert redacted.mask.tobytes() == before_mask.tobytes()
+    assert any(
+        layer.kind == "raster" and _pixel(layer, 6, 6)[0] > 200
+        for layer in session.document.layers
+    )
