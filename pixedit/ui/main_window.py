@@ -716,7 +716,7 @@ class MainWindow(QMainWindow):
             self.set_tool(tool)
 
     def _filter(self, title: str, specs: list[dict], apply_fn) -> None:
-        layer = self.session.active_layer()
+        layer = self.session.ensure_drawable_layer(allow_redaction=False)
         if layer is None or layer.kind == "redaction":
             self._toast("Choose a raster or text layer.")
             return
