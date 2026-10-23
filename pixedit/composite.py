@@ -3,8 +3,8 @@
 Pipeline for each visible layer, bottom to top:
 
 1. Redaction layers do not draw their own pixels. They take the canvas so
-   far, blur or pixelate it, and mix that effect back through the mask.
-   Source layers underneath stay untouched.
+   far, run the mask effect (pixelate, blur, solid, noise, and the rest),
+   and mix that back through the mask. Source layers underneath stay untouched.
 2. Raster and text layers are blended with a CSS-style "simple alpha
    compositing" formula (source-over, with the blend mode applied only where
    both coverages overlap). That keeps Multiply/Screen/Overlay from turning
@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image
 
 from pixedit.model import BLEND_MODES, Document, Layer
-from pixedit.pixels import filter_straight_canvas
+from pixedit.pixels import mask_effect
 
 # geom.place_image is imported lazily inside mask placement to keep import
 # order boring: composite -> model, and geom -> model, neither imports the other
@@ -118,11 +118,11 @@ def mask_to_canvas(layer: Layer, width: int, height: int) -> np.ndarray:
 
 
 def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
-    """Mix a blurred or pixelated copy of ``canvas`` through ``layer``'s mask.
+    """Mix the mask effect through ``layer``'s mask.
 
     The effect is computed from the stack *below* this layer, so pixels in
     earlier layers are not rewritten. Later layers still composite normally
-    and can sit above the redaction (annotations, for example).
+    and can sit above the mask (annotations, for example).
     """
     height, width = canvas.shape[:2]
     mask = mask_to_canvas(layer, width, height) * float(layer.opacity)
@@ -131,7 +131,9 @@ def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
     info = layer.redaction
     kind = info.kind if info is not None else "pixelate"
     amount = info.amount if info is not None else 12.0
-    effect = filter_straight_canvas(canvas, kind, amount)
+    color = info.color if info is not None else (0, 0, 0, 255)
+    seed = info.seed if info is not None else 1
+    effect = mask_effect(canvas, kind, amount, color, seed)
     mix = mask[..., None]
     return (effect * mix + canvas * (1.0 - mix)).astype(np.float32)
 

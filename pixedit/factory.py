@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 from PIL import Image
 
 from pixedit.model import Layer, RedactionInfo, TextInfo, new_id
@@ -48,7 +50,11 @@ def redaction_layer(
     amount: float,
     x: int = 0,
     y: int = 0,
+    color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    seed: int | None = None,
 ) -> Layer:
+    if seed is None:
+        seed = random.randrange(1, 2**31)
     return Layer(
         id=new_id(),
         name=name,
@@ -57,5 +63,10 @@ def redaction_layer(
         x=int(x),
         y=int(y),
         mask=mask.convert("L"),
-        redaction=RedactionInfo(kind=kind, amount=float(amount)),
+        redaction=RedactionInfo(
+            kind=kind,
+            amount=float(amount),
+            color=tuple(int(channel) for channel in color),
+            seed=int(seed),
+        ),
     )

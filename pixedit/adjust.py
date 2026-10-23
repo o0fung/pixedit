@@ -110,6 +110,44 @@ def hue_saturation(
     return _from_rgb(arr)
 
 
+def highlights_shadows(image: Image.Image, highlight: float, shade: float) -> Image.Image:
+    """Push the bright end and the dark end. Each argument is -100..100.
+
+    Positive highlight lightens pixels that are already bright and barely
+    touches dark ones. Positive shade lightens dark pixels and barely touches
+    bright ones. A negative value darkens that end. Midtones barely move.
+    Alpha is left as it was.
+    """
+    arr = _rgba(image).astype(np.float32)
+    rgb = arr[..., :3]
+    luma = (rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722) / 255.0
+    # Squared weights fall off before the middle, so a highlight slider does
+    # not also lift the shadows.
+    highlight_weight = luma ** 2
+    shade_weight = (1.0 - luma) ** 2
+    rgb = rgb + (float(highlight) / 100.0) * 128.0 * highlight_weight[..., None]
+    rgb = rgb + (float(shade) / 100.0) * 128.0 * shade_weight[..., None]
+    arr[..., :3] = np.clip(rgb, 0, 255)
+    return _from_rgb(arr)
+
+
+def color_grade(
+    image: Image.Image,
+    hue: float = 0.0,
+    saturation: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    highlight: float = 0.0,
+    shade: float = 0.0,
+) -> Image.Image:
+    """One combined grade: hue and saturation, then brightness and contrast, then highlight and shade."""
+    if all(abs(float(value)) < 1e-9 for value in (hue, saturation, brightness, contrast, highlight, shade)):
+        return image.copy()
+    graded = hue_saturation(image, hue_degrees=hue, saturation=saturation, lightness=0.0)
+    graded = brightness_contrast(graded, brightness, contrast)
+    return highlights_shadows(graded, highlight, shade)
+
+
 def desaturate(image: Image.Image) -> Image.Image:
     arr = _rgba(image).astype(np.float32)
     luma = arr[..., 0] * 0.2126 + arr[..., 1] * 0.7152 + arr[..., 2] * 0.0722

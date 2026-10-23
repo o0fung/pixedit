@@ -49,7 +49,7 @@ version = { attr = "pixedit.__version__" }
 include = ["pixedit*"]
 
 [tool.setuptools.package-data]
-pixedit = ["resources/*.qss", "resources/icons/*.svg"]
+pixedit = ["resources/*.qss", "resources/*.md", "resources/icons/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

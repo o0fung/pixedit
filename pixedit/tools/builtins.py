@@ -19,7 +19,7 @@ from pixedit.geom import (
     clip_box,
     combine_selection,
     grow_layer_to_cover,
-    hit_opaque,
+    hit_layer,
     mask_ellipse,
     mask_freehand,
     mask_rect,
@@ -29,7 +29,7 @@ from pixedit.geom import (
     selection_for_layer,
     size_from_anchor,
 )
-from pixedit.model import Layer, RedactionInfo, TextInfo, apply_visual, visual_state
+from pixedit.model import Layer, apply_visual, visual_state
 from pixedit.paint import (
     connected_mask,
     dab,
@@ -37,10 +37,11 @@ from pixedit.paint import (
     draw_shape,
     fill_region,
     interpolate,
+    mask_touches_edge,
     sample_color,
     stroke_spacing,
 )
-from pixedit.textutil import default_font_path, render_text
+from pixedit.textutil import render_text
 from pixedit.tools.base import Overlay, PointerEvent, Tool
 
 _FIXED = {"nw": "se", "ne": "sw", "sw": "ne", "se": "nw"}
@@ -87,12 +88,22 @@ def _canvas_selected(document, x: int, y: int) -> bool:
     return int(selection.getpixel((x, y))) > 0
 
 
-class MoveTool(Tool):
-    id = "move"
-    label = "Move"
+class TransformTool(Tool):
+    id = "transform"
+    label = "Transform"
     shortcut = "V"
     cursor = "size"
-    hint = "Drag a layer. Corners scale, the handle above rotates. Shift locks aspect."
+    hint = "Drag a layer to move it. Corners scale, the handle above rotates. Buttons flip and turn the active layer."
+
+    def panel_actions(self):
+        return [
+            {"id": "flip_active_horizontal", "label": "Flip horizontal"},
+            {"id": "flip_active_vertical", "label": "Flip vertical"},
+            {"id": "rotate_active_cw", "label": "Rotate 90° clockwise"},
+            {"id": "rotate_active_ccw", "label": "Rotate 90° counter-clockwise"},
+            {"id": "scale_layer", "label": "Scale…"},
+            {"id": "rotate_layer", "label": "Rotate…"},
+        ]
 
     def __init__(self) -> None:
         self._mode: str | None = None
@@ -111,7 +122,7 @@ class MoveTool(Tool):
             if handle is not None:
                 self._begin(session, session.layer_index, handle, event)
                 return
-        hit = hit_opaque(session.document, event.x, event.y)
+        hit = hit_layer(session.document, event.x, event.y)
         if hit is None:
             self._mode = None
             return
@@ -389,7 +400,7 @@ class _PaintTool(Tool):
         """Grow the stroke buffer so a dab outside the bitmap still lands.
 
         Redaction masks stay at their current size (document-sized when the
-        redact tool created them). Raster growth is clipped to the document,
+        mask tool created them). Raster growth is clipped to the document,
         with slack so the next moves in a stroke reuse the same buffer.
         """
         if self._array is None or self._layer is None or self._mask_mode:
@@ -442,7 +453,7 @@ class BrushTool(_PaintTool):
     id = "brush"
     label = "Brush"
     shortcut = "B"
-    hint = "Paint on the active layer. The cursor matches the brush diameter. [ and ] change the size."
+    hint = "Paint on the active layer. The cursor matches the diameter, and the panel shows the stamp. [ and ] change the size."
 
 
 class EraserTool(_PaintTool):
@@ -450,7 +461,7 @@ class EraserTool(_PaintTool):
     label = "Eraser"
     shortcut = "E"
     erase = True
-    hint = "Erase pixels, or lift a redaction mask when a redaction layer is active. The cursor matches the eraser diameter."
+    hint = "Erase pixels, or lift a mask when a mask layer is active. The panel shows the hole. [ and ] change the size."
 
 
 class TextTool(Tool):
@@ -458,18 +469,57 @@ class TextTool(Tool):
     label = "Text"
     shortcut = "T"
     cursor = "ibeam"
-    hint = "Click to add text. Click an existing text layer to edit it."
+    hint = "Click inside a text box to edit it. Click empty space to add text."
+
+    def option_schema(self):
+        return [
+            {"key": "text_font", "label": "Font", "type": "font"},
+            {"key": "text_style", "label": "Style", "type": "font_style"},
+            {
+                "key": "text_align",
+                "label": "Align",
+                "type": "choice",
+                "choices": [
+                    ("left", "Left"),
+                    ("center", "Center"),
+                    ("right", "Right"),
+                    ("justify", "Justify"),
+                ],
+                "default": "left",
+            },
+            {"key": "text_size", "label": "Size", "type": "spin", "min": 1, "max": 512, "default": 48},
+            {
+                "key": "text_line_spacing",
+                "label": "Line spacing",
+                "type": "int",
+                "min": 0,
+                "max": 80,
+                "default": 4,
+                "suffix": " px",
+            },
+            {
+                "key": "text_rotation",
+                "label": "Rotation",
+                "type": "int",
+                "min": -180,
+                "max": 180,
+                "default": 0,
+                "suffix": "°",
+            },
+        ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         target = self._text_target(session, event)
-        initial = target.text if target is not None else TextInfo(
-            text="Text",
-            font_path=default_font_path(),
-            font_family="DejaVu Sans",
-            size=48,
-            color=session.foreground,
-            rotation=0.0,
-        )
+        if target is None or target.text is None:
+            initial = session.text_info_from_options("Text")
+        else:
+            # Load this layer into the panel before the word dialog. The dialog
+            # keeps that style, so a click does not restyle it from the previous
+            # panel values. Cancel still leaves the layer selected.
+            session.layer_index = session.document.index_of(target.id)
+            session.adopt_text_style(target.text)
+            session.notify("change")
+            initial = target.text
         edited = session.prompt_text(initial)
         if edited is None or not edited.text.strip():
             return
@@ -480,23 +530,24 @@ class TextTool(Tool):
             session.update_text(target, edited)
 
     def _text_target(self, session, event: PointerEvent) -> Layer | None:
-        hit = hit_opaque(session.document, event.x, event.y)
-        if hit is not None and session.document.layers[hit].kind == "text":
-            return session.document.layers[hit]
-        active = session.active_layer()
-        if active is not None and active.kind == "text":
-            x, y, w, h = active.bounds()
-            if x <= event.x <= x + w and y <= event.y <= y + h:
-                return active
-        return None
+        # The topmost box wins, so a picture stacked above a text layer is not
+        # edited by a click on the picture. A gap in the text box still hits
+        # the text, because that layer sits above the background.
+        hit = hit_layer(session.document, event.x, event.y)
+        if hit is None:
+            return None
+        layer = session.document.layers[hit]
+        if layer.kind != "text":
+            return None
+        return layer
 
 
-class RedactTool(Tool):
-    id = "redact"
-    label = "Redact"
+class MaskTool(Tool):
+    id = "mask"
+    label = "Mask"
     shortcut = "R"
     cursor = "cross"
-    hint = "Draw a blur or pixelate mask. The pixels underneath stay intact until you export."
+    hint = "Draw a mask. The effect covers that region, and the pixels underneath stay intact until you export."
 
     def __init__(self) -> None:
         self._dragging = False
@@ -507,27 +558,40 @@ class RedactTool(Tool):
         self._before: dict | None = None
 
     def option_schema(self):
+        from pixedit.model import MASK_EFFECTS
+
         return [
             {
-                "key": "redact_shape",
+                "key": "mask_shape",
                 "label": "Shape",
                 "type": "choice",
                 "choices": ["rect", "ellipse", "freehand"],
                 "default": "rect",
             },
             {
-                "key": "redact_kind",
+                "key": "mask_kind",
                 "label": "Effect",
                 "type": "choice",
-                "choices": ["pixelate", "blur"],
+                "choices": [
+                    ("pixelate", "Pixelate"),
+                    ("blur", "Blur"),
+                    ("solid", "Solid"),
+                    ("noise", "Noise"),
+                    ("desaturate", "Desaturate"),
+                    ("invert", "Invert"),
+                    ("dim", "Dim"),
+                    ("sharpen", "Sharpen"),
+                ],
                 "default": "pixelate",
+                "amounts": MASK_EFFECTS,
+                "amount_key": "mask_amount",
             },
             {
-                "key": "redact_amount",
-                "label": "Amount",
+                "key": "mask_amount",
+                "label": "Block",
                 "type": "int",
-                "min": 1,
-                "max": 80,
+                "min": 2,
+                "max": 64,
                 "default": 12,
             },
         ]
@@ -553,7 +617,7 @@ class RedactTool(Tool):
             return
         self._points.append((event.x, event.y))
         self._dragging = False
-        kind = str(session.option("redact_shape", "rect"))
+        kind = str(session.option("mask_shape", "rect"))
         if kind != "freehand" and math.hypot(event.x - self._start[0], event.y - self._start[1]) < 2:
             self._points = []
             session.preview()
@@ -562,10 +626,7 @@ class RedactTool(Tool):
         self._layer = layer
         self._created = created
         self._before = None if created else visual_state(layer)
-        layer.redaction = RedactionInfo(
-            str(session.option("redact_kind", "pixelate")),
-            float(session.option("redact_amount", 12)),
-        )
+        layer.redaction = session.current_mask_info(layer.redaction)
         self._preview(session, event)
         baked = self._layer
         before = self._before
@@ -580,13 +641,13 @@ class RedactTool(Tool):
                 index = len(session.document.layers)
             else:
                 session.document.layers.pop(index)
-            session.add_layer(baked, index=index, name="Redact")
+            session.add_layer(baked, index=index, name="Mask")
             return
         if before is None:
             return
         new_state = visual_state(baked)
         apply_visual(baked, before)
-        session.apply_layer_image(baked, new_state, "Redact", before=before)
+        session.apply_layer_image(baked, new_state, "Mask", before=before)
 
     def pointer_cancel(self, session) -> bool:
         active = self._dragging or self._layer is not None
@@ -615,7 +676,7 @@ class RedactTool(Tool):
 
     def _shape_mask(self, session, event: PointerEvent) -> Image.Image:
         doc = session.document
-        kind = str(session.option("redact_shape", "rect"))
+        kind = str(session.option("mask_shape", "rect"))
         if kind == "freehand":
             return mask_freehand(doc.width, doc.height, self._points, radius=8)
         x0, y0 = self._start
@@ -627,7 +688,7 @@ class RedactTool(Tool):
     def overlays(self, session) -> list[Overlay]:
         if not self._dragging or len(self._points) < 1:
             return []
-        kind = str(session.option("redact_shape", "rect"))
+        kind = str(session.option("mask_shape", "rect"))
         if kind == "freehand":
             return [Overlay(kind="polyline", points=list(self._points))]
         x0, y0 = self._start
@@ -659,6 +720,17 @@ class SelectTool(Tool):
                 "default": "rect",
             },
             {"key": "tolerance", "label": "Wand tolerance", "type": "int", "min": 0, "max": 255, "default": 32},
+        ]
+
+    def panel_actions(self):
+        return [
+            {"id": "select_all", "label": "Select all", "shortcut": "Ctrl+A"},
+            {"id": "deselect", "label": "Deselect", "shortcut": "Ctrl+D", "needs_selection": True},
+            {"id": "invert_selection", "label": "Invert", "shortcut": "Ctrl+Shift+I", "needs_selection": True},
+            {"id": "cut_selection_to_layer", "label": "Cut to layer", "shortcut": "Ctrl+X", "needs_selection": True},
+            {"id": "copy_selection_to_layer", "label": "Copy to layer", "shortcut": "Ctrl+C", "needs_selection": True},
+            {"id": "clear_selection_contents", "label": "Clear pixels", "shortcut": "Delete", "needs_selection": True},
+            {"id": "crop_to_selection", "label": "Crop to selection", "needs_selection": True},
         ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
@@ -799,7 +871,10 @@ class FillTool(Tool):
     label = "Fill"
     shortcut = "G"
     cursor = "cross"
-    hint = "Click to flood-fill connected pixels within tolerance. A selection limits the fill."
+    hint = (
+        "Click to flood-fill connected pixels within tolerance. "
+        "Empty pixels that reach the layer edge are not filled. A selection limits the fill."
+    )
 
     def option_schema(self):
         return [
@@ -828,12 +903,29 @@ class FillTool(Tool):
             session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
             return
         selection = selection_for_layer(doc, layer)
+        tolerance = int(session.option("tolerance", 32))
         if selection is not None:
-            local = connected_mask(layer.image, local_x, local_y, int(session.option("tolerance", 32)))
+            local = connected_mask(layer.image, local_x, local_y, tolerance)
             keep = np.minimum(np.asarray(local), np.asarray(selection))
             if not bool(np.any(keep)):
                 session.cancel_raster_edit(layer, before, created)
                 session.show_message("Click is outside the selection. Fill only changes pixels inside it.")
+                return
+        # Open empty pixels reach the layer edge and would paint across the canvas.
+        # An enclosed hole does not touch that edge, so the inside of a closed
+        # outline still fills. The mask is the region that would be recolored,
+        # including the selection clip.
+        seed = layer.image.convert("RGBA").getpixel((local_x, local_y))
+        if isinstance(seed, tuple) and int(seed[3]) == 0:
+            region = connected_mask(layer.image, local_x, local_y, tolerance)
+            if selection is not None:
+                clipped = np.minimum(np.asarray(region), np.asarray(selection.convert("L")))
+                region = Image.fromarray(clipped.astype(np.uint8), "L")
+            if mask_touches_edge(region):
+                session.cancel_raster_edit(layer, before, created)
+                session.show_message(
+                    "Click is on empty pixels that reach the edge of the layer. Fill left them unchanged."
+                )
                 return
         # fill_region also pulls the soft inner edge of a brush stroke into the
         # fill, so a closed outline does not keep a rim of the old background.
@@ -841,19 +933,35 @@ class FillTool(Tool):
             layer.image,
             local_x,
             local_y,
-            int(session.option("tolerance", 32)),
+            tolerance,
             session.foreground,
             selection,
         )
         session.finish_raster_edit(layer, before, created, "Fill")
 
 
-class EyedropperTool(Tool):
-    id = "eyedropper"
-    label = "Eyedrop"
+class ColorTool(Tool):
+    id = "color"
+    label = "Color"
     shortcut = "I"
     cursor = "cross"
-    hint = "Click to pick a color from the flattened image."
+    hint = "Click to pick a color. Sliders adjust the active layer; Apply keeps the change."
+
+    def option_schema(self):
+        return [
+            {"key": "color_hue", "label": "Hue", "type": "int", "min": -180, "max": 180, "default": 0, "suffix": "°", "live": "color"},
+            {"key": "color_saturation", "label": "Saturation", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
+            {"key": "color_brightness", "label": "Brightness", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
+            {"key": "color_contrast", "label": "Contrast", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
+            {"key": "color_highlight", "label": "Highlight", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
+            {"key": "color_shade", "label": "Shade", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
+        ]
+
+    def panel_actions(self):
+        return [
+            {"id": "apply_color", "label": "Apply", "needs_color_preview": True},
+            {"id": "reset_color", "label": "Reset", "needs_color_preview": True},
+        ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         color = sample_color(composite(session.document), event.x, event.y)
@@ -862,6 +970,9 @@ class EyedropperTool(Tool):
             return
         session.foreground = color
         session.notify("color")
+
+    def pointer_cancel(self, session) -> bool:
+        return bool(session.cancel_color_adjust())
 
 
 class ShapeTool(Tool):
@@ -1025,3 +1136,11 @@ class ZoomTool(Tool):
     shortcut = "Z"
     cursor = "cross"
     hint = "Click to zoom in. Alt-click zooms out. The wheel zooms at the cursor."
+
+    def panel_actions(self):
+        return [
+            {"id": "zoom_in", "label": "Zoom in", "shortcut": "Ctrl++"},
+            {"id": "zoom_out", "label": "Zoom out", "shortcut": "Ctrl+-"},
+            {"id": "zoom_fit", "label": "Fit", "shortcut": "Ctrl+0"},
+            {"id": "zoom_100", "label": "100%", "shortcut": "Ctrl+1"},
+        ]

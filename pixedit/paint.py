@@ -111,6 +111,61 @@ def dab_mask(
     array[y0:y1, x0:x1] = np.clip(np.rint(region), 0, 255).astype(np.uint8)
 
 
+# The options swatch is fixed. A brush larger than the box fills it; the
+# slider still shows the real diameter.
+BRUSH_PREVIEW_WIDTH = 176
+BRUSH_PREVIEW_HEIGHT = 96
+BRUSH_PREVIEW_MARGIN = 8
+
+
+def brush_preview_image(
+    diameter: int,
+    hardness: float,
+    opacity: float,
+    color: tuple[int, int, int, int],
+    *,
+    erase: bool,
+) -> Image.Image:
+    """One stamp, using the same edge math as ``dab``.
+
+    ``diameter`` is the brush size in image pixels. ``hardness`` and
+    ``opacity`` are 0..1. A small brush stays small. A brush taller than the
+    swatch is scaled down so the whole circle stays visible.
+
+    The brush is the foreground color on a checkerboard, so a low opacity
+    still reads. The eraser is a hole in a solid chip.
+    """
+    width, height = BRUSH_PREVIEW_WIDTH, BRUSH_PREVIEW_HEIGHT
+    shown = min(height - BRUSH_PREVIEW_MARGIN * 2, max(1, int(diameter)))
+    radius = max(0.5, shown / 2.0)
+    if erase:
+        array = np.empty((height, width, 4), np.uint8)
+        array[:] = (168, 176, 184, 255)
+    else:
+        array = _checker(width, height)
+    dab(
+        array,
+        (width - 1) / 2.0,
+        (height - 1) / 2.0,
+        radius,
+        hardness,
+        color,
+        opacity,
+        erase,
+        None,
+    )
+    return Image.fromarray(array, "RGBA")
+
+
+def _checker(width: int, height: int, cell: int = 8) -> np.ndarray:
+    yy, xx = np.indices((height, width))
+    dark = ((xx // cell) + (yy // cell)) % 2 == 0
+    image = np.empty((height, width, 4), np.uint8)
+    image[dark] = (46, 52, 60, 255)
+    image[~dark] = (68, 76, 86, 255)
+    return image
+
+
 def stroke_spacing(radius: float, hardness: float) -> float:
     """Distance between brush stamps, in image pixels.
 
@@ -258,6 +313,18 @@ def connected_mask(image: Image.Image, x: int, y: int, tolerance: int) -> Image.
     ImageDraw.floodfill(work, (int(x), int(y)), 128, thresh=0)
     filled = np.asarray(work) == 128
     return Image.fromarray(filled.astype(np.uint8) * 255, "L")
+
+
+def mask_touches_edge(mask: Image.Image) -> bool:
+    """True when a selected pixel sits on the outer row or column of ``mask``.
+
+    An open field of empty pixels reaches that edge. An enclosed hole, such as
+    the inside of a closed outline, does not.
+    """
+    selected = np.asarray(mask.convert("L")) > 0
+    if selected.size == 0 or not bool(selected.any()):
+        return False
+    return bool(selected[0].any() or selected[-1].any() or selected[:, 0].any() or selected[:, -1].any())
 
 
 def fill_where(

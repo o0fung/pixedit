@@ -51,6 +51,15 @@ class Tool:
     def option_schema(self) -> list[dict[str, Any]]:
         return []
 
+    def panel_actions(self) -> list[dict[str, Any]]:
+        """Buttons under the option controls.
+
+        Each entry has ``id`` and ``label``. The window runs the id. Select
+        actions name session methods. ``needs_selection`` disables the button
+        until a selection exists. ``shortcut`` is only the tooltip.
+        """
+        return []
+
     def pointer_down(self, session, event: PointerEvent) -> None:
         return None
 
@@ -71,29 +80,29 @@ class Tool:
 def builtin_tools() -> list[Tool]:
     from pixedit.tools.builtins import (
         BrushTool,
+        ColorTool,
         CropTool,
         EraserTool,
-        EyedropperTool,
         FillTool,
         HandTool,
-        MoveTool,
-        RedactTool,
+        MaskTool,
         SelectTool,
         ShapeTool,
         TextTool,
+        TransformTool,
         ZoomTool,
     )
 
     return [
-        MoveTool(),
+        TransformTool(),
         BrushTool(),
         EraserTool(),
         TextTool(),
-        RedactTool(),
+        MaskTool(),
         SelectTool(),
         CropTool(),
         FillTool(),
-        EyedropperTool(),
+        ColorTool(),
         ShapeTool(),
         HandTool(),
         ZoomTool(),

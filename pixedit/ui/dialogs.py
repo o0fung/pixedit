@@ -1,30 +1,30 @@
-"""Modal editors: new canvas, text, PDF import, and live filter previews."""
+"""Modal editors: new canvas, text, PDF import, live filter previews, and About."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
-    QPushButton,
     QSlider,
     QSpinBox,
+    QTextBrowser,
     QVBoxLayout,
 )
+
+from pixedit import __version__
 
 from pixedit.adjust import apply_masked
 from pixedit.geom import selection_for_layer
 from pixedit.model import MutateLayerCommand, TextInfo, apply_visual, visual_state
-from pixedit.textutil import discover_fonts
 
 
 class NewDocumentDialog(QDialog):
@@ -76,75 +76,34 @@ class PdfImportDialog(QDialog):
 
 
 class TextDialog(QDialog):
+    """The words only. Font, style, align, spacing, rotation, and color live on the tool panel."""
+
     def __init__(self, initial: TextInfo, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Text")
-        self._color = tuple(initial.color)
+        self._initial = initial
         layout = QVBoxLayout(self)
         self.text = QPlainTextEdit()
         self.text.setPlainText(initial.text)
         self.text.setMinimumHeight(80)
         layout.addWidget(self.text)
-        form = QFormLayout()
-        self.font = QComboBox()
-        self._fonts = discover_fonts()
-        if not self._fonts:
-            self.font.addItem("Default", None)
-        else:
-            for family, style, path in self._fonts:
-                self.font.addItem(f"{family} {style}".strip(), path)
-            if initial.font_path:
-                index = self.font.findData(initial.font_path)
-                if index >= 0:
-                    self.font.setCurrentIndex(index)
-        self.size = QSpinBox()
-        self.size.setRange(1, 512)
-        self.size.setValue(int(initial.size))
-        self.rotation = QSlider(Qt.Orientation.Horizontal)
-        self.rotation.setRange(-180, 180)
-        self.rotation.setValue(int(round(initial.rotation)))
-        self.rotation_label = QLabel(f"{self.rotation.value()}°")
-        self.rotation.valueChanged.connect(lambda value: self.rotation_label.setText(f"{value}°"))
-        rotation_row = QHBoxLayout()
-        rotation_row.addWidget(self.rotation)
-        rotation_row.addWidget(self.rotation_label)
-        self.color_button = QPushButton("Color")
-        self.color_button.clicked.connect(self._pick_color)
-        self._paint_color_button()
-        form.addRow("Font", self.font)
-        form.addRow("Size", self.size)
-        form.addRow("Rotation", rotation_row)
-        form.addRow("Color", self.color_button)
-        layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self.resize(420, 320)
-
-    def _pick_color(self) -> None:
-        current = QColor(*self._color)
-        picked = QColorDialog.getColor(current, self, "Text color", QColorDialog.ColorDialogOption.ShowAlphaChannel)
-        if not picked.isValid():
-            return
-        self._color = (picked.red(), picked.green(), picked.blue(), picked.alpha())
-        self._paint_color_button()
-
-    def _paint_color_button(self) -> None:
-        r, g, b, _a = self._color
-        self.color_button.setStyleSheet(f"background: rgb({r}, {g}, {b}); color: white;")
+        self.resize(420, 180)
 
     def result_info(self) -> TextInfo:
-        path = self.font.currentData()
-        label = self.font.currentText()
-        family = label.split(" ")[0] if label else "Default"
+        style = self._initial
         return TextInfo(
             text=self.text.toPlainText(),
-            font_path=path,
-            font_family=family,
-            size=self.size.value(),
-            color=self._color,
-            rotation=float(self.rotation.value()),
+            font_path=style.font_path,
+            font_family=style.font_family,
+            size=style.size,
+            color=style.color,
+            rotation=style.rotation,
+            align=style.align,
+            line_spacing=style.line_spacing,
         )
 
 
@@ -291,7 +250,7 @@ class ShortcutsDialog(QDialog):
         text = QLabel(
             "\n".join(
                 [
-                    "Ctrl+N  New          Ctrl+O  Open",
+                    "Ctrl+N  New          Ctrl+O  Open          Ctrl+W  Close",
                     "Ctrl+S  Save project Ctrl+Shift+S  Save as",
                     "Ctrl+E  Export flattened image",
                     "Ctrl+Z  Undo         Ctrl+Shift+Z or Ctrl+Y  Redo",
@@ -301,11 +260,11 @@ class ShortcutsDialog(QDialog):
                     "Delete or Backspace  Clear pixels inside the selection",
                     "Ctrl+Shift+O  Place an image as new layers (File → Place, Layer → Place image)",
                     "Ctrl+0  Fit          Ctrl+1  100%       Ctrl++ / Ctrl+-  Zoom",
-                    "V Move   B Brush   E Eraser   T Text   R Redact   M Select",
-                    "C Crop   G Fill    I Eyedropper   U Shape   H Hand   Z Zoom",
+                    "V Transform   B Brush   E Eraser   T Text   R Mask   M Select",
+                    "C Crop   G Fill    I Color   U Shape   H Hand   Z Zoom",
                     "[ and ]  Brush size     Space  Pan     Wheel  Zoom at cursor",
                     "Escape  Cancel the current drag, or deselect",
-                    "Toolbar  Save, Open, Place, and Export (same as the File menu)",
+                    "Toolbar  New, Open, Close, Save, Save As, Place, Export, and Show folder",
                 ]
             )
         )
@@ -316,3 +275,50 @@ class ShortcutsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
         self.resize(560, 280)
+
+
+def _about_markdown() -> str:
+    """Guide text shipped beside the stylesheet. The version is not in this file."""
+    path = Path(__file__).resolve().parent.parent / "resources" / "about.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return "PixEdit is a layered desktop image editor."
+
+
+class AboutDialog(QDialog):
+    """Name, version, and the short guide in ``resources/about.md``.
+
+    The version comes from ``__version__``, so editing the guide does not
+    have to track the package version.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About PixEdit")
+        layout = QVBoxLayout(self)
+        title = QLabel("PixEdit")
+        title.setObjectName("aboutTitle")
+        self.version = QLabel(__version__)
+        self.version.setObjectName("aboutVersion")
+        self.version.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(title)
+        layout.addWidget(self.version)
+        self.body = QTextBrowser()
+        self.body.setObjectName("aboutBody")
+        self.body.setOpenLinks(False)
+        self.body.setOpenExternalLinks(False)
+        # Markdown becomes HTML. The default stylesheet colors headings to
+        # match the dark chrome after that conversion.
+        self.body.document().setDefaultStyleSheet(
+            "h2 { color: #d8f6ff; font-size: 15px; }"
+            "p, li { color: #e7edf2; }"
+            "code { color: #d8f6ff; }"
+        )
+        self.body.setMarkdown(_about_markdown())
+        layout.addWidget(self.body, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        self.resize(560, 480)

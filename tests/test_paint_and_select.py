@@ -1,4 +1,4 @@
-"""Brush, eraser, fill, selection, and eyedropper behavior without Qt."""
+"""Brush, eraser, fill, selection, and color sampling without Qt."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pixedit.model import new_document
 from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.builtins import BrushTool, EraserTool, EyedropperTool, FillTool, SelectTool, ShapeTool
+from pixedit.tools.builtins import BrushTool, ColorTool, EraserTool, FillTool, SelectTool, ShapeTool
 import numpy as np
 
 
@@ -145,9 +145,9 @@ def test_inverted_drag_still_fills_rect_and_ellipse():
     assert session.active_layer().image.getpixel((0, 0))[:3] == (255, 255, 255)
 
 
-def test_eyedropper_reads_composite():
+def test_color_tool_reads_composite():
     session = Session(new_document(8, 8, "black"))
-    tool = EyedropperTool()
+    tool = ColorTool()
     tool.pointer_down(session, PointerEvent(1, 1))
     assert session.foreground[:3] == (0, 0, 0)
 
@@ -186,11 +186,17 @@ def test_fill_tool_click_path_tolerance_selection_and_messages():
     session = Session(new_document(16, 16, "transparent"))
     session.foreground = (20, 30, 40, 255)
     session.options["tolerance"] = 32
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    steps = len(session.history.undo_stack)
     FillTool().pointer_down(session, PointerEvent(4, 5))
     layer = session.active_layer()
-    assert layer.image.getpixel((4, 5)) == (20, 30, 40, 255)
-    assert layer.image.getpixel((15, 15))[3] == 255
+    # Empty pixels run to the layer edge, so the canvas stays transparent.
+    assert layer.image.getpixel((4, 5))[3] == 0
+    assert layer.image.getpixel((15, 15))[3] == 0
     assert layer.image.size == (16, 16)
+    assert any("empty pixels" in message for message in messages)
+    assert len(session.history.undo_stack) == steps
 
     # A small sprite stays small. Fill recolors the seed's component only.
     sprite = raster_layer("Sprite", Image.new("RGBA", (6, 6), (255, 0, 0, 255)), 8, 8)
@@ -238,6 +244,46 @@ def test_fill_tool_click_path_tolerance_selection_and_messages():
     assert base.image.getpixel((2, 2))[:3] == (0, 0, 255)
     assert base.image.getpixel((12, 12))[:3] == (255, 255, 255)
     assert base.image.size == (16, 16)
+
+
+def _outline_on_transparent_layer() -> Session:
+    """A 32×32 closed rectangle on a larger white canvas, placed at (10, 10)."""
+    image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    ImageDraw.Draw(image).rectangle((8, 8, 23, 23), outline=(0, 0, 0, 255), width=2)
+    session = Session(new_document(64, 64, "white"))
+    outline = raster_layer("Outline", image, 10, 10)
+    session.add_layer(outline)
+    session.layer_index = session.document.index_of(outline.id)
+    session.foreground = (0, 180, 40, 255)
+    session.options["tolerance"] = 0
+    return session
+
+
+def test_fill_paints_an_enclosed_hole_and_skips_open_empty_pixels():
+    session = _outline_on_transparent_layer()
+    FillTool().pointer_down(session, PointerEvent(26, 26))
+    edited = session.active_layer()
+    # The hole is painted. Transparent margins are cropped; the layer does not
+    # grow out to the canvas.
+    assert edited.image.size != (64, 64)
+    assert edited.image.width < 64 and edited.image.height < 64
+    filled = edited.image.getpixel((26 - edited.x, 26 - edited.y))
+    assert filled[:3] == (0, 180, 40)
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
+
+    session = _outline_on_transparent_layer()
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    steps = len(session.history.undo_stack)
+    FillTool().pointer_down(session, PointerEvent(11, 11))
+    assert any("empty pixels" in message for message in messages)
+    layer = session.active_layer()
+    assert layer.image.size == (32, 32)
+    assert (layer.x, layer.y) == (10, 10)
+    assert layer.image.getpixel((1, 1))[3] == 0
+    assert layer.image.getpixel((0, 0))[3] == 0
+    assert len(session.history.undo_stack) == steps
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
 
 
 def test_brush_and_shape_on_a_new_layer_stay_content_sized():
@@ -543,7 +589,7 @@ def test_cut_and_copy_selection_to_a_new_layer():
     messages.clear()
     before = len(session.history.undo_stack)
     session.cut_selection_to_layer()
-    assert any("redaction" in message for message in messages)
+    assert any("mask" in message for message in messages)
     assert len(session.history.undo_stack) == before
 
 
@@ -575,3 +621,61 @@ def test_place_layers_keeps_the_document_and_undoes():
     session.place_layers([redaction_layer("Hide", Image.new("L", (8, 8), 255), "pixelate", 8)])
     assert any("no image" in message for message in messages)
     assert len(session.document.layers) == 1
+
+
+def test_crop_to_selection_uses_the_opaque_bounds():
+    session = Session(new_document(20, 20, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    session.crop_to_selection()
+    assert any("Draw a selection" in message for message in messages)
+    assert session.document.width == 20
+
+    empty = Image.new("L", (20, 20), 0)
+    session.set_selection(empty)
+    messages.clear()
+    session.crop_to_selection()
+    assert any("empty" in message for message in messages)
+    assert session.document.width == 20
+
+    mask = Image.new("L", (20, 20), 0)
+    mask.paste(255, (2, 3, 10, 12))
+    session.set_selection(mask)
+    session.crop_to_selection()
+    assert session.document.width == 8
+    assert session.document.height == 9
+
+
+def _red_width(image: Image.Image) -> int:
+    import numpy as np
+
+    arr = np.array(image)
+    cols = np.where((arr[..., 0] > 200) & (arr[..., 3] > 200))[0]
+    if len(cols) == 0:
+        return 0
+    return int(cols.max() - cols.min())
+
+
+def test_brush_preview_shows_size_hardness_opacity_and_eraser_hole():
+    from pixedit.paint import brush_preview_image
+
+    color = (255, 0, 0, 255)
+    small = brush_preview_image(8, 1.0, 1.0, color, erase=False)
+    large = brush_preview_image(80, 1.0, 1.0, color, erase=False)
+    huge = brush_preview_image(400, 1.0, 1.0, color, erase=False)
+    assert _red_width(large) > _red_width(small) + 20
+    assert abs(_red_width(huge) - _red_width(large)) <= 2
+
+    hard = np.array(brush_preview_image(48, 1.0, 1.0, color, erase=False))
+    soft = np.array(brush_preview_image(48, 0.0, 1.0, color, erase=False))
+    faint = np.array(brush_preview_image(48, 1.0, 0.35, color, erase=False))
+    assert hard[48, 88, 0] > 240
+    assert hard[48, 108, 0] > 200
+    assert soft[48, 108, 0] < 120
+    assert faint[48, 88, 0] < hard[48, 88, 0] - 40
+
+    hole = np.array(brush_preview_image(40, 1.0, 1.0, color, erase=True))
+    assert hole[2, 2, 3] == 255
+    assert hole[48, 88, 3] == 0
+    soft_hole = np.array(brush_preview_image(48, 0.0, 1.0, color, erase=True))
+    assert 0 < int(soft_hole[48, 108, 3]) < 255

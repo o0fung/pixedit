@@ -485,25 +485,49 @@ def tighten_raster_layer(layer: Layer) -> None:
     layer.text = None
 
 
-def hit_opaque(document: Document, x: float, y: float) -> int | None:
-    """Topmost visible layer whose pixel at (x, y) is not empty."""
+def layer_hit_box(layer: Layer) -> tuple[int, int, int, int] | None:
+    """Canvas rectangle a click uses to select ``layer``.
+
+    Half-open ``(left, top, right, bottom)``. ``None`` when there is nothing
+    to select.
+
+    Text uses the rendered bitmap. That rectangle is the text box: the padding
+    and the gaps between glyphs are inside it, and rotation is already baked
+    into the axis-aligned image. Raster and redaction use the tight rectangle
+    around non-empty pixels so a full-canvas plate or a document-sized mask
+    does not take clicks that miss its content. A hole inside that tight
+    rectangle still counts.
+    """
+    if layer.kind == "text":
+        x, y, width, height = layer.bounds()
+        if width < 1 or height < 1:
+            return None
+        return x, y, x + width, y + height
+    box = alpha_bbox(layer.bitmap())
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    return layer.x + x0, layer.y + y0, layer.x + x1, layer.y + y1
+
+
+def hit_layer(document: Document, x: float, y: float) -> int | None:
+    """Index of the topmost visible layer whose selection box contains ``(x, y)``.
+
+    The pointer is floored to a pixel. A higher layer wins even when that
+    pixel is empty, as long as the point sits inside its box. Hidden layers
+    are skipped.
+    """
     px, py = int(math.floor(x)), int(math.floor(y))
     for index in range(len(document.layers) - 1, -1, -1):
         layer = document.layers[index]
         if not layer.visible:
             continue
-        local_x = px - layer.x
-        local_y = py - layer.y
-        image = layer.bitmap()
-        if not (0 <= local_x < image.width and 0 <= local_y < image.height):
+        box = layer_hit_box(layer)
+        if box is None:
             continue
-        if image.mode == "L":
-            if image.getpixel((local_x, local_y)) > 8:
-                return index
-        else:
-            pixel = image.convert("RGBA").getpixel((local_x, local_y))
-            if isinstance(pixel, tuple) and pixel[3] > 8:
-                return index
+        left, top, right, bottom = box
+        if left <= px < right and top <= py < bottom:
+            return index
     return None
 
 

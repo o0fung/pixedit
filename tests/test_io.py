@@ -41,7 +41,7 @@ def test_roundtrip_common_rasters_and_gif_frames(tmp_path: Path):
 
 
 def test_project_roundtrip_keeps_text_redaction_and_selection(tmp_path: Path):
-    info = TextInfo("A", None, "Default", 18, (0, 0, 0, 255), 12)
+    info = TextInfo("A", None, "Default", 18, (0, 0, 0, 255), 12, "center", 16)
     text_image = render_text(info)
     from pixedit.factory import text_layer
 
@@ -64,10 +64,14 @@ def test_project_roundtrip_keeps_text_redaction_and_selection(tmp_path: Path):
     assert loaded.layers[1].kind == "text"
     assert loaded.layers[1].text is not None
     assert loaded.layers[1].text.rotation == 12
+    assert loaded.layers[1].text.align == "center"
+    assert loaded.layers[1].text.line_spacing == 16
     assert loaded.layers[1].x == 3
     assert loaded.layers[2].kind == "redaction"
     assert loaded.layers[2].redaction is not None
     assert loaded.layers[2].redaction.amount == 9
+    assert loaded.layers[2].redaction.seed == redact.redaction.seed
+    assert loaded.layers[2].redaction.color == redact.redaction.color
     assert loaded.layers[2].mask.getpixel((6, 6)) == 255
     assert loaded.selection is not None and loaded.selection.getpixel((1, 1)) == 255
     assert np.array_equal(np.array(composite(doc)), np.array(composite(loaded)))
@@ -98,3 +102,14 @@ def test_export_flattened(tmp_path: Path):
         export_image(session.document, str(path))
         with Image.open(path) as saved:
             assert saved.size == (8, 6)
+
+
+def test_old_text_project_defaults_align_and_spacing():
+    from pixedit.io import _text_from_json
+
+    info = _text_from_json(
+        {"text": "A", "font_path": None, "font_family": "Default", "size": 18, "color": [0, 0, 0, 255]}
+    )
+    assert info is not None
+    assert info.align == "left"
+    assert info.line_spacing == 4

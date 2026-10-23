@@ -67,3 +67,61 @@ def filter_straight_canvas(canvas: np.ndarray, kind: str, amount: float) -> np.n
     else:
         filtered = pixelate_image(premul, max(1, int(round(amount))))
     return premul_image_to_straight(filtered)
+
+
+def mask_effect(
+    canvas: np.ndarray,
+    kind: str,
+    amount: float,
+    color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    seed: int = 1,
+) -> np.ndarray:
+    """The image mixed through a mask. ``canvas`` is float straight RGBA, 0..1.
+
+    Blur and pixelate stay on the premultiplied path so a transparent edge
+    does not grow a dark halo. Solid replaces RGB and forces the covered
+    area opaque. Noise, desaturate, invert, dim, and sharpen edit straight
+    RGB and copy the original alpha back.
+
+    Unknown kinds fall through to pixelate, which is what older projects
+    used as the default effect.
+    """
+    if kind not in {"solid", "noise", "desaturate", "invert", "dim", "sharpen"}:
+        return filter_straight_canvas(canvas, kind, amount)
+    if kind == "solid":
+        effect = np.empty_like(canvas, dtype=np.float32)
+        effect[..., 0] = float(color[0]) / 255.0
+        effect[..., 1] = float(color[1]) / 255.0
+        effect[..., 2] = float(color[2]) / 255.0
+        effect[..., 3] = 1.0
+        return effect
+    effect = np.array(canvas, dtype=np.float32, copy=True)
+    rgb = effect[..., :3]
+    strength = min(1.0, max(0.0, float(amount) / 100.0))
+    if kind == "noise":
+        # The seed is stored on the layer, so a redraw samples the same grain.
+        noise = np.random.default_rng(int(seed) & 0xFFFFFFFF).random(rgb.shape).astype(np.float32)
+        effect[..., :3] = rgb * (1.0 - strength) + noise * strength
+        return effect
+    if kind == "desaturate":
+        luma = rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722
+        effect[..., :3] = rgb * (1.0 - strength) + luma[..., None] * strength
+        return effect
+    if kind == "invert":
+        effect[..., :3] = rgb * (1.0 - strength) + (1.0 - rgb) * strength
+        return effect
+    if kind == "dim":
+        effect[..., :3] = rgb * (1.0 - strength)
+        return effect
+    return _sharpen_straight(canvas, amount)
+
+
+def _sharpen_straight(canvas: np.ndarray, amount: float) -> np.ndarray:
+    """Unsharp mask on straight color. Alpha is the canvas's own coverage."""
+    uint8 = np.clip(np.rint(np.array(canvas) * 255.0), 0, 255).astype(np.uint8)
+    image = Image.fromarray(np.ascontiguousarray(uint8), "RGBA")
+    percent = max(1, int(round(float(amount))) * 2)
+    sharpened = image.filter(ImageFilter.UnsharpMask(radius=1.5, percent=percent, threshold=0))
+    out = np.asarray(sharpened.convert("RGBA")).astype(np.float32) / 255.0
+    out[..., 3] = canvas[..., 3]
+    return out

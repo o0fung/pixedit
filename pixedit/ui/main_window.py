@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QColorDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -16,10 +15,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSlider,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -30,14 +27,21 @@ from PyQt6.QtWidgets import (
 
 from pixedit import __version__
 from pixedit.adjust import blur, brightness_contrast, desaturate, hue_saturation, invert, levels, pixelate, sharpen
-from pixedit.geom import alpha_bbox
 from pixedit.io import export_image, load_path, save_project
+from pixedit.output_folder import (
+    dialog_start,
+    ensure_output_folder,
+    output_folder,
+    pin_native_dialog_directory,
+    set_output_folder,
+)
 from pixedit.plugins.api import get_api
 from pixedit.plugins.loader import load_plugins
 from pixedit.session import Session
 from pixedit.tools.base import Tool, builtin_tools
 from pixedit.ui.canvas import CanvasView, _is_clear_shortcut
 from pixedit.ui.dialogs import (
+    AboutDialog,
     LiveFilterDialog,
     NewDocumentDialog,
     PdfImportDialog,
@@ -47,6 +51,7 @@ from pixedit.ui.dialogs import (
     TextDialog,
 )
 from pixedit.ui.icons import icon_for_tool, icon_named
+from pixedit.ui.palette import ColorPalette
 from pixedit.ui.panels import LayerPanel, ToolOptions
 
 _OPEN_FILTER = "Images and projects (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf *.pix);;All files (*)"
@@ -54,9 +59,9 @@ _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pd
 
 # Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
 _TOOL_GROUPS = (
-    ("move", "hand", "zoom", "select", "eyedropper"),
+    ("transform", "hand", "zoom", "select", "color"),
     ("brush", "eraser", "fill", "shape", "text"),
-    ("crop", "redact"),
+    ("crop", "mask"),
 )
 
 
@@ -97,6 +102,10 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel()
         self._status_label.setObjectName("statusInfo")
         status.addWidget(self._status_label, 1)
+        # Permanent widgets stay visible while showMessage covers the readout.
+        # A click opens About; the document name in the title stays version-free.
+        self._version_label = _VersionLabel(__version__)
+        status.addPermanentWidget(self._version_label)
         # File actions sit in their own strip. The left column stays the
         # canvas tools (Move, Brush, and the rest), grouped separately.
         self.file_toolbar = QToolBar("File")
@@ -114,7 +123,10 @@ class MainWindow(QMainWindow):
 
         left = QFrame()
         left.setObjectName("panel")
-        left.setFixedWidth(248)
+        # The longest command label needs about 193px. The frame and the
+        # options panel each add 8px of margin on both sides, so 228 keeps
+        # that label inside the column. 248 is only the starting width.
+        left.setMinimumWidth(228)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         self.tool_host = QWidget()
@@ -122,24 +134,12 @@ class MainWindow(QMainWindow):
         self.tool_layout.setContentsMargins(0, 0, 0, 0)
         self.tool_layout.setSpacing(4)
         left_layout.addWidget(self.tool_host)
-        self.swatch = QPushButton("Foreground")
-        self.swatch.clicked.connect(self._choose_color)
-        self.swatch.setToolTip("Foreground color. Opacity applies to the brush, shapes, and fill.")
-        left_layout.addWidget(self.swatch)
-        opacity_row = QWidget()
-        opacity_layout = QHBoxLayout(opacity_row)
-        opacity_layout.setContentsMargins(0, 4, 0, 0)
-        self.opacity_label = QLabel("Opacity")
-        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
-        self.opacity_slider.setRange(0, 100)
-        self.opacity_slider.setToolTip("Opacity of the foreground color. Brush, shape, and fill use it.")
-        self.opacity_slider.valueChanged.connect(self._set_foreground_opacity)
-        opacity_layout.addWidget(self.opacity_label)
-        opacity_layout.addWidget(self.opacity_slider, 1)
-        left_layout.addWidget(opacity_row)
+        self.palette = ColorPalette(self.session, self._on_palette_color)
+        left_layout.addWidget(self.palette)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.options = ToolOptions(self.session, self._on_tool_option)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.options = ToolOptions(self.session, self._on_tool_option, self._on_panel_action)
         scroll.setWidget(self.options)
         left_layout.addWidget(scroll, 1)
 
@@ -154,15 +154,18 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.layers)
 
         splitter = QSplitter()
+        splitter.setChildrenCollapsible(False)
         splitter.addWidget(left)
         splitter.addWidget(self.canvas)
         splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([248, 800, 280])
         row.addWidget(splitter)
-        self._update_swatch()
 
     def _rebuild_tools(self) -> None:
-        current_id = self.current.id if self.current else "move"
+        current_id = self.current.id if self.current else "transform"
         builtin_ids = {tool.id for tool in builtin_tools()}
         extras = [tool for tool in get_api().tools if tool.id not in builtin_ids]
         self.tools = [*builtin_tools(), *extras]
@@ -175,8 +178,8 @@ class MainWindow(QMainWindow):
         for button in list(self._buttons.values()):
             self._button_group.removeButton(button)
         self._buttons.clear()
-        # Move/Hand/Zoom/Select/Eyedrop, then paint tools, then crop and
-        # redaction, then Marker and any other plugins. A line separates groups.
+        # Transform/Hand/Zoom/Select/Color, then paint tools, then crop and
+        # mask, then Marker and any other plugins. A line separates groups.
         grouped: list[list[Tool]] = []
         placed: set[str] = set()
         for ids in _TOOL_GROUPS:
@@ -198,6 +201,7 @@ class MainWindow(QMainWindow):
                 button.setIconSize(QSize(18, 18))
                 button.setCheckable(True)
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                button.setFixedHeight(24)
                 button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 button.setAccessibleName(caption)
                 button.setToolTip(f"{caption}\n{tool.hint}" if tool.hint else caption)
@@ -229,7 +233,15 @@ class MainWindow(QMainWindow):
         plugin_menu = bar.addMenu("Plugins")
         help_menu = bar.addMenu("Help")
 
-        self._action(file_menu, "New…", self._new, QKeySequence.StandardKey.New)
+        self._new_action = self._file_action(
+            file_menu,
+            "New…",
+            "New",
+            self._new,
+            QKeySequence.StandardKey.New,
+            "new",
+            "Start a blank document",
+        )
         self._open_action = self._file_action(
             file_menu,
             "Open…",
@@ -258,7 +270,15 @@ class MainWindow(QMainWindow):
             "save",
             "Save the project to its .pix file",
         )
-        self._action(file_menu, "Save project as…", self._save_as, QKeySequence("Ctrl+Shift+S"))
+        self._save_as_action = self._file_action(
+            file_menu,
+            "Save project as…",
+            "Save As",
+            self._save_as,
+            QKeySequence("Ctrl+Shift+S"),
+            "save-as",
+            "Save the project to a new .pix file",
+        )
         self._export_action = self._file_action(
             file_menu,
             "Export flattened…",
@@ -269,11 +289,35 @@ class MainWindow(QMainWindow):
             "Export a flattened PNG, JPEG, or WebP",
         )
         file_menu.addSeparator()
+        self._show_folder_action = self._file_action(
+            file_menu,
+            "Show output folder",
+            "Show folder",
+            self._show_output_folder,
+            None,
+            "folder",
+            "Show the output folder",
+        )
+        self._choose_folder_action = self._action(file_menu, "Choose output folder…", self._choose_output_folder)
+        file_menu.addSeparator()
+        self._close_action = self._file_action(
+            file_menu,
+            "Close",
+            "Close",
+            self.close,
+            QKeySequence.StandardKey.Close,
+            "close",
+            "Close PixEdit",
+        )
         self._action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
-        self._populate_file_toolbar()
-
         self.undo_action = self._action(edit_menu, "Undo", self.session.undo, QKeySequence.StandardKey.Undo)
         self.redo_action = self._action(edit_menu, "Redo", self.session.redo, QKeySequence.StandardKey.Redo)
+        self._prepare_history_button(self.undo_action, "Undo", "undo")
+        self._prepare_history_button(self.redo_action, "Redo", "redo")
+        self._populate_file_toolbar()
+        self._update_output_folder_tooltip()
+        self._update_history_actions()
+
         edit_menu.addSeparator()
         # One action shared by Edit, Select, and Layer so Ctrl+X / Ctrl+C fire once.
         # Line edits accept the shortcut override and still cut or copy text.
@@ -405,7 +449,10 @@ class MainWindow(QMainWindow):
             )
 
         self._action(help_menu, "Keyboard shortcuts", lambda: ShortcutsDialog(self).exec())
-        self._action(help_menu, "About PixEdit", self._about)
+        # AboutRole moves this item into the application menu on macOS.
+        # On Windows and Linux the role is ignored and it stays under Help.
+        about = self._action(help_menu, "About PixEdit", self._about)
+        about.setMenuRole(QAction.MenuRole.AboutRole)
 
     def _file_action(self, menu, label: str, short_label: str, slot, shortcut, icon_name: str, summary: str) -> QAction:
         """A File-menu action that also appears on the file toolbar.
@@ -421,12 +468,74 @@ class MainWindow(QMainWindow):
         action.setStatusTip(action.toolTip())
         return action
 
+    def _prepare_history_button(self, action: QAction, short: str, icon_name: str) -> None:
+        """Toolbar caption and icon. The menu text is set separately and can name the step."""
+        action.setIcon(icon_named(icon_name))
+        action.setIconText(short)
+
     def _populate_file_toolbar(self) -> None:
-        # Save, Open, Place, Export — the same QAction objects as File, so
-        # each shortcut fires once and the button runs that menu handler.
+        # New, Open, Close, Save, Save As, Place, Export, then Undo and Redo,
+        # then Show folder. Undo and Redo are the Edit-menu actions, so each
+        # shortcut fires once. Choosing a new folder stays in the menu.
         self.file_toolbar.clear()
-        for action in (self._save_action, self._open_action, self._place_action, self._export_action):
+        for action in (
+            self._new_action,
+            self._open_action,
+            self._close_action,
+            self._save_action,
+            self._save_as_action,
+            self._place_action,
+            self._export_action,
+        ):
             self.file_toolbar.addAction(action)
+        self.file_toolbar.addSeparator()
+        self.file_toolbar.addAction(self.undo_action)
+        self.file_toolbar.addAction(self.redo_action)
+        self.file_toolbar.addSeparator()
+        self.file_toolbar.addAction(self._show_folder_action)
+
+    def _update_output_folder_tooltip(self) -> None:
+        folder = output_folder()
+        show_tip = f"Show the output folder ({folder})"
+        self._show_folder_action.setToolTip(show_tip)
+        self._show_folder_action.setStatusTip(show_tip)
+        choose_tip = f"Choose where Open, Place, Save, and Export start ({folder})"
+        self._choose_folder_action.setToolTip(choose_tip)
+        self._choose_folder_action.setStatusTip(choose_tip)
+
+    def _file_dialog_start(self, filename: str | None = None) -> str:
+        """Directory argument for Open, Place, Save As, Export, and Choose.
+
+        Flow:
+        1. Create the configured folder when it is missing.
+        2. If that fails, say so and start in the home folder instead.
+        3. On macOS, point the Finder panel at that directory. It would
+           otherwise reopen the last place the user browsed.
+        """
+        folder = ensure_output_folder()
+        if folder is None:
+            self._toast(
+                f"Could not create the output folder ({output_folder()}). Starting in your home folder."
+            )
+            folder = Path.home()
+        pin_native_dialog_directory(folder)
+        return dialog_start(filename, folder=folder)
+
+    def _show_output_folder(self) -> None:
+        folder = ensure_output_folder()
+        if folder is None:
+            self._toast(f"Could not create the output folder ({output_folder()}).")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            self._toast(f"Could not open {folder}")
+
+    def _choose_output_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Choose output folder", self._file_dialog_start())
+        if not chosen:
+            return
+        set_output_folder(chosen)
+        self._update_output_folder_tooltip()
+        self._toast(f"Output folder set to {chosen}")
 
     def _make_action(self, label: str, slot, shortcut=None) -> QAction:
         action = QAction(label, self)
@@ -475,25 +584,58 @@ class MainWindow(QMainWindow):
         self.options.set_tool(tool)
         self.canvas.set_tool_cursor(tool.cursor)
         self._toast(tool.hint or tool.label)
+        self._sync_text_panel()
 
     def _on_session(self, kind: str) -> None:
         self.canvas.invalidate()
-        self._update_swatch()
         self._update_status()
         if kind == "preview":
+            # Choosing a layer in the stack only previews. The text panel still
+            # has to show that layer's font and color. A style drag sets
+            # text_edit_in_progress, and the sync below leaves it alone.
+            self._sync_text_panel()
             return
+        # An eyedropper pick on the Color tool is a finished color, so it can
+        # recolor the active text layer. Every other change refreshes the palette
+        # from the session, then loads the active text layer into the panel.
+        if kind == "color":
+            self.palette.sync_from_session()
+            self.palette.note_recent()
+            self._restyle_text(transient=False)
+            self.options.refresh_brush_preview()
+        else:
+            self.palette.sync_from_session()
         self.layers.refresh()
         self._update_title()
         self._update_history_actions()
+        self.options.update_actions()
+        if kind != "color":
+            self._sync_text_panel()
+        if self.current is not None and self.current.id == "color":
+            self.options.reload_from_session()
+            self.options.update_actions()
 
     def _update_history_actions(self) -> None:
         if hasattr(self, "undo_action"):
-            self.undo_action.setEnabled(self.session.history.can_undo())
             undo = self.session.history.undo_stack[-1].name if self.session.history.can_undo() else ""
-            self.undo_action.setText(f"Undo {undo}".strip())
-            self.redo_action.setEnabled(self.session.history.can_redo())
+            self._sync_history_action(self.undo_action, "Undo", self.session.history.can_undo(), undo)
             redo = self.session.history.redo_stack[-1].name if self.session.history.can_redo() else ""
-            self.redo_action.setText(f"Redo {redo}".strip())
+            self._sync_history_action(self.redo_action, "Redo", self.session.history.can_redo(), redo)
+
+    def _sync_history_action(self, action: QAction, verb: str, enabled: bool, step: str) -> None:
+        """Menu text names the step. The toolbar button stays the short word.
+
+        ``setText`` does not change ``iconText``, but setting it again keeps a
+        later menu update from widening the top bar if the two ever diverge.
+        """
+        action.setEnabled(enabled)
+        action.setText(f"{verb} {step}".strip())
+        action.setIconText(verb)
+        keys = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        summary = f"{verb} {step}".strip()
+        tip = f"{summary} ({keys})" if keys else summary
+        action.setToolTip(tip)
+        action.setStatusTip(tip)
 
     def _update_title(self) -> None:
         if self.session.path:
@@ -503,25 +645,58 @@ class MainWindow(QMainWindow):
         mark = " •" if self.session.dirty else ""
         self.setWindowTitle(f"PixEdit — {name}{mark}")
 
-    def _update_swatch(self, *, sync_slider: bool = True) -> None:
-        r, g, b, a = self.session.foreground
-        percent = int(round(a * 100 / 255))
-        self.swatch.setText(f"  #{r:02X}{g:02X}{b:02X}  {percent}%")
-        self.swatch.setStyleSheet(
-            f"background: rgba({r}, {g}, {b}, {a}); color: {'#111' if r + g + b > 380 else '#fff'}; text-align: left;"
-        )
-        if hasattr(self, "opacity_label"):
-            self.opacity_label.setText(f"Opacity  {percent}%")
-        if sync_slider and hasattr(self, "opacity_slider"):
-            self.opacity_slider.blockSignals(True)
-            self.opacity_slider.setValue(percent)
-            self.opacity_slider.blockSignals(False)
+    def _on_palette_color(self, transient: bool) -> None:
+        self.options.refresh_brush_preview()
+        self._restyle_text(transient=transient)
+        if self.current is not None and self.current.id == "mask":
+            self.session.recolor_solid_mask(transient=transient)
 
-    def _set_foreground_opacity(self, percent: int) -> None:
-        red, green, blue, _alpha = self.session.foreground
-        alpha = int(round(int(percent) * 255 / 100))
-        self.session.foreground = (red, green, blue, alpha)
-        self._update_swatch(sync_slider=False)
+    def _restyle_text(self, *, transient: bool) -> None:
+        if self.current is None or self.current.id != "text":
+            return
+        self.session.apply_text_style(transient=transient)
+
+    def _sync_text_panel(self) -> None:
+        """Show the active text layer's style in the panel without redrawing it."""
+        if self.current is None or self.current.id != "text":
+            return
+        if self.session.text_edit_in_progress():
+            return
+        layer = self.session.active_layer()
+        if layer is None or layer.kind != "text" or layer.text is None:
+            return
+        self.session.adopt_text_style(layer.text)
+        self.palette.sync_from_session()
+        self.options.reload_from_session()
+
+    def _on_panel_action(self, action_id: str) -> None:
+        if action_id == "zoom_in":
+            self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 1.25)
+            return
+        if action_id == "zoom_out":
+            self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 0.8)
+            return
+        if action_id == "zoom_fit":
+            self.canvas.fit()
+            return
+        if action_id == "zoom_100":
+            self.canvas.zoom_100()
+            return
+        if action_id == "scale_layer":
+            self._scale_layer()
+            return
+        if action_id == "rotate_layer":
+            self._rotate_layer()
+            return
+        if action_id == "apply_color":
+            self.session.commit_color_adjust()
+            return
+        if action_id == "reset_color":
+            self.session.cancel_color_adjust()
+            return
+        method = getattr(self.session, action_id, None)
+        if method is not None:
+            method()
 
     def _on_tool_option(self, key: str, _value: int) -> None:
         if key == "brush_size":
@@ -542,14 +717,6 @@ class MainWindow(QMainWindow):
 
     def _toast(self, text: str) -> None:
         self.statusBar().showMessage(text, 4000)
-
-    def _choose_color(self) -> None:
-        current = QColor(*self.session.foreground)
-        picked = QColorDialog.getColor(current, self, "Foreground", QColorDialog.ColorDialogOption.ShowAlphaChannel)
-        if not picked.isValid():
-            return
-        self.session.foreground = (picked.red(), picked.green(), picked.blue(), picked.alpha())
-        self._update_swatch()
 
     def _prompt_text(self, initial):
         dialog = TextDialog(initial, self)
@@ -586,13 +753,13 @@ class MainWindow(QMainWindow):
     def _open(self) -> None:
         if not self._confirm_discard():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open", "", _OPEN_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Open", self._file_dialog_start(), _OPEN_FILTER)
         if path:
             self.open_path(path)
 
     def _place(self) -> None:
         """Add an image as new layers. The open document stays in place."""
-        path, _ = QFileDialog.getOpenFileName(self, "Place image", "", _PLACE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Place image", self._file_dialog_start(), _PLACE_FILTER)
         if not path:
             return
         pdf_scale = 2.0
@@ -638,7 +805,12 @@ class MainWindow(QMainWindow):
         return True
 
     def _save_as(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(self, "Save project", "untitled.pix", "PixEdit project (*.pix)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save project",
+            self._file_dialog_start("untitled.pix"),
+            "PixEdit project (*.pix)",
+        )
         if not path:
             return False
         if not path.lower().endswith(".pix"):
@@ -650,7 +822,7 @@ class MainWindow(QMainWindow):
         path, selected = QFileDialog.getSaveFileName(
             self,
             "Export flattened image",
-            "export.png",
+            self._file_dialog_start("export.png"),
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp)",
         )
         if not path:
@@ -698,16 +870,7 @@ class MainWindow(QMainWindow):
         self.session.transform_active("rotate", degrees=dialog.degrees.value())
 
     def _crop_selection(self) -> None:
-        selection = self.session.document.selection
-        if selection is None:
-            self._toast("Draw a selection first.")
-            return
-        box = alpha_bbox(selection)
-        if box is None:
-            self._toast("The selection is empty.")
-            return
-        left, top, right, bottom = box
-        self.session.crop_to(left, top, right - left, bottom - top)
+        self.session.crop_to_selection()
 
     def _select_mode(self, mode: str) -> None:
         self.session.options["select_mode"] = mode
@@ -716,6 +879,7 @@ class MainWindow(QMainWindow):
             self.set_tool(tool)
 
     def _filter(self, title: str, specs: list[dict], apply_fn) -> None:
+        self.session.cancel_color_adjust()
         layer = self.session.active_layer()
         if layer is None or layer.kind == "redaction":
             self._toast("Choose a raster or text layer.")
@@ -750,11 +914,7 @@ class MainWindow(QMainWindow):
         self._toast(f"Brush size {size}")
 
     def _about(self) -> None:
-        QMessageBox.information(
-            self,
-            "About PixEdit",
-            f"PixEdit {__version__}\n\nA layered image editor.\nLaunch it with the pix command.",
-        )
+        AboutDialog(self).exec()
 
     def keyPressEvent(self, event) -> None:
         # Reaches here when the focused child does not accept the key (the
@@ -777,6 +937,24 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+
+class _VersionLabel(QLabel):
+    """Status-bar version. A click opens About without disturbing the readout."""
+
+    def __init__(self, version: str, parent=None) -> None:
+        super().__init__(version, parent)
+        self.setObjectName("statusVersion")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"PixEdit {version}")
+        self.setAccessibleName(f"PixEdit {version}")
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            opener = getattr(self.window(), "_about", None)
+            if opener is not None:
+                opener()
+        super().mouseReleaseEvent(event)
 
 
 def _tool_separator() -> QFrame:

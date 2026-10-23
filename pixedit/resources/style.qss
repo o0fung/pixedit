@@ -40,6 +40,27 @@ QLabel#statusInfo {
     padding-left: 8px;
 }
 
+QLabel#statusVersion {
+    color: #9aabba;
+    padding-right: 10px;
+}
+
+QLabel#aboutTitle {
+    font-size: 22px;
+    color: #f4fbff;
+}
+
+QLabel#aboutVersion {
+    color: #9aabba;
+    padding-bottom: 8px;
+}
+
+QTextBrowser#aboutBody {
+    background: #16191e;
+    color: #e7edf2;
+    border: none;
+}
+
 QToolButton, QPushButton {
     background: #232a33;
     color: #e7edf2;
@@ -151,7 +172,11 @@ QFrame#toolSeparator {
     border: none;
     min-height: 1px;
     max-height: 1px;
-    margin: 6px 8px;
+    margin: 4px 8px;
+}
+
+QFrame#panel QToolButton {
+    padding: 3px 8px;
 }
 
 QToolBar#fileToolbar {

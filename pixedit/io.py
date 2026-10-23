@@ -88,6 +88,8 @@ def _text_from_json(payload: dict | None) -> TextInfo | None:
         size=int(payload.get("size", 32)),
         color=(color[0], color[1], color[2], color[3]),
         rotation=float(payload.get("rotation", 0)),
+        align=str(payload.get("align", "left") or "left"),
+        line_spacing=max(0, int(payload.get("line_spacing", 4))),
     )
 
 
@@ -101,6 +103,8 @@ def _text_to_json(info: TextInfo | None) -> dict | None:
         "size": info.size,
         "color": list(info.color),
         "rotation": info.rotation,
+        "align": info.align,
+        "line_spacing": info.line_spacing,
     }
 
 
@@ -120,7 +124,12 @@ def save_project(document: Document, path: str) -> None:
                     layer.mask.save(handle, format="PNG")
             redaction = None
             if layer.redaction is not None:
-                redaction = {"kind": layer.redaction.kind, "amount": layer.redaction.amount}
+                redaction = {
+                    "kind": layer.redaction.kind,
+                    "amount": layer.redaction.amount,
+                    "color": list(layer.redaction.color),
+                    "seed": int(layer.redaction.seed),
+                }
             manifest_layers.append(
                 {
                     "id": layer.id,
@@ -170,9 +179,16 @@ def load_project(path: str) -> Document:
             redaction_payload = entry.get("redaction")
             redaction = None
             if redaction_payload:
+                raw_color = redaction_payload.get("color", [0, 0, 0, 255])
+                if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
+                    raw_color = [0, 0, 0, 255]
+                if len(raw_color) == 3:
+                    raw_color = [*raw_color, 255]
                 redaction = RedactionInfo(
                     kind=str(redaction_payload.get("kind", "pixelate")),
                     amount=float(redaction_payload.get("amount", 12)),
+                    color=tuple(int(channel) for channel in raw_color[:4]),
+                    seed=int(redaction_payload.get("seed", 1)),
                 )
             kind = entry.get("kind", "raster")
             if kind == "text" and text is not None:
@@ -181,13 +197,16 @@ def load_project(path: str) -> Document:
                 layer.image = image
                 layer.id = entry["id"]
             elif kind == "redaction":
+                info = redaction or RedactionInfo()
                 layer = redaction_layer(
-                    entry.get("name", "Redaction"),
+                    entry.get("name", "Mask"),
                     mask or Image.new("L", (manifest["width"], manifest["height"]), 0),
-                    redaction.kind if redaction else "pixelate",
-                    redaction.amount if redaction else 12,
+                    info.kind,
+                    info.amount,
                     int(entry.get("x", 0)),
                     int(entry.get("y", 0)),
+                    info.color,
+                    info.seed,
                 )
                 layer.id = entry["id"]
             else:

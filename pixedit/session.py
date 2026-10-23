@@ -8,6 +8,7 @@ tool options. It does not import Qt. The window listens for ``change`` and
 from __future__ import annotations
 
 import copy
+import random
 from typing import Any, Callable
 
 import numpy as np
@@ -16,6 +17,7 @@ from PIL import Image
 from pixedit.composite import composite, merge_pair
 from pixedit.factory import blank_layer, empty_raster_layer, raster_layer, redaction_layer, text_layer
 from pixedit.geom import (
+    alpha_bbox,
     canvas_flip,
     canvas_rotate_ccw,
     canvas_rotate_cw,
@@ -46,12 +48,22 @@ from pixedit.model import (
     SetSelectionCommand,
     TextInfo,
     apply_visual,
+    clamp_mask_amount,
     new_document,
     visual_state,
 )
-from pixedit.textutil import render_text
+from pixedit.textutil import default_font_path, render_text
 
 Listener = Callable[[str], None]
+
+_COLOR_OPTION_KEYS = (
+    "color_hue",
+    "color_saturation",
+    "color_brightness",
+    "color_contrast",
+    "color_highlight",
+    "color_shade",
+)
 
 
 def default_options() -> dict[str, Any]:
@@ -59,9 +71,15 @@ def default_options() -> dict[str, Any]:
         "brush_size": 24,
         "brush_hardness": 85,
         "brush_opacity": 100,
-        "redact_shape": "rect",
-        "redact_kind": "pixelate",
-        "redact_amount": 12,
+        "mask_shape": "rect",
+        "mask_kind": "pixelate",
+        "mask_amount": 12,
+        "color_hue": 0,
+        "color_saturation": 0,
+        "color_brightness": 0,
+        "color_contrast": 0,
+        "color_highlight": 0,
+        "color_shade": 0,
         "select_mode": "rect",
         "tolerance": 32,
         "shape_kind": "rect",
@@ -69,6 +87,12 @@ def default_options() -> dict[str, Any]:
         "shape_filled": False,
         "marker_size": 12,
         "rulers": True,
+        "text_font": default_font_path(),
+        "text_font_family": "DejaVu Sans",
+        "text_size": 48,
+        "text_align": "left",
+        "text_line_spacing": 4,
+        "text_rotation": 0,
     }
 
 
@@ -76,7 +100,12 @@ class Session:
     def __init__(self, document: Document | None = None) -> None:
         self.document = document or new_document(1280, 800, "white")
         self.history = History()
-        self.layer_index = len(self.document.layers) - 1
+        # Set before any layer_index assignment. The setter drops an in-progress
+        # color preview when the active layer changes, and it reads this flag.
+        self._color_before: dict[str, Any] | None = None
+        self._color_layer: Layer | None = None
+        self._ending_color = False
+        self._layer_index = len(self.document.layers) - 1
         self.foreground: tuple[int, int, int, int] = (20, 24, 28, 255)
         self.options = default_options()
         self.path: str | None = None
@@ -86,6 +115,25 @@ class Session:
         self._message_handler: Callable[[str], None] | None = None
         self._text_prompter: Callable[[TextInfo | None], TextInfo | None] | None = None
         self._redact_before: RedactionInfo | None = None
+        self._text_before: dict | None = None
+
+    @property
+    def layer_index(self) -> int:
+        return self._layer_index
+
+    @layer_index.setter
+    def layer_index(self, value: int) -> None:
+        """Select a layer. A color preview belongs to one layer, so leaving it restores that layer."""
+        new_index = int(value)
+        preview = self._color_layer
+        self._layer_index = new_index
+        if preview is None:
+            return
+        current = None
+        if self.document.layers and 0 <= new_index < len(self.document.layers):
+            current = self.document.layers[new_index]
+        if current is not preview:
+            self.cancel_color_adjust()
 
     def add_listener(self, listener: Listener) -> None:
         self._listeners.append(listener)
@@ -114,18 +162,23 @@ class Session:
         return self._text_prompter(initial)
 
     def commit(self, command: Any) -> None:
+        # An unapplied color grade is not part of the next undo step. The
+        # notify below reloads the sliders after the options are zeroed.
+        self._discard_color_preview()
         self.history.push(command)
         self.dirty = True
         self.clamp_index()
         self.notify("change")
 
     def undo(self) -> None:
+        self._discard_color_preview()
         if self.history.undo():
             self.dirty = True
             self.clamp_index()
             self.notify("change")
 
     def redo(self) -> None:
+        self._discard_color_preview()
         if self.history.redo():
             self.dirty = True
             self.clamp_index()
@@ -199,10 +252,20 @@ class Session:
         """``delta`` +1 moves the active layer up the stack (toward the front)."""
         if self.layer_index < 0:
             return
-        new_index = self.layer_index + delta
-        if not (0 <= new_index < len(self.document.layers)):
+        self.move_layer(self.layer_index, self.layer_index + delta)
+
+    def move_layer(self, old_index: int, new_index: int) -> None:
+        """Move one layer from ``old_index`` to ``new_index``.
+
+        Index 0 is the back of the stack (painted first). A higher index is
+        in front. One undo step. The moved layer stays selected.
+        """
+        count = len(self.document.layers)
+        if not (0 <= old_index < count and 0 <= new_index < count):
             return
-        self.commit(ReorderLayerCommand(self.document, self.layer_index, new_index))
+        if old_index == new_index:
+            return
+        self.commit(ReorderLayerCommand(self.document, old_index, new_index))
         self.layer_index = new_index
 
     def merge_down_active(self) -> None:
@@ -289,7 +352,7 @@ class Session:
             self.show_message("No layer to clear.")
             return
         if layer.kind == "redaction":
-            self.show_message("Delete clears pixels on a raster layer. Use the eraser to lift a redaction mask.")
+            self.show_message("Delete clears pixels on a raster layer. Use the eraser to lift a mask.")
             return
         before = visual_state(layer)
         local = selection_for_layer(self.document, layer)
@@ -348,7 +411,7 @@ class Session:
             self.show_message("Choose a layer to copy from.")
             return
         if layer.kind == "redaction":
-            self.show_message("A redaction mask is not pixels. Copy the layer underneath it.")
+            self.show_message("A mask is not pixels. Copy the layer underneath it.")
             return
         local = selection_for_layer(self.document, layer)
         if local is None:
@@ -445,6 +508,23 @@ class Session:
         layers, selection = crop_document(self.document, left, top, width, height)
         self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name="Crop"))
 
+    def crop_to_selection(self) -> None:
+        """Crop the canvas to the selection's opaque bounds.
+
+        The Image menu and the Select panel share this path. An empty
+        selection explains itself and leaves the canvas alone.
+        """
+        selection = self.document.selection
+        if selection is None:
+            self.show_message("Draw a selection first.")
+            return
+        box = alpha_bbox(selection)
+        if box is None:
+            self.show_message("The selection is empty.")
+            return
+        left, top, right, bottom = box
+        self.crop_to(left, top, right - left, bottom - top)
+
     def trim(self) -> None:
         rect = trim_rect(self.document)
         if rect is None:
@@ -473,7 +553,20 @@ class Session:
             return
         self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name=name))
 
+    def flip_active_horizontal(self) -> None:
+        self.transform_active("flip-h")
+
+    def flip_active_vertical(self) -> None:
+        self.transform_active("flip-v")
+
+    def rotate_active_cw(self) -> None:
+        self.transform_active("rotate", degrees=90)
+
+    def rotate_active_ccw(self) -> None:
+        self.transform_active("rotate", degrees=-90)
+
     def transform_active(self, kind: str, **kwargs: Any) -> None:
+        self._discard_color_preview()
         layer = self.active_layer()
         if layer is None:
             return
@@ -518,6 +611,7 @@ class Session:
         gesture, and ``finish_raster_edit`` crops transparent margins unless
         the layer already covered the canvas.
         """
+        self._discard_color_preview()
         layer = self.active_layer()
         if layer is not None and layer.kind == "redaction" and paint_redaction:
             return layer, visual_state(layer), False
@@ -591,45 +685,92 @@ class Session:
     def ensure_redaction_layer(self) -> tuple[Layer, bool]:
         """Return the active redaction layer, creating one above the selection if needed.
 
-        The new layer is inserted for preview only. The redact tool removes it
+        The new layer is inserted for preview only. The mask tool removes it
         and re-adds it through ``add_layer`` on release so undo drops the whole
         region in one step.
         """
+        self._discard_color_preview()
         layer = self.active_layer()
         if layer is not None and layer.kind == "redaction":
             return layer, False
         mask = Image.new("L", (self.document.width, self.document.height), 0)
+        info = self.current_mask_info()
         created = redaction_layer(
-            "Redaction",
+            "Mask",
             mask,
-            str(self.option("redact_kind", "pixelate")),
-            float(self.option("redact_amount", 12)),
+            info.kind,
+            info.amount,
+            color=info.color,
+            seed=info.seed,
         )
         index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
         self.document.layers.insert(index, created)
         self.layer_index = index
         return created, True
 
-    def set_redaction_settings(self, kind: str, amount: float, *, transient: bool) -> None:
-        """Update the active redaction layer while a slider is dragged, then commit."""
+    def current_mask_info(self, previous: RedactionInfo | None = None) -> RedactionInfo:
+        """Effect settings from the Mask panel.
+
+        A new region gets a fresh noise seed. Another stroke on the same layer
+        keeps that seed, and keeps the stored color unless the effect is Solid,
+        which takes the foreground swatch.
+        """
+        kind = str(self.option("mask_kind", "pixelate"))
+        amount = clamp_mask_amount(kind, float(self.option("mask_amount", 12)))
+        if kind == "solid":
+            color = tuple(int(channel) for channel in self.foreground)
+        elif previous is not None:
+            color = tuple(int(channel) for channel in previous.color)
+        else:
+            color = (0, 0, 0, 255)
+        seed = int(previous.seed) if previous is not None else random.randrange(1, 2**31)
+        return RedactionInfo(kind, amount, color, seed)
+
+    def set_redaction_settings(
+        self,
+        kind: str,
+        amount: float,
+        *,
+        transient: bool,
+        color: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        """Update the active mask layer while a slider is dragged, then commit."""
+        self._discard_color_preview()
         layer = self.active_layer()
         if layer is None or layer.kind != "redaction" or layer.redaction is None:
             self._redact_before = None
             return
-        amount = float(amount)
+        base = self._redact_before or layer.redaction
+        chosen = tuple(int(channel) for channel in (color if color is not None else base.color))
+        amount = clamp_mask_amount(str(kind), float(amount))
+        updated = RedactionInfo(str(kind), amount, chosen, int(base.seed))
         if transient:
             if self._redact_before is None:
                 self._redact_before = copy.deepcopy(layer.redaction)
-            layer.redaction = RedactionInfo(kind, amount)
+            layer.redaction = updated
             self.preview()
             return
         old = self._redact_before or copy.deepcopy(layer.redaction)
         self._redact_before = None
         layer.redaction = old
-        if old.kind == kind and abs(old.amount - amount) < 1e-6:
+        if old.kind == kind and abs(old.amount - amount) < 1e-6 and tuple(int(channel) for channel in old.color) == chosen:
             self.preview()
             return
-        self.commit(SetRedactionSettings(layer, kind, amount))
+        self.commit(SetRedactionSettings(layer, str(kind), amount, chosen))
+
+    def recolor_solid_mask(self, *, transient: bool) -> None:
+        """While the Mask tool is active, the foreground swatch is Solid's color."""
+        layer = self.active_layer()
+        if layer is None or layer.kind != "redaction" or layer.redaction is None:
+            return
+        if layer.redaction.kind != "solid":
+            return
+        self.set_redaction_settings(
+            layer.redaction.kind,
+            layer.redaction.amount,
+            transient=transient,
+            color=tuple(int(channel) for channel in self.foreground),
+        )
 
     def add_text(self, info: TextInfo, x: int, y: int) -> None:
         if not info.text.strip():
@@ -637,23 +778,223 @@ class Session:
         layer = text_layer("Text", info, x, y)
         self.add_layer(layer, name="Add text")
 
-    def update_text(self, layer: Layer, info: TextInfo) -> None:
-        before = visual_state(layer)
+    def text_info_from_options(self, text: str) -> TextInfo:
+        """Words plus the Text panel's font, align, spacing, rotation, and palette color."""
+        red, green, blue, alpha = (int(channel) for channel in self.foreground)
+        align = str(self.option("text_align", "left") or "left")
+        if align not in ("left", "center", "right", "justify"):
+            align = "left"
+        return TextInfo(
+            text=text,
+            font_path=self.option("text_font"),
+            font_family=str(self.option("text_font_family") or "Default"),
+            size=max(1, int(self.option("text_size", 48))),
+            color=(red, green, blue, alpha),
+            rotation=float(self.option("text_rotation", 0)),
+            align=align,
+            line_spacing=max(0, int(self.option("text_line_spacing", 4))),
+        )
+
+    def adopt_text_style(self, info: TextInfo) -> None:
+        """Copy a text layer's style into the tool options and the palette.
+
+        This does not render. Loading a layer into the panel must not restyle it.
+        """
+        color = tuple(int(channel) for channel in info.color)
+        if len(color) == 3:
+            color = (*color, 255)
+        self.options["text_font"] = info.font_path
+        self.options["text_font_family"] = info.font_family or "Default"
+        self.options["text_size"] = max(1, int(info.size))
+        self.options["text_align"] = info.align if info.align in ("left", "center", "right", "justify") else "left"
+        self.options["text_line_spacing"] = max(0, int(info.line_spacing))
+        self.options["text_rotation"] = float(info.rotation)
+        self.foreground = color
+
+    def text_edit_in_progress(self) -> bool:
+        return self._text_before is not None
+
+    def apply_text_style(self, *, transient: bool) -> None:
+        """Restyle the active text layer from the panel and the foreground color.
+
+        A drag (rotation, line spacing, or the palette) previews on every move
+        and commits once on release. The preview is not an undo step. Releasing
+        on the same style the drag started from leaves history alone.
+
+        Flow:
+        1. No active text layer: forget any preview and return.
+        2. Build the style from the panel options plus the palette color,
+           keeping the layer's words.
+        3. While dragging, remember the pre-drag pixels on the first move,
+           draw the preview, and stop.
+        4. On release, put those pre-drag pixels back, then commit one edit
+           if the style actually changed.
+        """
+        layer = self.active_layer()
+        if layer is None or layer.kind != "text" or layer.text is None:
+            self._text_before = None
+            return
+        info = self.text_info_from_options(layer.text.text)
+        if transient:
+            if self._text_before is None:
+                self._text_before = visual_state(layer)
+            if _text_same(layer.text, info):
+                return
+            self._write_text(layer, info)
+            self.preview()
+            return
+        before = self._text_before
+        self._text_before = None
+        if before is not None:
+            apply_visual(layer, before)
+        if layer.text is None or _text_same(layer.text, info):
+            if before is not None:
+                self.preview()
+            return
+        self.update_text(layer, info)
+
+    def _write_text(self, layer: Layer, info: TextInfo) -> None:
         image = render_text(info)
         # Keep the center stable when the render size changes (rotation, font size).
         cx = layer.x + layer.image.width / 2
         cy = layer.y + layer.image.height / 2
         layer.image = image
-        layer.text = info
+        layer.text = copy.deepcopy(info)
         layer.kind = "text"
         layer.x = int(round(cx - image.width / 2))
         layer.y = int(round(cy - image.height / 2))
+
+    def update_text(self, layer: Layer, info: TextInfo) -> None:
+        before = visual_state(layer)
+        self._write_text(layer, info)
         new_state = visual_state(layer)
         apply_visual(layer, before)
         self.commit(MutateLayerCommand(layer, new_state, name="Edit text"))
 
+    def color_adjust_values(self) -> dict[str, float]:
+        return {key: float(self.option(key, 0)) for key in _COLOR_OPTION_KEYS}
+
+    def color_adjust_active(self) -> bool:
+        return self._color_before is not None
+
+    def _color_is_neutral(self, values: dict[str, float] | None = None) -> bool:
+        data = self.color_adjust_values() if values is None else values
+        return all(abs(value) < 1e-6 for value in data.values())
+
+    def _zero_color_options(self) -> None:
+        for key in _COLOR_OPTION_KEYS:
+            self.options[key] = 0
+
+    def _restore_color_snapshot(self) -> bool:
+        before = self._color_before
+        layer = self._color_layer
+        self._color_before = None
+        self._color_layer = None
+        if before is None or layer is None:
+            return False
+        apply_visual(layer, before)
+        return True
+
+    def _discard_color_preview(self) -> None:
+        """Put the snapshot back and zero the sliders. The caller notifies."""
+        self._restore_color_snapshot()
+        self._zero_color_options()
+
+    def cancel_color_adjust(self) -> bool:
+        """Drop an unapplied grade. True when a preview was actually showing.
+
+        Escape uses that flag so a preview is cancelled first and a selection
+        is cleared only when nothing was previewing. Switching tools and
+        selecting another layer use the same restore.
+        """
+        if self._ending_color:
+            return False
+        self._ending_color = True
+        try:
+            neutral = self._color_is_neutral()
+            restored = self._restore_color_snapshot()
+            self._zero_color_options()
+            if restored or not neutral:
+                self.notify("change")
+            return restored
+        finally:
+            self._ending_color = False
+
+    def preview_color_adjust(self) -> None:
+        """Redraw the active layer from the sliders without writing history.
+
+        Flow:
+        1. A mask layer is refused. The sliders return to zero.
+        2. All sliders at zero put the snapshot back, if a drag had started.
+        3. The first non-zero value snapshots the layer, including text.
+        4. Later values recompute from that snapshot so the sliders combine
+           into one grade. The selection, when there is one, limits the grade.
+        """
+        layer = self.active_layer()
+        if layer is None or layer.kind == "redaction":
+            self.cancel_color_adjust()
+            self.show_message("Choose a raster or text layer for this filter.")
+            return
+        if self._color_layer is not None and layer is not self._color_layer:
+            self.cancel_color_adjust()
+            return
+        values = self.color_adjust_values()
+        if self._color_is_neutral(values):
+            if self._color_before is not None and self._color_layer is layer:
+                apply_visual(layer, self._color_before)
+                self._color_before = None
+                self._color_layer = None
+                self.preview()
+            return
+        if self._color_before is None:
+            self._color_before = visual_state(layer)
+            self._color_layer = layer
+        self._paint_color_preview(layer)
+        self.preview()
+
+    def _paint_color_preview(self, layer: Layer) -> None:
+        from pixedit.adjust import apply_masked, color_grade
+
+        before = self._color_before
+        if before is None:
+            return
+        values = self.color_adjust_values()
+        edited = color_grade(
+            before["image"],
+            hue=values["color_hue"],
+            saturation=values["color_saturation"],
+            brightness=values["color_brightness"],
+            contrast=values["color_contrast"],
+            highlight=values["color_highlight"],
+            shade=values["color_shade"],
+        )
+        selection = selection_for_layer(self.document, layer)
+        layer.image = apply_masked(before["image"], edited, selection)
+        # Text is shown as pixels for the preview. Cancel restores ``before``,
+        # which still has the text metadata. Apply keeps the pixels.
+        layer.kind = "raster"
+        layer.text = None
+
+    def commit_color_adjust(self) -> None:
+        """Keep the preview as one undo step and return the sliders to zero."""
+        layer = self._color_layer
+        before = self._color_before
+        if layer is None or before is None or self._color_is_neutral():
+            self.cancel_color_adjust()
+            return
+        self._paint_color_preview(layer)
+        new_state = visual_state(layer)
+        new_state["kind"] = "raster"
+        new_state["text"] = None
+        apply_visual(layer, before)
+        self._color_before = None
+        self._color_layer = None
+        self._zero_color_options()
+        self.commit(MutateLayerCommand(layer, new_state, name="Color"))
+
     def run_filter(self, name: str, function: Callable[[Image.Image], Image.Image]) -> None:
         """Apply a pixel function to the active raster or text layer, honoring the selection."""
+        self._discard_color_preview()
         layer = self.active_layer()
         if layer is None or layer.kind == "redaction":
             self.show_message("Choose a raster or text layer for this filter.")
@@ -671,3 +1012,16 @@ class Session:
         new_state = visual_state(layer)
         apply_visual(layer, before)
         self.commit(MutateLayerCommand(layer, new_state, name=name))
+
+
+def _text_same(left: TextInfo, right: TextInfo) -> bool:
+    return (
+        left.text == right.text
+        and left.font_path == right.font_path
+        and left.font_family == right.font_family
+        and int(left.size) == int(right.size)
+        and tuple(int(channel) for channel in left.color) == tuple(int(channel) for channel in right.color)
+        and abs(float(left.rotation) - float(right.rotation)) < 1e-4
+        and (left.align or "left") == (right.align or "left")
+        and int(left.line_spacing) == int(right.line_spacing)
+    )

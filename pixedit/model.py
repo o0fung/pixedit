@@ -32,18 +32,47 @@ class TextInfo:
     size: int
     color: tuple[int, int, int, int]
     rotation: float = 0.0  # degrees clockwise
+    align: str = "left"  # left, center, right, justify
+    line_spacing: int = 4
 
 
 @dataclass
 class RedactionInfo:
-    """How a redaction mask is applied at composite time.
+    """How a mask is applied at composite time.
 
-    ``kind`` is ``blur`` (``amount`` is Gaussian radius) or ``pixelate``
-    (``amount`` is the mosaic block size in pixels).
+    ``kind`` selects the effect. ``amount`` is the mosaic block, blur radius,
+    or strength. ``color`` is the flat color used by Solid. ``seed`` keeps
+    Noise from changing every time the canvas is redrawn.
     """
 
     kind: str = "pixelate"
     amount: float = 12.0
+    color: tuple[int, int, int, int] = (0, 0, 0, 255)
+    seed: int = 1
+
+
+# Solid has no strength slider. The other entries are the amount control:
+# label, inclusive range, and the value used when that effect is chosen fresh.
+MASK_EFFECTS: dict[str, dict[str, int | str] | None] = {
+    "pixelate": {"label": "Block", "min": 2, "max": 64, "default": 12},
+    "blur": {"label": "Radius", "min": 1, "max": 40, "default": 8},
+    "solid": None,
+    "noise": {"label": "Strength", "min": 1, "max": 100, "default": 100},
+    "desaturate": {"label": "Strength", "min": 0, "max": 100, "default": 100},
+    "invert": {"label": "Strength", "min": 0, "max": 100, "default": 100},
+    "dim": {"label": "Strength", "min": 0, "max": 100, "default": 60},
+    "sharpen": {"label": "Strength", "min": 1, "max": 100, "default": 50},
+}
+
+
+def clamp_mask_amount(kind: str, amount: float) -> float:
+    """Fit ``amount`` to the effect's slider. Solid keeps the number it had."""
+    spec = MASK_EFFECTS.get(kind)
+    if not spec:
+        return float(amount)
+    low = int(spec["min"])
+    high = int(spec["max"])
+    return float(min(high, max(low, int(round(amount)))))
 
 
 @dataclass
@@ -54,9 +83,10 @@ class Layer:
     ``(x, y)`` on the canvas. Paint and shapes grow that bitmap around new
     marks; they do not resize every layer to the document. A layer that
     already covers the canvas (background, import, flatten) keeps that size.
-    A redaction layer stores an ``L`` mask (255 = fully redacted) in document
-    coordinates and does not paint its own color; compositing blurs or
-    pixelates whatever is already underneath the mask.
+    A redaction layer stores an ``L`` mask (255 = fully covered) in document
+    coordinates and does not paint its own color. Compositing mixes an effect
+    — pixelate, blur, solid, noise, and the other mask effects — through that
+    mask. The layer kind stays ``redaction`` so existing projects still open.
     """
 
     id: str
@@ -310,12 +340,19 @@ class MutateLayerCommand(Command):
 
 
 class SetRedactionSettings(Command):
-    name = "Redaction settings"
+    name = "Mask"
 
-    def __init__(self, layer: Layer, kind: str, amount: float) -> None:
+    def __init__(
+        self,
+        layer: Layer,
+        kind: str,
+        amount: float,
+        color: tuple[int, int, int, int] | None = None,
+    ) -> None:
         self.layer = layer
         self.kind = kind
         self.amount = float(amount)
+        self.color = None if color is None else tuple(int(channel) for channel in color)
         self._old: RedactionInfo | None = None
         self._captured = False
 
@@ -323,7 +360,12 @@ class SetRedactionSettings(Command):
         if not self._captured:
             self._old = copy.deepcopy(self.layer.redaction)
             self._captured = True
-        self.layer.redaction = RedactionInfo(self.kind, self.amount)
+        # Seed stays with the layer. A new color is stored only when the
+        # caller passed one (choosing Solid, or moving the swatch).
+        old = self._old
+        color = self.color if self.color is not None else (old.color if old is not None else (0, 0, 0, 255))
+        seed = old.seed if old is not None else 1
+        self.layer.redaction = RedactionInfo(self.kind, self.amount, color, seed)
 
     def undo(self) -> None:
         self.layer.redaction = copy.deepcopy(self._old)
