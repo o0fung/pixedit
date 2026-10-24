@@ -42,6 +42,10 @@ class Tool:
     cursor = "cross"
     hint = ""
 
+    def cursor_name(self, _session) -> str:
+        """Pointer for this tool. Options can change it; the canvas asks every time."""
+        return self.cursor
+
     def button_caption(self) -> str:
         """Toolbar text. A shortcut is shown beside the name, as in ``Brush (B)``."""
         if self.shortcut:
@@ -54,11 +58,23 @@ class Tool:
     def panel_actions(self) -> list[dict[str, Any]]:
         """Buttons under the option controls.
 
-        Each entry has ``id`` and ``label``. The window runs the id. Select
-        actions name session methods. ``needs_selection`` disables the button
-        until a selection exists. ``shortcut`` is only the tooltip.
+        Each entry has ``id`` and ``label``. ``icon`` names a file in
+        ``resources/icons`` and draws an icon-only button; the label stays
+        the tooltip and the accessible name. ``new_row`` starts a new row
+        even when the next icon would still fit. The window runs the id.
+        Select actions name session methods. ``needs_selection`` disables
+        the button until a selection exists. ``shortcut`` is only the tooltip.
         """
         return []
+
+    def wants_stroke_sampling(self, _session) -> bool:
+        """True when the canvas should poll the cursor while the button is down.
+
+        Mouse-move events arrive in bursts. The canvas stores a point every
+        8 ms and passes the batch to ``extend_points``. Release calls
+        ``commit_stroke`` with the pointer, including Shift and Alt.
+        """
+        return False
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         return None

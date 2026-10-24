@@ -72,8 +72,9 @@ def ensure_output_folder() -> Path | None:
 def dialog_start(filename: str | None = None, folder: Path | None = None) -> str:
     """Path a file dialog should open.
 
-    Open and Place pass no filename and get the folder. Save As passes
-    ``untitled.pix`` and Export passes ``export.png``.
+    Open and Place pass no filename and get the folder. Save As and Export
+    pass a suggested filename, such as ``photo.pix`` or ``photo.png``. A new
+    canvas still uses ``untitled.pix`` and ``export.png``.
     """
     root = output_folder() if folder is None else folder
     if filename:

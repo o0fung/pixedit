@@ -8,13 +8,81 @@ from pathlib import Path
 
 from PIL import Image
 
-from pixedit.composite import composite, composite_over
+from pixedit.composite import composite, composite_group_over, composite_over
 from pixedit.factory import raster_layer, redaction_layer, text_layer
-from pixedit.model import Document, Layer, RedactionInfo, TextInfo
+from pixedit.model import Document, Layer, LayerGroup, RedactionInfo, TextInfo, bind_mask_targets, new_id
 
 RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
 PROJECT_SUFFIX = ".pix"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+DEFAULT_DPI = 72.0
+
+# Export dialog order. The first suffix is appended when the chosen name has none.
+# JPEG, BMP, GIF, and PDF are flattened on white inside export_image.
+EXPORT_CHOICES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("PNG", (".png",)),
+    ("JPEG", (".jpg", ".jpeg")),
+    ("WebP", (".webp",)),
+    ("TIFF", (".tif", ".tiff")),
+    ("BMP", (".bmp",)),
+    ("GIF", (".gif",)),
+    ("PDF", (".pdf",)),
+)
+EXPORT_SUFFIXES = {suffix for _label, suffixes in EXPORT_CHOICES for suffix in suffixes}
+# No straight alpha. Clear pixels would turn black if the channel were dropped.
+_OPAQUE_EXPORT_SUFFIXES = {"jpg", "jpeg", "bmp", "gif", "pdf"}
+
+
+def _export_filter(label: str, suffixes: tuple[str, ...]) -> str:
+    globs = " ".join(f"*{suffix}" for suffix in suffixes)
+    return f"{label} ({globs})"
+
+
+def export_filter_string() -> str:
+    """QFileDialog filter listing every format ``export_image`` can write."""
+    return ";;".join(_export_filter(label, suffixes) for label, suffixes in EXPORT_CHOICES)
+
+
+def export_filter_for_suffix(suffix: str) -> str:
+    """The Export filter that matches ``suffix``. Unknown suffixes use PNG."""
+    wanted = suffix.lower()
+    for label, suffixes in EXPORT_CHOICES:
+        if wanted in suffixes:
+            return _export_filter(label, suffixes)
+    label, suffixes = EXPORT_CHOICES[0]
+    return _export_filter(label, suffixes)
+
+
+def extension_for_export_filter(selected: str) -> str:
+    """Suffix to add when the chosen export name has no known extension."""
+    for label, suffixes in EXPORT_CHOICES:
+        if selected.startswith(label):
+            return suffixes[0]
+    return ".png"
+
+
+def image_dpi(image: Image.Image) -> float:
+    """Resolution stored on a file, or 72 when the file does not say."""
+    raw = image.info.get("dpi")
+    if isinstance(raw, (tuple, list)) and raw:
+        try:
+            value = float(raw[0])
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    density = image.info.get("jfif_density")
+    unit = image.info.get("jfif_unit")
+    if isinstance(density, (tuple, list)) and density:
+        try:
+            value = float(density[0])
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0 and unit == 1:
+            return value
+        if value > 0 and unit == 2:
+            return value * 2.54
+    return DEFAULT_DPI
 
 
 def load_raster(path: str) -> Document:
@@ -24,6 +92,7 @@ def load_raster(path: str) -> Document:
     instead of stacking every frame on top of the others.
     """
     with Image.open(path) as source:
+        dpi = image_dpi(source)
         frames: list[Image.Image] = []
         count = getattr(source, "n_frames", 1) or 1
         for index in range(count):
@@ -39,14 +108,15 @@ def load_raster(path: str) -> Document:
         layer = raster_layer(name, frame)
         layer.visible = index == 0 or not multiple
         layers.append(layer)
-    return Document(width=width, height=height, layers=layers)
+    return Document(width=width, height=height, layers=layers, dpi=dpi)
 
 
 def load_pdf(path: str, scale: float = 2.0) -> Document:
-    """Render each PDF page to its own layer.
+    """Render each PDF page as its own group.
 
     ``scale`` is the PDFium zoom. 1.0 is about 72 DPI and 2.0 is about 144 DPI.
-    Only the first page is visible; the rest stay in the layer stack.
+    Every page stays visible inside its group. The canvas shows the first page.
+    Groups are stored in page order, which is the order PDF export writes.
     """
     import pypdfium2 as pdfium
 
@@ -65,14 +135,25 @@ def load_pdf(path: str, scale: float = 2.0) -> Document:
         pdf.close()
     if not pages:
         raise ValueError("PDF has no pages")
-    width = max(page.width for page in pages)
-    height = max(page.height for page in pages)
-    layers = []
+    groups: list[LayerGroup] = []
     for index, page in enumerate(pages):
         layer = raster_layer(f"Page {index + 1}", page)
-        layer.visible = index == 0
-        layers.append(layer)
-    return Document(width=width, height=height, layers=layers)
+        groups.append(
+            LayerGroup(
+                id=new_id(),
+                name=f"Page {index + 1}",
+                width=page.width,
+                height=page.height,
+                layers=[layer],
+            )
+        )
+    return Document(
+        width=groups[0].width,
+        height=groups[0].height,
+        dpi=DEFAULT_DPI * float(scale),
+        groups=groups,
+        active_group_id=groups[0].id,
+    )
 
 
 def _text_from_json(payload: dict | None) -> TextInfo | None:
@@ -108,56 +189,210 @@ def _text_to_json(info: TextInfo | None) -> dict | None:
     }
 
 
+def _dpi_from_manifest(manifest: dict) -> float:
+    dpi = DEFAULT_DPI
+    if manifest.get("dpi") is not None:
+        try:
+            dpi = float(manifest["dpi"])
+        except (TypeError, ValueError):
+            dpi = DEFAULT_DPI
+        if dpi <= 0:
+            dpi = DEFAULT_DPI
+    return dpi
+
+
+def _layer_manifest(layer: Layer, image_name: str, mask_name: str | None) -> dict:
+    redaction = None
+    if layer.redaction is not None:
+        redaction = {
+            "kind": layer.redaction.kind,
+            "amount": layer.redaction.amount,
+            "color": list(layer.redaction.color),
+            "seed": int(layer.redaction.seed),
+        }
+    return {
+        "id": layer.id,
+        "name": layer.name,
+        "kind": layer.kind,
+        "visible": layer.visible,
+        "opacity": layer.opacity,
+        "blend_mode": layer.blend_mode,
+        "x": layer.x,
+        "y": layer.y,
+        "image": image_name,
+        "mask": mask_name,
+        "text": _text_to_json(layer.text),
+        "redaction": redaction,
+        "target_id": layer.target_id,
+    }
+
+
+def _read_layer(archive: zipfile.ZipFile, entry: dict, width: int, height: int) -> Layer:
+    with archive.open(entry["image"]) as handle:
+        image = Image.open(handle).convert("RGBA")
+        image.load()
+    mask = None
+    if entry.get("mask"):
+        with archive.open(entry["mask"]) as handle:
+            mask = Image.open(handle).convert("L")
+            mask.load()
+    text = _text_from_json(entry.get("text"))
+    redaction_payload = entry.get("redaction")
+    redaction = None
+    if redaction_payload:
+        raw_color = redaction_payload.get("color", [0, 0, 0, 255])
+        if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
+            raw_color = [0, 0, 0, 255]
+        if len(raw_color) == 3:
+            raw_color = [*raw_color, 255]
+        redaction = RedactionInfo(
+            kind=str(redaction_payload.get("kind", "pixelate")),
+            amount=float(redaction_payload.get("amount", 12)),
+            color=tuple(int(channel) for channel in raw_color[:4]),
+            seed=int(redaction_payload.get("seed", 1)),
+        )
+    kind = entry.get("kind", "raster")
+    if kind == "text" and text is not None:
+        layer = text_layer(entry.get("name", "Text"), text, int(entry.get("x", 0)), int(entry.get("y", 0)))
+        # Prefer the stored render so a missing font does not move pixels.
+        layer.image = image
+        layer.id = entry["id"]
+    elif kind == "redaction":
+        info = redaction or RedactionInfo()
+        layer = redaction_layer(
+            entry.get("name", "Mask"),
+            mask or Image.new("L", (width, height), 0),
+            info.kind,
+            info.amount,
+            int(entry.get("x", 0)),
+            int(entry.get("y", 0)),
+            info.color,
+            info.seed,
+        )
+        layer.id = entry["id"]
+        raw_target = entry.get("target_id")
+        if isinstance(raw_target, str) and raw_target:
+            layer.target_id = raw_target
+    else:
+        layer = raster_layer(entry.get("name", "Layer"), image, int(entry.get("x", 0)), int(entry.get("y", 0)))
+        layer.id = entry["id"]
+    layer.visible = bool(entry.get("visible", True))
+    layer.opacity = float(entry.get("opacity", 1))
+    layer.blend_mode = str(entry.get("blend_mode", "normal"))
+    if mask is not None:
+        layer.mask = mask
+    return layer
+
+
+def _read_selection(archive: zipfile.ZipFile, name: str | None) -> Image.Image | None:
+    if not name:
+        return None
+    with archive.open(name) as handle:
+        selection = Image.open(handle).convert("L")
+        selection.load()
+    return selection
+
+
 def save_project(document: Document, path: str) -> None:
-    """Write a ``.pix`` zip: ``manifest.json`` plus PNG assets for each layer."""
+    """Write a version 2 ``.pix`` zip: one folder of PNGs per group."""
     destination = Path(path)
-    manifest_layers = []
+    manifest_groups = []
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for index, layer in enumerate(document.layers):
-            image_name = f"layers/{index:03d}.png"
-            mask_name = None
-            with archive.open(image_name, "w") as handle:
-                layer.image.save(handle, format="PNG")
-            if layer.mask is not None:
-                mask_name = f"layers/{index:03d}_mask.png"
-                with archive.open(mask_name, "w") as handle:
-                    layer.mask.save(handle, format="PNG")
-            redaction = None
-            if layer.redaction is not None:
-                redaction = {
-                    "kind": layer.redaction.kind,
-                    "amount": layer.redaction.amount,
-                    "color": list(layer.redaction.color),
-                    "seed": int(layer.redaction.seed),
-                }
-            manifest_layers.append(
+        for group_index, group in enumerate(document.groups):
+            manifest_layers = []
+            for index, layer in enumerate(group.layers):
+                image_name = f"groups/{group_index:03d}/layers/{index:03d}.png"
+                mask_name = None
+                with archive.open(image_name, "w") as handle:
+                    layer.image.save(handle, format="PNG")
+                if layer.mask is not None:
+                    mask_name = f"groups/{group_index:03d}/layers/{index:03d}_mask.png"
+                    with archive.open(mask_name, "w") as handle:
+                        layer.mask.save(handle, format="PNG")
+                manifest_layers.append(_layer_manifest(layer, image_name, mask_name))
+            selection_name = None
+            if group.selection is not None:
+                selection_name = f"groups/{group_index:03d}/selection.png"
+                with archive.open(selection_name, "w") as handle:
+                    group.selection.save(handle, format="PNG")
+            manifest_groups.append(
                 {
-                    "id": layer.id,
-                    "name": layer.name,
-                    "kind": layer.kind,
-                    "visible": layer.visible,
-                    "opacity": layer.opacity,
-                    "blend_mode": layer.blend_mode,
-                    "x": layer.x,
-                    "y": layer.y,
-                    "image": image_name,
-                    "mask": mask_name,
-                    "text": _text_to_json(layer.text),
-                    "redaction": redaction,
+                    "id": group.id,
+                    "name": group.name,
+                    "width": group.width,
+                    "height": group.height,
+                    "selection": selection_name,
+                    "layers": manifest_layers,
                 }
             )
-        if document.selection is not None:
-            with archive.open("selection.png", "w") as handle:
-                document.selection.save(handle, format="PNG")
         manifest = {
             "format": "pixedit",
             "version": FORMAT_VERSION,
-            "width": document.width,
-            "height": document.height,
-            "selection": "selection.png" if document.selection is not None else None,
-            "layers": manifest_layers,
+            "dpi": float(document.dpi),
+            "active_group": document.active_group_id,
+            "groups": manifest_groups,
         }
         archive.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+
+def _load_project_v1(archive: zipfile.ZipFile, manifest: dict) -> Document:
+    """Wrap a one-canvas project as a single group named Group 1.
+
+    The file on disk is left unchanged. The next save writes version 2.
+    """
+    width = int(manifest["width"])
+    height = int(manifest["height"])
+    layers = [_read_layer(archive, entry, width, height) for entry in manifest["layers"]]
+    # Older projects omit target_id. The mask then belongs to the picture
+    # or text layer directly under it.
+    bind_mask_targets(layers)
+    group = LayerGroup(
+        id=new_id(),
+        name="Group 1",
+        width=width,
+        height=height,
+        layers=layers,
+        selection=_read_selection(archive, manifest.get("selection")),
+    )
+    return Document(
+        width=width,
+        height=height,
+        dpi=_dpi_from_manifest(manifest),
+        groups=[group],
+        active_group_id=group.id,
+    )
+
+
+def _load_project_v2(archive: zipfile.ZipFile, manifest: dict) -> Document:
+    raw_groups = manifest.get("groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError("This PixEdit project has no groups")
+    groups: list[LayerGroup] = []
+    for entry in raw_groups:
+        width = int(entry["width"])
+        height = int(entry["height"])
+        layers = [_read_layer(archive, layer_entry, width, height) for layer_entry in entry.get("layers", [])]
+        bind_mask_targets(layers)
+        groups.append(
+            LayerGroup(
+                id=str(entry.get("id") or new_id()),
+                name=str(entry.get("name") or "Group"),
+                width=width,
+                height=height,
+                layers=layers,
+                selection=_read_selection(archive, entry.get("selection")),
+            )
+        )
+    active = manifest.get("active_group")
+    if not isinstance(active, str):
+        active = groups[0].id
+    return Document(
+        width=groups[0].width,
+        height=groups[0].height,
+        dpi=_dpi_from_manifest(manifest),
+        groups=groups,
+        active_group_id=active,
+    )
 
 
 def load_project(path: str) -> Document:
@@ -165,70 +400,20 @@ def load_project(path: str) -> Document:
         manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
         if manifest.get("format") != "pixedit":
             raise ValueError("Not a PixEdit project")
-        layers: list[Layer] = []
-        for entry in manifest["layers"]:
-            with archive.open(entry["image"]) as handle:
-                image = Image.open(handle).convert("RGBA")
-                image.load()
-            mask = None
-            if entry.get("mask"):
-                with archive.open(entry["mask"]) as handle:
-                    mask = Image.open(handle).convert("L")
-                    mask.load()
-            text = _text_from_json(entry.get("text"))
-            redaction_payload = entry.get("redaction")
-            redaction = None
-            if redaction_payload:
-                raw_color = redaction_payload.get("color", [0, 0, 0, 255])
-                if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
-                    raw_color = [0, 0, 0, 255]
-                if len(raw_color) == 3:
-                    raw_color = [*raw_color, 255]
-                redaction = RedactionInfo(
-                    kind=str(redaction_payload.get("kind", "pixelate")),
-                    amount=float(redaction_payload.get("amount", 12)),
-                    color=tuple(int(channel) for channel in raw_color[:4]),
-                    seed=int(redaction_payload.get("seed", 1)),
-                )
-            kind = entry.get("kind", "raster")
-            if kind == "text" and text is not None:
-                layer = text_layer(entry.get("name", "Text"), text, int(entry.get("x", 0)), int(entry.get("y", 0)))
-                # Prefer the stored render so a missing font does not move pixels.
-                layer.image = image
-                layer.id = entry["id"]
-            elif kind == "redaction":
-                info = redaction or RedactionInfo()
-                layer = redaction_layer(
-                    entry.get("name", "Mask"),
-                    mask or Image.new("L", (manifest["width"], manifest["height"]), 0),
-                    info.kind,
-                    info.amount,
-                    int(entry.get("x", 0)),
-                    int(entry.get("y", 0)),
-                    info.color,
-                    info.seed,
-                )
-                layer.id = entry["id"]
-            else:
-                layer = raster_layer(entry.get("name", "Layer"), image, int(entry.get("x", 0)), int(entry.get("y", 0)))
-                layer.id = entry["id"]
-            layer.visible = bool(entry.get("visible", True))
-            layer.opacity = float(entry.get("opacity", 1))
-            layer.blend_mode = str(entry.get("blend_mode", "normal"))
-            if mask is not None:
-                layer.mask = mask
-            layers.append(layer)
-        selection = None
-        if manifest.get("selection"):
-            with archive.open(manifest["selection"]) as handle:
-                selection = Image.open(handle).convert("L")
-                selection.load()
-    return Document(
-        width=int(manifest["width"]),
-        height=int(manifest["height"]),
-        layers=layers,
-        selection=selection,
-    )
+        raw_version = manifest.get("version", 1)
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("This PixEdit project has an unreadable version.") from exc
+        # Version 1 is one canvas. Opening it builds one group. The next Save
+        # writes version 2. Any other version is refused.
+        if version <= 1:
+            return _load_project_v1(archive, manifest)
+        if version == FORMAT_VERSION:
+            return _load_project_v2(archive, manifest)
+        raise ValueError(
+            f"This PixEdit project uses version {version}, which this version of PixEdit cannot open."
+        )
 
 
 def load_path(path: str, pdf_scale: float = 2.0) -> Document:
@@ -247,14 +432,48 @@ def load_path(path: str, pdf_scale: float = 2.0) -> Document:
 
 
 def export_image(document: Document, path: str, fmt: str | None = None, quality: int = 92) -> None:
-    """Write a flattened PNG, JPEG, or WebP file."""
+    """Write a flattened file.
+
+    PNG, WebP, and TIFF keep transparency. JPEG, BMP, GIF, and PDF are
+    composited on white, because those formats cannot keep a real alpha
+    channel. GIF is reduced to 256 colors. PNG and the other single-image
+    formats save the page on screen. PDF writes every group, in group order,
+    one raster page each, at the document resolution.
+    """
     suffix = (fmt or Path(path).suffix.lstrip(".")).lower()
-    if suffix in {"jpg", "jpeg"}:
+    # Empty means "caller passed a path with no extension"; write PNG.
+    # Anything else that we cannot write is refused before compositing.
+    if suffix not in {"png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf", ""}:
+        raise ValueError(f"Unsupported export format: .{suffix}")
+    dpi = max(1.0, float(document.dpi))
+    resolution = (dpi, dpi)
+    if suffix == "pdf":
+        pages = [composite_group_over(group, (255, 255, 255, 255)).convert("RGB") for group in document.groups]
+        if not pages:
+            raise ValueError("Nothing to export")
+        first, *rest = pages
+        if rest:
+            first.save(path, format="PDF", resolution=dpi, save_all=True, append_images=rest)
+        else:
+            first.save(path, format="PDF", resolution=dpi)
+        return
+    if suffix in _OPAQUE_EXPORT_SUFFIXES:
         flat = composite_over(document, (255, 255, 255, 255)).convert("RGB")
-        flat.save(path, format="JPEG", quality=quality)
+    else:
+        flat = composite(document)
+    if suffix in {"jpg", "jpeg"}:
+        flat.save(path, format="JPEG", quality=quality, dpi=resolution)
         return
-    flat = composite(document)
     if suffix == "webp":
-        flat.save(path, format="WEBP", quality=quality)
+        flat.save(path, format="WEBP", quality=quality, dpi=resolution)
         return
-    flat.save(path, format="PNG")
+    if suffix in {"tif", "tiff"}:
+        flat.save(path, format="TIFF", dpi=resolution)
+        return
+    if suffix == "bmp":
+        flat.save(path, format="BMP")
+        return
+    if suffix == "gif":
+        flat.convert("P", palette=Image.Palette.ADAPTIVE).save(path, format="GIF")
+        return
+    flat.save(path, format="PNG", dpi=resolution)

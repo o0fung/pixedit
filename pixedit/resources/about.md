@@ -1,3 +1,5 @@
+By Yeung LF developed with CursorAi
+
 PixEdit is a layered desktop image editor. Launch it with `pix`, or with `python -m pixedit`. Passing a path, as in `pix photo.png`, opens that file.
 
 ## Open
@@ -6,7 +8,7 @@ PNG, JPEG, WebP, TIFF, BMP, GIF, and PDF. Multi-frame GIF and TIFF become one la
 
 ## Save and export
 
-Save writes a `.pix` project: a zip of the layer stack, masks, and the selection. Opening a PNG does not overwrite that file on Save. Use Export for a flattened PNG, JPEG, or WebP. JPEG is composited on white.
+Save writes a `.pix` project: a zip of the layer stack, masks, and the selection. Opening a PNG does not overwrite that file on Save. Use Export for a flattened PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF. JPEG, BMP, GIF, and PDF are composited on white.
 
 ## Output folder
 

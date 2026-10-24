@@ -85,6 +85,39 @@ QToolButton:checked {
     border: 1px solid #3ec6ff;
 }
 
+/* Picture buttons in the tool options and the layer list. Tight padding so
+   the choice squares and the 44px command squares both keep their icon. */
+QToolButton#iconButton {
+    padding: 2px;
+    text-align: center;
+}
+QFrame#panel QToolButton#iconButton,
+QFrame#layers QToolButton#iconButton {
+    padding: 2px;
+    text-align: center;
+}
+
+/* Canvas-size anchor. A tight 3×3, not the wide toolbar buttons. */
+QWidget#anchorMatrix {
+    background: #8ea0b0;
+}
+QToolButton#anchorCell {
+    background: #12161b;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    margin: 0;
+}
+QToolButton#anchorCell:hover {
+    background: #1d4254;
+}
+QToolButton#anchorCell:checked,
+QToolButton#anchorCell:checked:hover {
+    background: #f4f7f8;
+    border: none;
+    color: #f4f7f8;
+}
+
 QToolButton:disabled, QPushButton:disabled {
     color: #66727f;
     background: #1b2128;
@@ -98,7 +131,7 @@ QListWidget {
 }
 
 QListWidget::item {
-    padding: 6px 8px;
+    padding: 4px 8px;
     border-radius: 4px;
 }
 

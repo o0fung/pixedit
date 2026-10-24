@@ -52,6 +52,7 @@ def redaction_layer(
     y: int = 0,
     color: tuple[int, int, int, int] = (0, 0, 0, 255),
     seed: int | None = None,
+    target_id: str | None = None,
 ) -> Layer:
     if seed is None:
         seed = random.randrange(1, 2**31)
@@ -69,4 +70,5 @@ def redaction_layer(
             color=tuple(int(channel) for channel in color),
             seed=int(seed),
         ),
+        target_id=target_id,
     )

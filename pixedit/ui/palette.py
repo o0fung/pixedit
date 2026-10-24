@@ -5,12 +5,16 @@ hue. Dragging writes ``session.foreground`` live and tells the window when
 the drag is still moving, so a text layer can preview without an undo step.
 Recent swatches update only when the drag, a typed hex value, or a
 Color-tool pick finishes.
+
+The code box takes letters only while it has the keyboard. Enter applies
+the code and returns to the picture. Escape, the color square, the hue
+strip, and a recent swatch leave the box without applying a half-typed code.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtCore import Qt, QPointF, QTimer
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider, QVBoxLayout, QWidget
 
@@ -157,6 +161,9 @@ class _Field(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        # The square and the strip do not take focus. Leave the code box
+        # before the pick, or the box would keep the next shortcut.
+        self.palette._leave_code_box()
         self._pressed = True
         self.palette._drag = self.kind
         self._pick(event.position().x(), event.position().y(), transient=True)
@@ -189,6 +196,45 @@ class _Field(QWidget):
         self.palette.set_hsv(hue, self.palette.sat, self.palette.val, transient=transient)
 
 
+class _HexEdit(QLineEdit):
+    """Color code. Tool letters are typed here only while this box has the keyboard.
+
+    Enter applies the code (the base class emits ``editingFinished``) and then
+    the picture takes the keyboard, so the next letter is a shortcut. Escape
+    throws the typed text away. Focus that arrives because another control was
+    destroyed is not a click in the box, so it is given back on the next turn.
+    """
+
+    def __init__(self, palette: ColorPalette) -> None:
+        super().__init__()
+        self.palette = palette
+        # Set when Qt parks the keyboard here because another control was
+        # destroyed. A click clears it before the queued return runs.
+        self._bounce_focus = False
+        self.setPlaceholderText("#RRGGBB")
+        self.setMaxLength(9)
+        self.setToolTip("Foreground color. Type #RGB, #RRGGBB, or #RRGGBBAA. Enter or Escape returns to the picture.")
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
+            self.palette._leave_code_box()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.isAutoRepeat():
+            self.palette._focus_canvas()
+
+    def mousePressEvent(self, event) -> None:
+        self._bounce_focus = False
+        super().mousePressEvent(event)
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._bounce_focus = event.reason() == Qt.FocusReason.OtherFocusReason
+        if self._bounce_focus:
+            QTimer.singleShot(0, self.palette._return_accidental_focus)
+
+
 class ColorPalette(QWidget):
     def __init__(self, session, on_color=None) -> None:
         super().__init__()
@@ -216,10 +262,7 @@ class ColorPalette(QWidget):
         row.setSpacing(6)
         self.chip = QWidget()
         self.chip.setFixedSize(28, 28)
-        self.hex_edit = QLineEdit()
-        self.hex_edit.setPlaceholderText("#RRGGBB")
-        self.hex_edit.setMaxLength(9)
-        self.hex_edit.setToolTip("Foreground color. Type #RGB, #RRGGBB, or #RRGGBBAA.")
+        self.hex_edit = _HexEdit(self)
         self.hex_edit.editingFinished.connect(self._commit_hex)
         row.addWidget(self.chip)
         row.addWidget(self.hex_edit, 1)
@@ -244,6 +287,7 @@ class ColorPalette(QWidget):
         for index in range(_RECENT_LIMIT):
             button = QPushButton()
             button.setFixedSize(22, 22)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setToolTip("Recent color")
             button.clicked.connect(lambda _checked=False, slot=index: self._pick_recent(slot))
@@ -300,10 +344,49 @@ class ColorPalette(QWidget):
         self._apply_rgb(red, green, blue, alpha, emit=True)
         self.note_recent()
 
-    def _pick_recent(self, index: int) -> None:
-        if index >= len(self._recent):
+    def _leave_code_box(self) -> None:
+        """Give the picture the keyboard without applying a half-typed code.
+
+        Focus loss would commit through ``editingFinished``. The visible code
+        is put back first, and that commit is blocked, so Escape or a click
+        on the square does not restyle from the abandoned text. The click
+        then picks its own color.
+        """
+        # ``hasFocus`` is false when this window is not the active app window.
+        # The code box can still be the keyboard target inside the window.
+        if self.window().focusWidget() is self.hex_edit:
+            self._show_hex(force=True)
+            self.hex_edit.blockSignals(True)
+            self._focus_canvas()
+            self.hex_edit.blockSignals(False)
             return
-        red, green, blue, alpha = self._recent[index]
+        self._focus_canvas()
+
+    def _focus_canvas(self) -> None:
+        window = self.window()
+        canvas = getattr(window, "canvas", None)
+        if canvas is not None:
+            canvas.setFocus()
+
+    def _return_accidental_focus(self) -> None:
+        """The code box gained the keyboard because another control was destroyed.
+
+        A click that landed in the meantime keeps the box. Otherwise the
+        half-shown code is not committed; the picture takes the keyboard.
+        """
+        edit = self.hex_edit
+        if edit._bounce_focus and self.window().focusWidget() is edit:
+            edit._bounce_focus = False
+            self._leave_code_box()
+
+    def _pick_recent(self, index: int) -> None:
+        # Read the swatch before leaving the box. A focus change can commit
+        # and reorder the row; the click should still use the color that was shown.
+        color = self._recent[index] if index < len(self._recent) else None
+        self._leave_code_box()
+        if color is None:
+            return
+        red, green, blue, alpha = color
         self._apply_rgb(red, green, blue, alpha, emit=True)
         self.note_recent()
 
@@ -364,8 +447,10 @@ class ColorPalette(QWidget):
         self.sv_pad.update()
         self.hue_pad.update()
 
-    def _show_hex(self) -> None:
-        if self.hex_edit.hasFocus():
+    def _show_hex(self, *, force: bool = False) -> None:
+        # While the user is typing, keep their text. Escape and a swatch
+        # click pass force so the abandoned code is replaced.
+        if self.hex_edit.hasFocus() and not force:
             return
         red, green, blue, alpha = (int(channel) for channel in self.session.foreground)
         text = f"#{red:02X}{green:02X}{blue:02X}" if alpha == 255 else f"#{red:02X}{green:02X}{blue:02X}{alpha:02X}"

@@ -27,7 +27,15 @@ from PyQt6.QtWidgets import (
 
 from pixedit import __version__
 from pixedit.adjust import blur, brightness_contrast, desaturate, hue_saturation, invert, levels, pixelate, sharpen
-from pixedit.io import export_image, load_path, save_project
+from pixedit.io import (
+    EXPORT_SUFFIXES,
+    export_filter_for_suffix,
+    export_filter_string,
+    export_image,
+    extension_for_export_filter,
+    load_path,
+    save_project,
+)
 from pixedit.output_folder import (
     dialog_start,
     ensure_output_folder,
@@ -42,6 +50,8 @@ from pixedit.tools.base import Tool, builtin_tools
 from pixedit.ui.canvas import CanvasView, _is_clear_shortcut
 from pixedit.ui.dialogs import (
     AboutDialog,
+    CanvasSizeDialog,
+    ImageSizeDialog,
     LiveFilterDialog,
     NewDocumentDialog,
     PdfImportDialog,
@@ -59,9 +69,9 @@ _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pd
 
 # Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
 _TOOL_GROUPS = (
-    ("transform", "hand", "zoom", "select", "color"),
+    ("transform", "hand", "zoom", "select"),
     ("brush", "eraser", "fill", "shape", "text"),
-    ("crop", "mask"),
+    ("color", "crop", "mask"),
 )
 
 
@@ -112,7 +122,7 @@ class MainWindow(QMainWindow):
         self.file_toolbar.setObjectName("fileToolbar")
         self.file_toolbar.setMovable(False)
         self.file_toolbar.setFloatable(False)
-        self.file_toolbar.setIconSize(QSize(18, 18))
+        self.file_toolbar.setIconSize(QSize(22, 22))
         self.file_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.file_toolbar)
         shell = QWidget()
@@ -178,8 +188,9 @@ class MainWindow(QMainWindow):
         for button in list(self._buttons.values()):
             self._button_group.removeButton(button)
         self._buttons.clear()
-        # Transform/Hand/Zoom/Select/Color, then paint tools, then crop and
-        # mask, then Marker and any other plugins. A line separates groups.
+        # Transform/Hand/Zoom/Select, then paint tools, then Image & Eyedrop,
+        # Sizes & Crop, and Mask, then Marker and any other plugins. A line
+        # separates groups.
         grouped: list[list[Tool]] = []
         placed: set[str] = set()
         for ids in _TOOL_GROUPS:
@@ -196,12 +207,13 @@ class MainWindow(QMainWindow):
             for tool in group:
                 button = QToolButton()
                 caption = tool.button_caption()
-                button.setText(caption)
+                # A single & is a mnemonic and disappears. && is the visible ampersand.
+                button.setText(caption.replace("&", "&&"))
                 button.setIcon(icon_for_tool(tool.id))
-                button.setIconSize(QSize(18, 18))
+                button.setIconSize(QSize(22, 22))
                 button.setCheckable(True)
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-                button.setFixedHeight(24)
+                button.setFixedHeight(30)
                 button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 button.setAccessibleName(caption)
                 button.setToolTip(f"{caption}\n{tool.hint}" if tool.hint else caption)
@@ -286,7 +298,7 @@ class MainWindow(QMainWindow):
             self._export,
             QKeySequence("Ctrl+E"),
             "export",
-            "Export a flattened PNG, JPEG, or WebP",
+            "Export a flattened PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF",
         )
         file_menu.addSeparator()
         self._show_folder_action = self._file_action(
@@ -314,7 +326,6 @@ class MainWindow(QMainWindow):
         self.redo_action = self._action(edit_menu, "Redo", self.session.redo, QKeySequence.StandardKey.Redo)
         self._prepare_history_button(self.undo_action, "Undo", "undo")
         self._prepare_history_button(self.redo_action, "Redo", "redo")
-        self._populate_file_toolbar()
         self._update_output_folder_tooltip()
         self._update_history_actions()
 
@@ -328,23 +339,31 @@ class MainWindow(QMainWindow):
             "Copy selection to new layer", self.session.copy_selection_to_layer, QKeySequence("Ctrl+C")
         )
         self._deselect_action = self._make_action("Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
+        # Shared by Edit, Select, and Layer. The icon is set once on the action.
+        self._cut_action.setIcon(icon_named("cut-to-layer"))
+        self._copy_action.setIcon(icon_named("copy-to-layer"))
+        self._deselect_action.setIcon(icon_named("deselect"))
         edit_menu.addAction(self._cut_action)
         edit_menu.addAction(self._copy_action)
         edit_menu.addAction(self._deselect_action)
         # WidgetShortcut displays Delete in the menu. It only fires when the
         # window itself has focus, so a line edit still receives the key.
         # Canvas and this window handle Delete while the user is editing.
-        clear_action = self._action(edit_menu, "Clear selection contents", self.session.clear_selection_contents)
+        clear_action = self._action(
+            edit_menu, "Clear selection contents", self.session.clear_selection_contents, icon="clear-pixels"
+        )
         clear_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
         clear_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
 
-        self._action(image_menu, "Crop to selection", self._crop_selection)
+        self._action(image_menu, "Crop to selection", self._crop_selection, icon="crop-to-selection")
         self._action(image_menu, "Trim transparent edges", self.session.trim)
+        self._action(image_menu, "Canvas size…", self._canvas_size)
+        self._action(image_menu, "Image size…", self._image_size)
         image_menu.addSeparator()
-        self._action(image_menu, "Rotate canvas 90° clockwise", lambda: self.session.transform_canvas("rotate-cw"))
-        self._action(image_menu, "Rotate canvas 90° counter-clockwise", lambda: self.session.transform_canvas("rotate-ccw"))
-        self._action(image_menu, "Flip canvas horizontal", lambda: self.session.transform_canvas("flip-h"))
-        self._action(image_menu, "Flip canvas vertical", lambda: self.session.transform_canvas("flip-v"))
+        self._action(image_menu, "Rotate canvas 90° clockwise", lambda: self.session.transform_canvas("rotate-cw"), icon="rotate-cw")
+        self._action(image_menu, "Rotate canvas 90° counter-clockwise", lambda: self.session.transform_canvas("rotate-ccw"), icon="rotate-ccw")
+        self._action(image_menu, "Flip canvas horizontal", lambda: self.session.transform_canvas("flip-h"), icon="flip-h")
+        self._action(image_menu, "Flip canvas vertical", lambda: self.session.transform_canvas("flip-v"), icon="flip-v")
         image_menu.addSeparator()
         self._action(image_menu, "Brightness / Contrast…", lambda: self._filter(
             "Brightness / Contrast",
@@ -376,6 +395,8 @@ class MainWindow(QMainWindow):
         self._action(image_menu, "Invert", lambda: self.session.run_filter("Invert", invert))
 
         self._action(layer_menu, "New layer", self.session.add_blank_layer, QKeySequence("Ctrl+Shift+N"))
+        self._action(layer_menu, "New group", self.session.add_group)
+        self._action(layer_menu, "Delete group", self.session.delete_active_group)
         self._action(layer_menu, "Place image…", self._place)
         self._action(layer_menu, "Duplicate", self.session.duplicate_active, QKeySequence("Ctrl+J"))
         self._action(layer_menu, "Delete", self.session.delete_active)
@@ -384,28 +405,31 @@ class MainWindow(QMainWindow):
         layer_menu.addAction(self._cut_action)
         layer_menu.addAction(self._copy_action)
         layer_menu.addSeparator()
-        self._action(layer_menu, "Merge down", self.session.merge_down_active, QKeySequence("Ctrl+Shift+E"))
+        self._action(layer_menu, "Apply mask", self.session.apply_active_mask)
+        self._action(
+            layer_menu, "Merge down", self.session.merge_down_active, QKeySequence("Ctrl+Shift+E"), icon="layer-merge-down"
+        )
         self._action(layer_menu, "Flatten image", self.session.flatten)
         layer_menu.addSeparator()
         self._action(layer_menu, "Bring forward", lambda: self.session.move_active(1))
         self._action(layer_menu, "Send backward", lambda: self.session.move_active(-1))
         layer_menu.addSeparator()
-        self._action(layer_menu, "Scale…", self._scale_layer)
-        self._action(layer_menu, "Rotate…", self._rotate_layer)
-        self._action(layer_menu, "Flip horizontal", lambda: self.session.transform_active("flip-h"))
-        self._action(layer_menu, "Flip vertical", lambda: self.session.transform_active("flip-v"))
+        self._action(layer_menu, "Scale…", self._scale_layer, icon="scale")
+        self._action(layer_menu, "Rotate…", self._rotate_layer, icon="rotate")
+        self._action(layer_menu, "Flip horizontal", self.session.flip_active_horizontal, icon="flip-h")
+        self._action(layer_menu, "Flip vertical", self.session.flip_active_vertical, icon="flip-v")
 
-        self._action(select_menu, "All", self.session.select_all, QKeySequence.StandardKey.SelectAll)
+        self._action(select_menu, "All", self.session.select_all, QKeySequence.StandardKey.SelectAll, icon="select-all")
         select_menu.addAction(self._deselect_action)
-        self._action(select_menu, "Invert", self.session.invert_selection, QKeySequence("Ctrl+Shift+I"))
+        self._action(select_menu, "Invert", self.session.invert_selection, QKeySequence("Ctrl+Shift+I"), icon="select-invert")
         select_menu.addSeparator()
         select_menu.addAction(self._cut_action)
         select_menu.addAction(self._copy_action)
         select_menu.addSeparator()
-        self._action(select_menu, "Rectangular", lambda: self._select_mode("rect"))
-        self._action(select_menu, "Elliptical", lambda: self._select_mode("ellipse"))
-        self._action(select_menu, "Freehand", lambda: self._select_mode("freehand"))
-        self._action(select_menu, "Magic wand", lambda: self._select_mode("wand"))
+        self._action(select_menu, "Rectangular", lambda: self._select_mode("rect"), icon="select-rect")
+        self._action(select_menu, "Elliptical", lambda: self._select_mode("ellipse"), icon="select-ellipse")
+        self._action(select_menu, "Freehand", lambda: self._select_mode("freehand"), icon="select-freehand")
+        self._action(select_menu, "Magic wand", lambda: self._select_mode("wand"), icon="geom-wand")
 
         self._action(filter_menu, "Gaussian blur…", lambda: self._filter(
             "Gaussian blur",
@@ -426,9 +450,9 @@ class MainWindow(QMainWindow):
             if command.shortcut:
                 action.setShortcut(QKeySequence(command.shortcut))
 
-        self._action(view_menu, "Zoom in", lambda: self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 1.25), QKeySequence.StandardKey.ZoomIn)
-        self._action(view_menu, "Zoom out", lambda: self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 0.8), QKeySequence.StandardKey.ZoomOut)
-        self._action(view_menu, "Fit", self.canvas.fit, QKeySequence("Ctrl+0"))
+        self._action(view_menu, "Zoom in", lambda: self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 1.25), QKeySequence.StandardKey.ZoomIn, icon="zoom")
+        self._action(view_menu, "Zoom out", lambda: self.canvas.zoom_at(self.canvas.width() / 2, self.canvas.height() / 2, 0.8), QKeySequence.StandardKey.ZoomOut, icon="zoom-out")
+        self._action(view_menu, "Fit", self.canvas.fit, QKeySequence("Ctrl+0"), icon="zoom-fit")
         self._action(view_menu, "Actual pixels", self.canvas.zoom_100, QKeySequence("Ctrl+1"))
         view_menu.addSeparator()
         rulers = self._action(view_menu, "Rulers", self._toggle_rulers)
@@ -451,8 +475,15 @@ class MainWindow(QMainWindow):
         self._action(help_menu, "Keyboard shortcuts", lambda: ShortcutsDialog(self).exec())
         # AboutRole moves this item into the application menu on macOS.
         # On Windows and Linux the role is ignored and it stays under Help.
-        about = self._action(help_menu, "About PixEdit", self._about)
-        about.setMenuRole(QAction.MenuRole.AboutRole)
+        # The same action is the About button beside Show folder. The menu
+        # keeps the full name; the strip uses the short caption.
+        self._about_action = self._action(help_menu, "About PixEdit", self._about)
+        self._about_action.setMenuRole(QAction.MenuRole.AboutRole)
+        self._about_action.setIcon(icon_named("about"))
+        self._about_action.setIconText("About")
+        self._about_action.setToolTip("About PixEdit")
+        self._about_action.setStatusTip("About PixEdit")
+        self._populate_file_toolbar()
 
     def _file_action(self, menu, label: str, short_label: str, slot, shortcut, icon_name: str, summary: str) -> QAction:
         """A File-menu action that also appears on the file toolbar.
@@ -475,8 +506,9 @@ class MainWindow(QMainWindow):
 
     def _populate_file_toolbar(self) -> None:
         # New, Open, Close, Save, Save As, Place, Export, then Undo and Redo,
-        # then Show folder. Undo and Redo are the Edit-menu actions, so each
-        # shortcut fires once. Choosing a new folder stays in the menu.
+        # then Show folder and About. Undo and Redo are the Edit-menu actions,
+        # so each shortcut fires once. About is the Help-menu action. Choosing
+        # a new folder stays in the menu.
         self.file_toolbar.clear()
         for action in (
             self._new_action,
@@ -493,6 +525,7 @@ class MainWindow(QMainWindow):
         self.file_toolbar.addAction(self.redo_action)
         self.file_toolbar.addSeparator()
         self.file_toolbar.addAction(self._show_folder_action)
+        self.file_toolbar.addAction(self._about_action)
 
     def _update_output_folder_tooltip(self) -> None:
         folder = output_folder()
@@ -545,8 +578,10 @@ class MainWindow(QMainWindow):
         self._owned_actions.append(action)
         return action
 
-    def _action(self, menu, label: str, slot, shortcut=None) -> QAction:
+    def _action(self, menu, label: str, slot, shortcut=None, icon: str | None = None) -> QAction:
         action = self._make_action(label, slot, shortcut)
+        if icon:
+            action.setIcon(icon_named(icon))
         menu.addAction(action)
         return action
 
@@ -577,17 +612,34 @@ class MainWindow(QMainWindow):
     def set_tool(self, tool: Tool) -> None:
         if self.current is not None and self.current is not tool:
             self.current.pointer_cancel(self.session)
+        # The options panel is rebuilt below. Remember the keyboard first.
+        # A focused slider or spin box is destroyed with the old panel, and
+        # Qt would move the keyboard onto the color code. The code box itself
+        # should also give way, so the next letter is a tool shortcut.
+        # The layer list sits outside that panel and keeps the keyboard.
+        focus = self.focusWidget()
+        return_to_canvas = focus is self.palette.hex_edit or (
+            focus is not None and self.options.isAncestorOf(focus)
+        )
         self.current = tool
         button = self._buttons.get(tool.id)
         if button is not None:
             button.setChecked(True)
         self.options.set_tool(tool)
-        self.canvas.set_tool_cursor(tool.cursor)
+        self.canvas.refresh_tool_cursor()
         self._toast(tool.hint or tool.label)
         self._sync_text_panel()
+        if return_to_canvas:
+            self.canvas.setFocus()
 
     def _on_session(self, kind: str) -> None:
-        self.canvas.invalidate()
+        if kind == "overlay":
+            # The rubber band moved and the photo did not. Rebuilding the
+            # composite here would stall the cursor poll that is collecting points.
+            self.canvas.update()
+            return
+        bounds = self.session.preview_bounds if kind == "preview" else None
+        self.canvas.invalidate(bounds)
         self._update_status()
         if kind == "preview":
             # Choosing a layer in the stack only previews. The text panel still
@@ -595,7 +647,7 @@ class MainWindow(QMainWindow):
             # text_edit_in_progress, and the sync below leaves it alone.
             self._sync_text_panel()
             return
-        # An eyedropper pick on the Color tool is a finished color, so it can
+        # An eyedropper pick on Image & Eyedrop is a finished color, so it can
         # recolor the active text layer. Every other change refreshes the palette
         # from the session, then loads the active text layer into the panel.
         if kind == "color":
@@ -638,12 +690,46 @@ class MainWindow(QMainWindow):
         action.setStatusTip(tip)
 
     def _update_title(self) -> None:
+        # A saved .pix project wins. Otherwise show the opened image or PDF
+        # name. A new canvas has neither and stays Untitled.
         if self.session.path:
             name = Path(self.session.path).name
+        elif self.session.source_name:
+            name = self.session.source_name
         else:
             name = "Untitled"
         mark = " •" if self.session.dirty else ""
         self.setWindowTitle(f"PixEdit — {name}{mark}")
+
+    def _suggested_project_name(self) -> str:
+        """Filename Save As should offer.
+
+        An existing project keeps its name. An opened image or PDF uses that
+        stem, so photo.png suggests photo.pix. A new canvas stays untitled.pix.
+        """
+        if self.session.path:
+            return Path(self.session.path).name
+        if self.session.source_name:
+            stem = Path(self.session.source_name).stem
+            if stem:
+                return f"{stem}.pix"
+        return "untitled.pix"
+
+    def _export_suggestion(self) -> tuple[str, str]:
+        """Filename and filter the Export dialog should open with.
+
+        photo.png stays PNG, scan.pdf stays PDF. A .pix project uses its stem
+        plus .png. A new canvas stays export.png.
+        """
+        source = self.session.path or self.session.source_name
+        if not source:
+            return "export.png", export_filter_for_suffix(".png")
+        path = Path(source)
+        suffix = path.suffix.lower()
+        if suffix in EXPORT_SUFFIXES and path.stem:
+            return f"{path.stem}{suffix}", export_filter_for_suffix(suffix)
+        stem = path.stem or "export"
+        return f"{stem}.png", export_filter_for_suffix(".png")
 
     def _on_palette_color(self, transient: bool) -> None:
         self.options.refresh_brush_preview()
@@ -685,6 +771,12 @@ class MainWindow(QMainWindow):
         if action_id == "scale_layer":
             self._scale_layer()
             return
+        if action_id == "canvas_size":
+            self._canvas_size()
+            return
+        if action_id == "image_size":
+            self._image_size()
+            return
         if action_id == "rotate_layer":
             self._rotate_layer()
             return
@@ -698,8 +790,8 @@ class MainWindow(QMainWindow):
         if method is not None:
             method()
 
-    def _on_tool_option(self, key: str, _value: int) -> None:
-        if key == "brush_size":
+    def _on_tool_option(self, key: str, _value) -> None:
+        if key in {"brush_size", "shape_kind", "select_mode", "mask_shape"}:
             self.canvas.refresh_tool_cursor()
 
     def _update_status(self) -> None:
@@ -707,8 +799,13 @@ class MainWindow(QMainWindow):
         x, y = self._cursor
         tool = self.current.label if self.current else ""
         zoom = int(round(self.canvas.zoom * 100))
+        index = doc.group_index(doc.active_group_id) + 1
+        if len(doc.groups) > 1:
+            page = f"{doc.group.name}  {index} of {len(doc.groups)} · "
+        else:
+            page = f"{doc.group.name} · "
         self._status_label.setText(
-            f"{doc.width} × {doc.height} px    {x:.0f}, {y:.0f}    {zoom}%    {tool}"
+            f"{page}{doc.width} × {doc.height} px · {_format_dpi(doc.dpi)} dpi    {x:.0f}, {y:.0f}    {zoom}%    {tool}"
         )
 
     def _on_cursor(self, x: float, y: float, zoom: float) -> None:
@@ -746,8 +843,8 @@ class MainWindow(QMainWindow):
         dialog = NewDocumentDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        width, height, background = dialog.values()
-        self.session.new_canvas(width, height, background)
+        width, height, background, dpi = dialog.values()
+        self.session.new_canvas(width, height, background, dpi)
         QTimer.singleShot(0, self.canvas.fit)
 
     def _open(self) -> None:
@@ -773,7 +870,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
-        self.session.place_layers(incoming.layers)
+        if Path(path).suffix.lower() == ".pdf":
+            self.session.place_groups(incoming.groups)
+        else:
+            self.session.place_layers(incoming.layers)
 
     def open_path(self, path: str) -> None:
         pdf_scale = 2.0
@@ -787,8 +887,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open failed", f"Could not open {path}\n\n{exc}")
             return
+        # A .pix file is the save path. An image or PDF only lends its filename,
+        # so Save still asks for a project and does not overwrite the source.
         project = Path(path).suffix.lower() == ".pix"
-        self.session.replace_document(document, path if project else None)
+        self.session.replace_document(
+            document,
+            path if project else None,
+            None if project else Path(path).name,
+        )
         QTimer.singleShot(0, self.canvas.fit)
         self._toast(f"Opened {Path(path).name}")
 
@@ -808,7 +914,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save project",
-            self._file_dialog_start("untitled.pix"),
+            self._file_dialog_start(self._suggested_project_name()),
             "PixEdit project (*.pix)",
         )
         if not path:
@@ -819,28 +925,33 @@ class MainWindow(QMainWindow):
         return self._save()
 
     def _export(self) -> None:
+        filename, selected_filter = self._export_suggestion()
         path, selected = QFileDialog.getSaveFileName(
             self,
             "Export flattened image",
-            self._file_dialog_start("export.png"),
-            "PNG (*.png);;JPEG (*.jpg *.jpeg);;WebP (*.webp)",
+            self._file_dialog_start(filename),
+            export_filter_string(),
+            selected_filter,
         )
         if not path:
             return
+        # The filename's extension wins. A name with no known extension takes
+        # the extension of the filter the user left selected.
         suffix = Path(path).suffix.lower()
-        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-            if "JPEG" in selected:
-                path += ".jpg"
-            elif "WebP" in selected:
-                path += ".webp"
-            else:
-                path += ".png"
+        if suffix not in EXPORT_SUFFIXES:
+            path += extension_for_export_filter(selected)
         try:
             export_image(self.session.document, path)
         except Exception as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        self._toast(f"Exported {path}")
+        note = f"Exported {path}"
+        if Path(path).suffix.lower() != ".pdf" and len(self.session.document.groups) > 1:
+            note = (
+                f"Exported {path}. This file is {self.session.document.group.name}, "
+                "the page you are viewing. Export PDF to write every page."
+            )
+        self._toast(note)
 
     def _rename_layer(self) -> None:
         layer = self.session.active_layer()
@@ -871,6 +982,22 @@ class MainWindow(QMainWindow):
 
     def _crop_selection(self) -> None:
         self.session.crop_to_selection()
+
+    def _canvas_size(self) -> None:
+        document = self.session.document
+        dialog = CanvasSizeDialog(document.width, document.height, tuple(self.session.foreground), self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        width, height, anchor, fill = dialog.values()
+        self.session.resize_canvas(width, height, anchor, fill)
+
+    def _image_size(self) -> None:
+        document = self.session.document
+        dialog = ImageSizeDialog(document.width, document.height, document.dpi, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        width, height, dpi, method, resample = dialog.values()
+        self.session.resize_image(width, height, dpi, resample, method)
 
     def _select_mode(self, mode: str) -> None:
         self.session.options["select_mode"] = mode
@@ -919,6 +1046,15 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event) -> None:
         # Reaches here when the focused child does not accept the key (the
         # canvas does accept it). Line edits consume Delete themselves.
+        if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
+            self.canvas.set_alt_held(True)
+        if event.key() == Qt.Key.Key_Space:
+            # The layer list ignores Space so a row checkbox does not flip.
+            # The canvas owns hold-Space as pan. A text field accepts the key
+            # before it gets here, so typing a space is unchanged.
+            self.canvas.keyPressEvent(event)
+            event.accept()
+            return
         if _is_clear_shortcut(event):
             self.session.clear_selection_contents()
             event.accept()
@@ -931,6 +1067,15 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
+            self.canvas.set_alt_held(False)
+        if event.key() == Qt.Key.Key_Space:
+            self.canvas.keyReleaseEvent(event)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def closeEvent(self, event) -> None:
         if self._confirm_discard():
@@ -963,6 +1108,13 @@ def _tool_separator() -> QFrame:
     line.setFixedHeight(1)
     line.setAccessibleName("Tool group separator")
     return line
+
+
+def _format_dpi(dpi: float) -> str:
+    value = float(dpi)
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}"
 
 
 def _app_icon() -> QIcon:

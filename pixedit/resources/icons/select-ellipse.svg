@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- A path, not an ellipse element: Qt drops the dash pattern on ellipse. -->
+  <path d="M19.4 12a7.4 5.6 0 1 1-14.8 0 7.4 5.6 0 1 1 14.8 0" stroke="#d5e4ee" stroke-width="1.7" stroke-dasharray="2.4 2.1" stroke-linecap="round"/>
+  <path d="M12 6.4a7.4 5.6 0 0 1 6.4 3.2" stroke="#3ec6ff" stroke-width="1.7" stroke-linecap="round"/>
+</svg>

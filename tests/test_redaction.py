@@ -91,6 +91,8 @@ def test_redact_tool_is_undoable_and_nondestructive():
     tool.pointer_move(session, PointerEvent(24, 20))
     tool.pointer_up(session, PointerEvent(24, 28))
     assert any(layer.kind == "redaction" for layer in session.document.layers)
+    mask_layer = next(layer for layer in session.document.layers if layer.kind == "redaction")
+    assert mask_layer.target_id == base.id
     assert np.array_equal(np.array(session.document.layers[0].image), before)
     mask = next(layer for layer in session.document.layers if layer.kind == "redaction").mask
     assert mask.size == (32, 32)
@@ -205,3 +207,223 @@ def test_switching_mask_effect_clamps_the_amount_and_keeps_the_seed():
     session.undo()
     assert session.active_layer().redaction.kind == "noise"
     assert session.active_layer().redaction.amount == 100
+
+
+def test_mask_filters_its_picture_and_leaves_the_layer_below():
+    bottom = _half_image(48)
+    top = Image.new("RGBA", (48, 48), (0, 0, 0, 0))
+    for y in range(20, 28):
+        for x in range(20, 28):
+            top.putpixel((x, y), (0, 180, 0, 255))
+    mask = Image.new("L", (48, 48), 0)
+    mask.paste(255, (16, 0, 32, 48))
+    photo = raster_layer("Photo", top)
+    band = redaction_layer("Privacy", mask, "blur", 6, target_id=photo.id)
+    doc = Document(48, 48, [raster_layer("Back", bottom), photo, band])
+    flat = np.array(composite(doc))
+    # Far from the green square the red/blue edge is the lower layer, unblurred.
+    assert flat[2, 18, 0] > 250 and flat[2, 18, 2] < 5
+    assert flat[2, 30, 2] > 250 and flat[2, 30, 0] < 5
+    assert np.array_equal(np.array(doc.layers[0].image), np.array(bottom))
+    assert np.array_equal(np.array(doc.layers[1].image), np.array(top))
+
+
+def test_hidden_picture_hides_its_mask_and_a_hidden_mask_is_skipped():
+    photo = raster_layer("Photo", _half_image(16))
+    mask = redaction_layer("Mask", Image.new("L", (16, 16), 255), "solid", 0, color=(0, 255, 0, 255), target_id=photo.id)
+    back = raster_layer("Back", Image.new("RGBA", (16, 16), (255, 0, 0, 255)))
+    doc = Document(16, 16, [back, photo, mask])
+    assert composite(doc).getpixel((14, 1)) == (0, 255, 0, 255)
+    photo.visible = False
+    assert composite(doc).getpixel((14, 1)) == (255, 0, 0, 255)
+    photo.visible = True
+    mask.visible = False
+    assert composite(doc).getpixel((14, 1))[:3] == (0, 0, 255)
+
+
+def test_apply_mask_bakes_only_the_covered_pixels_and_undoes():
+    session = Session()
+    session.new_canvas(8, 8, "white")
+    photo = raster_layer("Photo", _half_image(8))
+    session.add_layer(photo)
+    mask = Image.new("L", (8, 8), 0)
+    mask.paste(255, (4, 0, 8, 8))
+    band = redaction_layer("Mask", mask, "solid", 0, color=(0, 255, 0, 255), target_id=photo.id)
+    session.add_layer(band)
+    session.layer_index = session.document.index_of(band.id)
+    session.apply_active_mask()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo"]
+    baked = session.document.layers[1]
+    assert baked.id == photo.id
+    assert baked.image.size == (8, 8)
+    assert baked.image.getpixel((1, 1)) == (255, 0, 0, 255)
+    assert baked.image.getpixel((6, 1)) == (0, 255, 0, 255)
+    assert session.document.layers[0].image.getpixel((6, 1)) == (255, 255, 255, 255)
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Mask"]
+    assert session.document.layers[1].image.getpixel((6, 1)) == (0, 0, 255, 255)
+
+
+def test_apply_stops_at_the_selected_mask_and_leaves_later_masks():
+    photo = raster_layer("Photo", _half_image(8))
+    left = Image.new("L", (8, 8), 0)
+    left.paste(255, (0, 0, 4, 8))
+    right = Image.new("L", (8, 8), 0)
+    right.paste(255, (4, 0, 8, 8))
+    lower = redaction_layer("Lower", left, "solid", 0, color=(0, 255, 0, 255), target_id=photo.id)
+    upper = redaction_layer("Upper", right, "solid", 0, color=(255, 255, 255, 255), target_id=photo.id)
+    session = Session(Document(8, 8, [photo, lower, upper]))
+    session.layer_index = 1
+    session.apply_active_mask()
+    assert [layer.name for layer in session.document.layers] == ["Photo", "Upper"]
+    baked = session.document.layers[0]
+    assert baked.image.getpixel((1, 1)) == (0, 255, 0, 255)
+    assert baked.image.getpixel((6, 1)) == (0, 0, 255, 255)
+    assert composite(session.document).getpixel((6, 1)) == (255, 255, 255, 255)
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Photo", "Lower", "Upper"]
+    assert session.document.layers[0].image.getpixel((1, 1)) == (255, 0, 0, 255)
+
+
+def test_apply_on_text_becomes_a_raster_and_a_small_layer_grows_to_the_mask():
+    from pixedit.factory import text_layer
+    from pixedit.model import TextInfo
+
+    info = TextInfo("Hi", None, "Default", 18, (0, 0, 0, 255))
+    title = text_layer("Title", info, 2, 2)
+    mask = redaction_layer(
+        "Mask", Image.new("L", (32, 32), 255), "solid", 0, color=(9, 8, 7, 255), target_id=title.id
+    )
+    session = Session(Document(32, 32, [title, mask]))
+    session.layer_index = 1
+    session.apply_active_mask()
+    baked = session.document.layers[0]
+    assert baked.kind == "raster"
+    assert baked.text is None
+    assert baked.id == title.id
+    assert len(session.document.layers) == 1
+
+    session = Session()
+    session.new_canvas(16, 16, "white")
+    small = raster_layer("Dot", Image.new("RGBA", (2, 2), (255, 0, 0, 255)), 6, 6)
+    session.add_layer(small)
+    region = Image.new("L", (16, 16), 0)
+    region.paste(255, (4, 4, 10, 10))
+    band = redaction_layer("Mask", region, "solid", 0, color=(0, 0, 255, 255), target_id=small.id)
+    session.add_layer(band)
+    session.layer_index = session.document.index_of(band.id)
+    session.apply_active_mask()
+    grown = next(layer for layer in session.document.layers if layer.id == small.id)
+    assert grown.image.size == (6, 6)
+    assert (grown.x, grown.y) == (4, 4)
+    assert grown.image.getpixel((0, 0)) == (0, 0, 255, 255)
+    assert session.document.layers[0].image.getpixel((0, 0)) == (255, 255, 255, 255)
+
+
+def test_delete_mask_leaves_the_picture_and_delete_picture_removes_its_masks():
+    session = Session()
+    session.new_canvas(8, 8, "white")
+    photo = raster_layer("Photo", _half_image(8))
+    session.add_layer(photo)
+    before = np.array(photo.image)
+    band = redaction_layer("Mask", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
+    session.add_layer(band)
+    session.layer_index = session.document.index_of(band.id)
+    session.delete_active()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo"]
+    assert np.array_equal(np.array(session.document.layers[1].image), before)
+    session.undo()
+    session.layer_index = session.document.index_of(photo.id)
+    session.delete_active()
+    assert [layer.name for layer in session.document.layers] == ["Background"]
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Mask"]
+
+
+def test_mask_block_moves_together_and_duplicate_keeps_the_masks():
+    session = Session()
+    session.new_canvas(8, 8, "white")
+    session.document.layers[0].name = "Back"
+    photo = raster_layer("Photo", _half_image(8))
+    session.add_layer(photo)
+    lower = redaction_layer("A", Image.new("L", (8, 8), 255), "blur", 2, target_id=photo.id)
+    upper = redaction_layer("B", Image.new("L", (8, 8), 255), "dim", 10, target_id=photo.id)
+    session.add_layer(lower)
+    session.add_layer(upper)
+    label = raster_layer("Label", Image.new("RGBA", (8, 8), (0, 255, 0, 255)))
+    session.add_layer(label)
+    session.layer_index = session.document.index_of(lower.id)
+    session.move_active(1)
+    assert [layer.name for layer in session.document.layers] == ["Back", "Photo", "B", "A", "Label"]
+    # A is now the front mask. Moving it again slides the whole block past Label.
+    session.layer_index = session.document.index_of(lower.id)
+    session.move_active(1)
+    assert [layer.name for layer in session.document.layers] == ["Back", "Label", "Photo", "B", "A"]
+    session.undo()
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Back", "Photo", "A", "B", "Label"]
+
+    session.layer_index = session.document.index_of(photo.id)
+    session.duplicate_active()
+    assert [layer.name for layer in session.document.layers] == ["Back", "Photo", "A", "B", "Photo copy", "Label"]
+    assert session.document.layers[1].id == photo.id
+    assert session.document.layers[2].target_id == photo.id
+    session.undo()
+    session.layer_index = session.document.index_of(lower.id)
+    session.duplicate_active()
+    assert [layer.name for layer in session.document.layers] == ["Back", "Photo", "A", "A copy", "B", "Label"]
+    assert session.active_layer().target_id == photo.id
+
+
+def test_merge_down_on_a_mask_bakes_into_the_picture_only():
+    session = Session()
+    session.new_canvas(8, 8, "white")
+    photo = raster_layer("Photo", _half_image(8))
+    session.add_layer(photo)
+    band = redaction_layer("Mask", Image.new("L", (8, 8), 255), "solid", 0, color=(0, 255, 0, 255), target_id=photo.id)
+    session.add_layer(band)
+    session.layer_index = session.document.index_of(band.id)
+    session.merge_down_active()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo"]
+    assert session.document.layers[1].image.getpixel((1, 1)) == (0, 255, 0, 255)
+    assert session.document.layers[0].image.getpixel((1, 1)) == (255, 255, 255, 255)
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Mask"]
+    session.layer_index = session.document.index_of(photo.id)
+    session.merge_down_active()
+    assert len(session.document.layers) == 1
+    assert session.document.layers[0].image.getpixel((1, 1)) == (0, 255, 0, 255)
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Mask"]
+    assert session.document.layers[1].image.getpixel((6, 1)) == (0, 0, 255, 255)
+
+
+def test_new_mask_targets_the_active_layer_and_stacks_above_older_ones():
+    session = Session()
+    session.new_canvas(32, 32, "white")
+    base = session.document.layers[0]
+    older = redaction_layer("Old", Image.new("L", (32, 32), 0), "blur", 4, target_id=base.id)
+    session.add_layer(older)
+    session.layer_index = 0
+    session.options["mask_shape"] = "rect"
+    session.options["mask_kind"] = "pixelate"
+    tool = MaskTool()
+    tool.pointer_down(session, PointerEvent(4, 4))
+    tool.pointer_up(session, PointerEvent(12, 12))
+    assert [layer.name for layer in session.document.layers] == ["Background", "Old", "Mask"]
+    assert session.document.layers[2].target_id == base.id
+    assert session.document.layers[1].target_id == base.id
+
+
+def test_project_roundtrip_keeps_an_explicit_mask_target(tmp_path):
+    from pixedit.io import load_project, save_project
+
+    photo = raster_layer("Photo", Image.new("RGBA", (8, 8), (255, 0, 0, 255)))
+    other = raster_layer("Other", Image.new("RGBA", (8, 8), (0, 0, 255, 255)))
+    band = redaction_layer("Mask", Image.new("L", (8, 8), 255), "pixelate", 8, target_id=photo.id)
+    doc = Document(8, 8, [photo, other, band])
+    path = tmp_path / "masks.pix"
+    save_project(doc, str(path))
+    loaded = load_project(str(path))
+    assert loaded.layers[2].target_id == loaded.layers[0].id
+    assert loaded.layers[2].target_id != loaded.layers[1].id

@@ -7,6 +7,7 @@ from PIL import Image
 
 from pixedit.adjust import brightness_contrast, desaturate, hue_saturation, invert, levels
 from pixedit.factory import raster_layer, redaction_layer, text_layer
+from pixedit.geom import hit_layer
 from pixedit.model import Layer, TextInfo, new_document
 from pixedit.plugins.examples.basic import MarkerTool, apply_vignette, vignette_image
 from pixedit.plugins.loader import load_plugins, reset_plugins
@@ -135,43 +136,68 @@ def test_text_tool_overlapping_boxes_pick_the_upper_layer():
 
 def test_move_selects_text_box_and_background():
     session = Session(new_document(200, 200, "white"))
+    background = session.document.layers[0]
     layer = text_layer("Greeting", TextInfo("Hello", None, "Default", 20, (0, 0, 0, 255)), 30, 30)
     session.add_layer(layer)
-    session.layer_index = 0
     px, py = _empty_pixel(layer)
-    tool = TransformTool()
-    tool.pointer_down(session, PointerEvent(px, py))
-    assert session.layer_index == session.document.index_of(layer.id)
+    text_index = session.document.index_of(layer.id)
+    assert hit_layer(session.document, px, py) == text_index
     x, y, width, height = layer.bounds()
     outside = (x + width + 30, y + height + 30)
+    assert hit_layer(session.document, *outside) == 0
+
+    # A drag that starts on the text, or outside it, keeps the background
+    # selected and leaves the text where it is.
+    session.layer_index = 0
+    tool = TransformTool()
+    tool.pointer_down(session, PointerEvent(px, py))
+    tool.pointer_up(session, PointerEvent(px + 8, py + 6))
+    assert session.active_layer() is background
+    assert (layer.x, layer.y) == (x, y)
+    assert (background.x, background.y) == (8, 6)
+    session.undo()
     tool.pointer_down(session, PointerEvent(*outside))
-    active = session.active_layer()
-    assert active is not None
-    assert active.kind == "raster"
-    assert active.name == "Background"
+    tool.pointer_up(session, PointerEvent(outside[0] + 4, outside[1] + 3))
+    assert session.active_layer() is background
+    assert (layer.x, layer.y) == (x, y)
+    assert (background.x, background.y) == (4, 3)
 
 
 def test_move_selects_a_raster_hole_and_ignores_redaction_margins():
     session = Session(new_document(200, 200, "white"))
+    background = session.document.layers[0]
     image = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
     image.putpixel((0, 0), (255, 0, 0, 255))
     image.putpixel((9, 9), (255, 0, 0, 255))
     sprite = raster_layer("Hole", image, 40, 40)
     session.add_layer(sprite)
-    session.layer_index = 0
-    TransformTool().pointer_down(session, PointerEvent(45, 45))
-    assert session.active_layer().id == sprite.id
+    assert hit_layer(session.document, 45, 45) == session.document.index_of(sprite.id)
 
     mask = Image.new("L", (200, 200), 0)
     mask.putpixel((10, 10), 255)
     mask.putpixel((14, 12), 255)
     redaction = redaction_layer("Hide", mask, "pixelate", 8)
     session.add_layer(redaction)
+    assert hit_layer(session.document, 80, 80) == 0
+    assert hit_layer(session.document, 12, 11) == session.document.index_of(redaction.id)
+
+    # Those hits do not retarget Transform. The background stays selected
+    # and is the only layer that moves.
     session.layer_index = 0
-    TransformTool().pointer_down(session, PointerEvent(80, 80))
-    assert session.active_layer().kind == "raster"
-    TransformTool().pointer_down(session, PointerEvent(12, 11))
-    assert session.active_layer().id == redaction.id
+    tool = TransformTool()
+    tool.pointer_down(session, PointerEvent(45, 45))
+    tool.pointer_up(session, PointerEvent(53, 49))
+    assert session.active_layer() is background
+    assert (sprite.x, sprite.y) == (40, 40)
+    assert (redaction.x, redaction.y) == (0, 0)
+    assert (background.x, background.y) == (8, 4)
+    session.undo()
+    tool.pointer_down(session, PointerEvent(12, 11))
+    tool.pointer_up(session, PointerEvent(16, 15))
+    assert session.active_layer() is background
+    assert (sprite.x, sprite.y) == (40, 40)
+    assert (redaction.x, redaction.y) == (0, 0)
+    assert (background.x, background.y) == (4, 4)
 
 
 def test_example_plugin_registers_and_darkens_corners():

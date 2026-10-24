@@ -2,13 +2,15 @@
 
 Pipeline for each visible layer, bottom to top:
 
-1. Redaction layers do not draw their own pixels. They take the canvas so
-   far, run the mask effect (pixelate, blur, solid, noise, and the rest),
-   and mix that back through the mask. Source layers underneath stay untouched.
-2. Raster and text layers are blended with a CSS-style "simple alpha
-   compositing" formula (source-over, with the blend mode applied only where
-   both coverages overlap). That keeps Multiply/Screen/Overlay from turning
-   into black when the backdrop is transparent.
+1. A mask layer does not draw on its own turn. It belongs to one picture or
+   text layer. When that layer is drawn, the effect (pixelate, blur, solid,
+   noise, and the rest) runs on a buffer that contains only that layer, then
+   the buffer is blended with the layer's opacity and blend mode. Layers
+   below are not sampled, and layers above the group paint on top.
+2. Raster and text layers without a mask are blended with a CSS-style
+   "simple alpha compositing" formula (source-over, with the blend mode
+   applied only where both coverages overlap). That keeps Multiply, Screen,
+   and Overlay from turning into black when the backdrop is transparent.
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from pixedit.model import BLEND_MODES, Document, Layer
+from pixedit.geom import alpha_bbox, covers_document
+from pixedit.model import BLEND_MODES, Document, Layer, LayerGroup, masks_for
 from pixedit.pixels import mask_effect
 
 # geom.place_image is imported lazily inside mask placement to keep import
@@ -90,9 +93,16 @@ def _intersection(
     return x0, y0, x1 - x0, y1 - y0, x0 - ax, y0 - ay
 
 
-def blit_layer(canvas: np.ndarray, layer: Layer) -> np.ndarray:
+def blit_layer(canvas: np.ndarray, layer: Layer, origin_x: int = 0, origin_y: int = 0) -> np.ndarray:
     image = layer.image
-    overlap = _intersection(layer.x, layer.y, image.width, image.height, canvas.shape[1], canvas.shape[0])
+    overlap = _intersection(
+        layer.x - origin_x,
+        layer.y - origin_y,
+        image.width,
+        image.height,
+        canvas.shape[1],
+        canvas.shape[0],
+    )
     if overlap is None or layer.opacity <= 0:
         return canvas
     x0, y0, width, height, sx, sy = overlap
@@ -120,9 +130,9 @@ def mask_to_canvas(layer: Layer, width: int, height: int) -> np.ndarray:
 def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
     """Mix the mask effect through ``layer``'s mask.
 
-    The effect is computed from the stack *below* this layer, so pixels in
-    earlier layers are not rewritten. Later layers still composite normally
-    and can sit above the mask (annotations, for example).
+    ``canvas`` is the picture the mask belongs to, not the stack underneath.
+    Pixels outside the mask stay as they were passed in. The mask's opacity
+    fades the effect.
     """
     height, width = canvas.shape[:2]
     mask = mask_to_canvas(layer, width, height) * float(layer.opacity)
@@ -138,22 +148,134 @@ def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
     return (effect * mix + canvas * (1.0 - mix)).astype(np.float32)
 
 
-def composite(document: Document) -> Image.Image:
-    """Flatten ``document`` to one RGBA image the size of the canvas."""
-    canvas = np.zeros((document.height, document.width, 4), dtype=np.float32)
+def shows_redaction(document: Document) -> bool:
+    """A visible mask layer. Blur and noise read outside a partial repaint."""
+    return any(layer.visible and layer.opacity > 0 and layer.kind == "redaction" for layer in document.layers)
+
+
+def _plain_target(layer: Layer) -> Layer:
+    """A stand-in that blits ``layer`` at full opacity and Normal blend.
+
+    The real opacity and blend are applied after the mask, so Multiply is
+    not mixed against an empty buffer and a later fade covers the effect
+    and the untouched pixels together.
+    """
+    return Layer(
+        id=layer.id,
+        name=layer.name,
+        kind="raster",
+        visible=True,
+        opacity=1.0,
+        blend_mode="normal",
+        image=layer.image,
+        x=layer.x,
+        y=layer.y,
+    )
+
+
+def target_with_masks(document: Document, target: Layer, masks: list[Layer]) -> np.ndarray:
+    """Document-sized float RGBA of ``target`` with ``masks`` applied in order.
+
+    Hidden masks and masks at zero opacity are skipped. The buffer starts
+    empty, so a blur samples this layer's pixels and transparency, not the
+    pictures underneath.
+    """
+    solo = np.zeros((document.height, document.width, 4), dtype=np.float32)
+    blit_layer(solo, _plain_target(target))
+    for mask in masks:
+        if not mask.visible or mask.opacity <= 0:
+            continue
+        solo = apply_redaction(solo, mask)
+    return solo
+
+
+def baked_placement(
+    document: Document, target: Layer, masks: list[Layer]
+) -> tuple[Image.Image, int, int]:
+    """Pixels, x, and y after baking ``masks`` into ``target``.
+
+    A layer that already covers the document keeps that full plate, so a
+    background does not shrink to the painted region. Any smaller layer is
+    cropped to the opaque result, which includes blur or a solid fill that
+    spreads past the old bitmap.
+    """
+    flat = float_to_pil(target_with_masks(document, target, masks))
+    if covers_document(
+        target.x,
+        target.y,
+        target.image.width,
+        target.image.height,
+        document.width,
+        document.height,
+    ):
+        return flat, 0, 0
+    box = alpha_bbox(flat)
+    if box is None:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0)), int(target.x), int(target.y)
+    x0, y0, x1, y1 = box
+    return flat.crop((x0, y0, x1, y1)), x0, y0
+
+
+def composite_region(document: Document, box: tuple[int, int, int, int]) -> Image.Image:
+    """Flatten ``box`` so it matches ``composite`` cropped to the same pixels.
+
+    ``box`` is ``(x0, y0, x1, y1)`` already clipped to the document. Redaction
+    layers are skipped: blur and noise read pixels outside the box, so the
+    caller flattens the whole document when a mask is visible.
+    """
+    x0, y0, x1, y1 = box
+    canvas = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.float32)
     for layer in document.layers:
+        if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
+            continue
+        blit_layer(canvas, layer, x0, y0)
+    return float_to_pil(canvas)
+
+
+def composite(document: Document) -> Image.Image:
+    """Flatten ``document`` to one RGBA image the size of the canvas.
+
+    Masks are skipped on their own turn and applied when their picture is
+    drawn. A hidden picture hides its masks. A hidden mask is left out of
+    that picture's buffer, and the other masks of the same picture still run.
+    """
+    canvas = np.zeros((document.height, document.width, 4), dtype=np.float32)
+    layers = document.layers
+    for layer in layers:
+        if layer.kind == "redaction":
+            continue
         if not layer.visible or layer.opacity <= 0:
             continue
-        if layer.kind == "redaction":
-            canvas = apply_redaction(canvas, layer)
-        else:
+        owned = [mask for mask in masks_for(layers, layer) if mask.visible and mask.opacity > 0]
+        if not owned:
             canvas = blit_layer(canvas, layer)
+            continue
+        solo = target_with_masks(document, layer, owned)
+        canvas = blend_arrays(canvas, solo, layer.opacity, layer.blend_mode)
     return float_to_pil(canvas)
 
 
 def composite_over(document: Document, background: tuple[int, int, int, int]) -> Image.Image:
     """Flatten onto a solid background. Used by JPEG export."""
     flat = composite(document)
+    base = Image.new("RGBA", flat.size, background)
+    return Image.alpha_composite(base, flat)
+
+
+def composite_group(group: LayerGroup) -> Image.Image:
+    """Flatten one page without changing which page the document is showing."""
+    document = Document(
+        width=group.width,
+        height=group.height,
+        groups=[group],
+        active_group_id=group.id,
+    )
+    return composite(document)
+
+
+def composite_group_over(group: LayerGroup, background: tuple[int, int, int, int]) -> Image.Image:
+    """Flatten one page onto a solid background."""
+    flat = composite_group(group)
     base = Image.new("RGBA", flat.size, background)
     return Image.alpha_composite(base, flat)
 

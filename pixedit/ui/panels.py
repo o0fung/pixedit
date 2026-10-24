@@ -2,29 +2,37 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLayout,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStyledItemDelegate,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from pixedit.model import BLEND_MODES
+from pixedit.model import BLEND_MODES, layers_leaving, mask_target
 from pixedit.paint import brush_preview_image
 from pixedit.textutil import group_fonts
 from pixedit.ui.canvas import pil_to_pixmap
+from pixedit.ui.icons import icon_named
+from pixedit.ui.thumbs import THUMB_SIZE, checker_image, layer_thumb, text_head
 
 
 def wrap_degrees(degrees: float) -> int:
@@ -36,6 +44,274 @@ def wrap_degrees(degrees: float) -> int:
     elif rounded < -180:
         rounded += 360
     return rounded
+
+
+def _track_column(widget: QWidget) -> QWidget:
+    """Let the form assign the field width, instead of the control's contents.
+
+    A Preferred or Minimum policy keeps the widget at its own hint. The
+    longest font name, or a spin box wide enough for three digits, then
+    becomes the options panel's minimum and sticks out of the tool column.
+    Ignored drops that hint so the field column can shrink and grow with
+    the splitter. The vertical policy stays, so a slider does not grow tall.
+    """
+    widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
+    widget.setMinimumWidth(0)
+    return widget
+
+
+class ColumnComboBox(QComboBox):
+    """Closed box follows the tool column. The open list stays readable.
+
+    The default combo sizes itself to its longest entry. A font family is
+    wider than the tool column, and that hint was locking the options panel.
+    The closed box uses a short minimum instead. Opening the list widens it
+    to the longest entry so the name can still be read.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(0)
+        _track_column(self)
+        self.currentTextChanged.connect(self._sync_tooltip)
+
+    def setCurrentIndex(self, index: int) -> None:
+        super().setCurrentIndex(index)
+        # A stored font is applied with signals blocked, so the text signal
+        # does not run. The tip still has to name what the closed box shows.
+        self._sync_tooltip(self.currentText())
+
+    def _sync_tooltip(self, text: str) -> None:
+        self.setToolTip(text)
+
+    def showPopup(self) -> None:
+        view = self.view()
+        text_width = view.sizeHintForColumn(0)
+        # The list scrolls, so the longest name needs the bar's width too.
+        # Without it the last characters sit under the scrollbar.
+        needed = text_width + view.verticalScrollBar().sizeHint().width()
+        if text_width > 0:
+            view.setMinimumWidth(needed)
+        super().showPopup()
+        popup = view.window()
+        # An empty menu never opens. The view's window is then this window,
+        # and resizing it would change the tool column.
+        if popup is None or popup is self.window() or needed <= self.width():
+            return
+        frame = popup.frameWidth() * 2
+        popup.resize(max(popup.width(), needed + frame), popup.height())
+
+
+# Command icons use the full width of the tool column. Choice icons share
+# that row with their own caption, and grow up to the same 44px square.
+# 32px is the old field size. 28px is the smallest square that still keeps
+# four pictures beside "Mode" on one row when the tool column is at its
+# 228px minimum and the options scrollbar is showing.
+_ACTION_SIDE = 44
+_ACTION_ICON = 26
+_CHOICE_MIN = 32
+_CHOICE_MAX = 44
+_CHOICE_WRAP = 28
+_CHOICE_ICON_MIN = 20
+_CHOICE_ICON_MAX = 26
+_CHOICE_GAP = 4
+_LABEL_GAP = 6
+
+
+def _choice_span(count: int, side: int) -> int:
+    """Pixels covered by ``count`` squares of ``side``, including the gaps."""
+    if count <= 0:
+        return 0
+    return count * side + (count - 1) * _CHOICE_GAP
+
+
+def _choice_icon_px(side: int) -> int:
+    """Glyph grows with the square, from 20px at 32px up to 26px at 44px."""
+    if side <= _CHOICE_MIN:
+        return _CHOICE_ICON_MIN
+    if side >= _CHOICE_MAX:
+        return _CHOICE_ICON_MAX
+    span = _CHOICE_MAX - _CHOICE_MIN
+    grown = (side - _CHOICE_MIN) / span
+    return int(round(_CHOICE_ICON_MIN + grown * (_CHOICE_ICON_MAX - _CHOICE_ICON_MIN)))
+
+
+def _icon_button(label: str, icon_name: str, tip: str = "", *, side: int, icon_px: int) -> QToolButton:
+    """Square picture button. The words stay in the tooltip and the accessible name."""
+    button = QToolButton()
+    button.setObjectName("iconButton")
+    button.setIcon(icon_named(icon_name))
+    button.setIconSize(QSize(icon_px, icon_px))
+    button.setFixedSize(side, side)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+    button.setAutoRaise(False)
+    button.setAccessibleName(label)
+    button.setToolTip(tip or label)
+    button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return button
+
+
+class IconChoice(QWidget):
+    """Exclusive picture buttons. The stored value is the choice id.
+
+    The row spans the options panel. The caption is only as wide as its own
+    text, and the squares sit in the space immediately to its right. They
+    grow together up to the command-button size while they still share one
+    row. A long slider label elsewhere in the form cannot push them apart.
+    """
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, caption: str, choices: list[tuple[str, str, str]]) -> None:
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.label = QLabel(caption, self)
+        self._buttons: list[QToolButton] = []
+        self._by_value: dict[str, QToolButton] = {}
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        for value, label, icon_name in choices:
+            button = _icon_button(label, icon_name, side=_CHOICE_MIN, icon_px=_CHOICE_ICON_MIN)
+            button.setParent(self)
+            button.setCheckable(True)
+            button.setProperty("choice", value)
+            self._buttons.append(button)
+            self._by_value[value] = button
+            self._group.addButton(button)
+        self._group.buttonClicked.connect(self._emit)
+        _track_column(self)
+        self.setMinimumHeight(_CHOICE_MIN)
+
+    def _emit(self, button: QAbstractButton) -> None:
+        # A second click on the current picture must not clear the choice.
+        if not button.isChecked():
+            self._group.blockSignals(True)
+            button.setChecked(True)
+            self._group.blockSignals(False)
+        self.changed.emit(str(button.property("choice")))
+
+    def labels(self) -> list[str]:
+        return [button.accessibleName() for button in self._buttons]
+
+    def value(self) -> str:
+        button = self._group.checkedButton()
+        if button is None:
+            return ""
+        return str(button.property("choice"))
+
+    def set_value(self, value: str) -> None:
+        button = self._by_value.get(str(value))
+        if button is None:
+            return
+        self._group.blockSignals(True)
+        button.setChecked(True)
+        self._group.blockSignals(False)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._height_for(width)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self._height_for(self.width()))
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self._height_for(self.width()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place()
+
+    def _caption_width(self) -> int:
+        self.label.ensurePolished()
+        return max(0, self.label.sizeHint().width())
+
+    def _metrics(self, width: int) -> tuple[int, int, int, int]:
+        """Return ``(side, columns, button_x, label_y_beside)``.
+
+        Purpose: keep the caption next to the pictures, on one row when the
+        column allows.
+
+        1. The caption takes only its own text width. Squares use what remains.
+        2. Grow every square up to 44px while they still share one row.
+        3. Stay on that one row down to 28px. The minimum tool column, once
+           the scrollbar is taken out, is about that wide for four pictures.
+        4. Below 28px, wrap 32px squares in the remaining width.
+        5. If one 32px square does not fit beside the caption, the caption
+           moves above and the squares use the full row.
+
+        ``label_y_beside`` is 0 when the caption sits on the first button row,
+        and -1 when the caption is on its own line above the squares.
+        """
+        count = len(self._buttons)
+        # No width yet: report one row, so the size hint does not stack the squares.
+        if count == 0 or width <= 0:
+            return _CHOICE_MIN, max(count, 1), 0, 0
+        caption = self._caption_width()
+        gap = _LABEL_GAP if caption else 0
+        room = width - caption - gap
+        if room >= _CHOICE_MIN:
+            gaps = (count - 1) * _CHOICE_GAP
+            side = (room - gaps) // count
+            if side >= _CHOICE_WRAP:
+                return min(side, _CHOICE_MAX), count, caption + gap, 0
+            columns = 1
+            while columns < count and _choice_span(columns + 1, _CHOICE_MIN) <= room:
+                columns += 1
+            return _CHOICE_MIN, columns, caption + gap, 0
+        columns = 1
+        while columns < count and _choice_span(columns + 1, _CHOICE_MIN) <= width:
+            columns += 1
+        return _CHOICE_MIN, max(1, columns), 0, -1
+
+    def _height_for(self, width: int) -> int:
+        count = len(self._buttons)
+        if count == 0:
+            return _CHOICE_MIN
+        # The first hint arrives before the form assigns a width. 44px is the
+        # tallest square, so that pass cannot clip a button that later grows.
+        if width <= 0:
+            return _CHOICE_MAX
+        side, columns, _button_x, label_above = self._metrics(width)
+        rows = (count + columns - 1) // columns
+        buttons = _choice_span(rows, side)
+        if label_above:
+            caption_h = max(self.label.sizeHint().height(), 0)
+            return caption_h + _CHOICE_GAP + buttons
+        return max(buttons, self.label.sizeHint().height(), _CHOICE_MIN)
+
+    def _place(self) -> None:
+        count = len(self._buttons)
+        width = self.width()
+        # Before the form assigns a row width there is nothing to measure against.
+        if count == 0 or width <= 0:
+            return
+        side, columns, button_x, label_above = self._metrics(width)
+        icon_px = _choice_icon_px(side)
+        caption_w = self._caption_width()
+        caption_h = self.label.sizeHint().height()
+        if label_above:
+            self.label.setGeometry(0, 0, caption_w, caption_h)
+            button_y = caption_h + _CHOICE_GAP
+        else:
+            button_y = 0
+            self.label.setGeometry(0, max(0, (side - caption_h) // 2), caption_w, caption_h)
+        self.label.show()
+        rows = (count + columns - 1) // columns
+        needed = button_y + _choice_span(rows, side)
+        if not label_above:
+            needed = max(needed, caption_h, _CHOICE_MIN)
+        step = side + _CHOICE_GAP
+        for index, button in enumerate(self._buttons):
+            button.setIconSize(QSize(icon_px, icon_px))
+            button.setFixedSize(side, side)
+            button.setGeometry(button_x + (index % columns) * step, button_y + (index // columns) * step, side, side)
+            button.show()
+        if self.minimumHeight() != needed:
+            self.setMinimumHeight(needed)
+            self.updateGeometry()
 
 
 class ToolOptions(QWidget):
@@ -52,7 +328,7 @@ class ToolOptions(QWidget):
         self._font_catalog: dict[str, list[tuple[str, str]]] = {}
         self._font_by_path: dict[str, tuple[str, str]] = {}
         self._loading = False
-        self.action_buttons: list[QPushButton] = []
+        self.action_buttons: list[QAbstractButton] = []
         self._action_specs: list[dict] = []
         # Width the command rows were packed for. A later resize reflows only
         # when the visible column width changes, so a rebuild cannot loop.
@@ -65,19 +341,21 @@ class ToolOptions(QWidget):
         self._brush_erase = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
-        # The scroll area must not squash the font menu or the command buttons.
-        # A shorter viewport scrolls instead of overlapping the rows.
+        # Vertical minimum stays so a short viewport scrolls instead of
+        # squashing the rows. The font menu may be narrower than its longest
+        # name; that name is readable in the open list.
         outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.heading = QLabel("Tool")
         self.heading.setObjectName("section")
         self.hint = QLabel("")
         self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
+        self.hint.hide()
         outer.addWidget(self.heading)
-        outer.addWidget(self.hint)
         self.form_host = QWidget()
         self.form = QFormLayout(self.form_host)
         self.form.setContentsMargins(0, 4, 0, 0)
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(self.form_host)
         self.actions_host = QWidget()
@@ -86,7 +364,11 @@ class ToolOptions(QWidget):
         self.actions_layout.setSpacing(6)
         self.actions_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.addWidget(self.actions_host)
+        # Spare height stays between the controls and the description, so
+        # sliders and buttons stay at the top. A short viewport collapses
+        # this gap and the description is the last thing you scroll to.
         outer.addStretch(1)
+        outer.addWidget(self.hint)
 
     def set_tool(self, tool) -> None:
         self.brush_preview = None
@@ -95,6 +377,7 @@ class ToolOptions(QWidget):
         try:
             self.heading.setText(tool.label)
             self.hint.setText(tool.hint or "")
+            self.hint.setVisible(bool(tool.hint))
             while self.form.rowCount():
                 self.form.removeRow(0)
             self._widgets.clear()
@@ -105,8 +388,14 @@ class ToolOptions(QWidget):
                 self._specs[key] = spec
                 self.session.options.setdefault(key, spec.get("default"))
                 widget = self._make(spec)
-                label = QLabel(spec["label"])
-                self.form.addRow(label, widget)
+                if isinstance(widget, IconChoice):
+                    # The caption is inside the row. A spanning row keeps a long
+                    # slider label from widening the gap in front of the pictures.
+                    self.form.addRow(widget)
+                    label = widget.label
+                else:
+                    label = QLabel(spec["label"])
+                    self.form.addRow(label, widget)
                 self._widgets[key] = widget
                 self._labels[key] = label
                 if isinstance(widget, QSlider):
@@ -115,6 +404,7 @@ class ToolOptions(QWidget):
                 self._install_brush_preview(bool(getattr(tool, "erase", False)))
             self._rebuild_actions(getattr(tool, "panel_actions", lambda: [])())
             self._sync_mask_amount()
+            self._sync_crop_ratio()
         finally:
             self._loading = False
         self.refresh_brush_preview()
@@ -153,6 +443,8 @@ class ToolOptions(QWidget):
                     widget.blockSignals(True)
                     widget.setValue(int(value))
                     widget.blockSignals(False)
+                elif isinstance(widget, IconChoice):
+                    widget.set_value("" if value is None else str(value))
                 elif isinstance(widget, QComboBox) and spec.get("type") == "font":
                     self._select_font(widget, value)
                 elif isinstance(widget, QComboBox) and spec.get("type") == "font_style":
@@ -172,6 +464,7 @@ class ToolOptions(QWidget):
                     widget.blockSignals(False)
         finally:
             self._loading = False
+        self._sync_crop_ratio()
 
     def update_actions(self) -> None:
         has_selection = self.session.document.selection is not None
@@ -228,14 +521,24 @@ class ToolOptions(QWidget):
             width = 232
         return max(1, width - margins.left() - margins.right())
 
-    def _make_action_button(self, spec: dict) -> QPushButton:
-        button = QPushButton(str(spec["label"]))
-        # Ignored horizontally so a pair does not force the panel to the sum
-        # of the two labels. The row still gives each button its text width
-        # through the stretch factor below.
-        button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    def _make_action_button(self, spec: dict) -> QAbstractButton:
+        label = str(spec["label"])
         shortcut = spec.get("shortcut")
-        button.setToolTip(f"{spec['label']} ({shortcut})" if shortcut else str(spec["label"]))
+        tip = f"{label} ({shortcut})" if shortcut else label
+        icon_name = spec.get("icon")
+        if icon_name:
+            button: QAbstractButton = _icon_button(label, str(icon_name), tip, side=_ACTION_SIDE, icon_px=_ACTION_ICON)
+            button.icon_only = True
+        else:
+            # Ignored horizontally so a pair does not force the panel to the sum
+            # of the two labels. The row still gives each button its text width
+            # through the stretch factor below.
+            text_button = QPushButton(label)
+            text_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            text_button.setToolTip(tip)
+            text_button.setAccessibleName(label)
+            text_button.icon_only = False
+            button = text_button
         button.needs_selection = bool(spec.get("needs_selection", False))
         button.needs_color_preview = bool(spec.get("needs_color_preview", False))
         action_id = str(spec["id"])
@@ -253,26 +556,33 @@ class ToolOptions(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
         self.action_buttons = []
-        # Pair two commands only when both full labels fit in the visible
-        # column. A label that does not fit beside the one already on the
-        # row starts a new row. One label wider than the column still gets
-        # its own row; the row's minimum is that label, so the splitter
-        # cannot clip it.
+        # Text commands stop at two per row, and only when both full labels
+        # fit. A third label would be crushed, and one label wider than the
+        # column still gets its own row so the splitter cannot clip it.
+        # Icon buttons have no label width, so they keep packing until the
+        # next square would pass the visible column. new_row starts a row
+        # anyway, which keeps Scale and Rotate under the quarter-turns.
         gap = 6
-        pending: list[tuple[QPushButton, int]] = []
+        pending: list[tuple[QAbstractButton, int, bool]] = []
         for spec in actions:
             button = self._make_action_button(spec)
             button.setParent(self)
             button.ensurePolished()
-            pending.append((button, button.sizeHint().width()))
-        rows: list[list[tuple[QPushButton, int]]] = []
-        current: list[tuple[QPushButton, int]] = []
+            if getattr(button, "icon_only", False):
+                width = _ACTION_SIDE
+            else:
+                width = button.sizeHint().width()
+            pending.append((button, width, bool(spec.get("new_row"))))
+        rows: list[list[tuple[QAbstractButton, int]]] = []
+        current: list[tuple[QAbstractButton, int]] = []
         used = 0
-        for button, width in pending:
+        for button, width, new_row in pending:
             extra = gap if current else 0
-            # Two labels on a row, and only when both full widths fit.
-            # A third label always starts the next row.
-            if current and (len(current) >= 2 or used + extra + width > budget):
+            row_has_text = any(not getattr(placed, "icon_only", False) for placed, _width in current)
+            this_is_text = not getattr(button, "icon_only", False)
+            text_capped = bool(current) and len(current) >= 2 and (this_is_text or row_has_text)
+            overflow = bool(current) and used + extra + width > budget
+            if current and (new_row or text_capped or overflow):
                 rows.append(current)
                 current = []
                 used = 0
@@ -289,16 +599,27 @@ class ToolOptions(QWidget):
             row.setSpacing(gap)
             widest = 0
             tallest = 0
+            icons = all(getattr(button, "icon_only", False) for button, _width in row_buttons)
             for button, width in row_buttons:
                 widest = max(widest, width)
                 tallest = max(tallest, button.sizeHint().height())
-                row.addWidget(button, max(1, width))
+                # Squares stay at _ACTION_SIDE. Text buttons share the row by label width.
+                row.addWidget(button, 0 if icons else max(1, width))
                 self.action_buttons.append(button)
-            # Floor is the wider label, not the sum. The sum would lock the
-            # options widget at the two-column width and keep the right button
-            # under the splitter. The height floor keeps an Ignored button
+            # A trailing stretch keeps the squares together. Without it, Qt
+            # pours the spare column width into the gaps and the icons drift apart.
+            if icons:
+                row.addStretch(1)
+            # Text floor is the wider label, not the sum. The sum would lock
+            # the options widget at the two-column width and keep the right
+            # button under the splitter. Icon squares cannot shrink, so their
+            # floor is the whole row; four of them are still narrower than
+            # the tool column. The height floor keeps an Ignored button
             # from collapsing the row.
-            row_host.setMinimumWidth(widest)
+            if icons:
+                row_host.setMinimumWidth(sum(width for _button, width in row_buttons) + gap * (len(row_buttons) - 1))
+            else:
+                row_host.setMinimumWidth(widest)
             row_host.setMinimumHeight(tallest)
             self.actions_layout.addWidget(row_host)
             # Rows created after the panel is already on screen stay hidden,
@@ -349,6 +670,16 @@ class ToolOptions(QWidget):
             widget.setValue(clamped)
             widget.blockSignals(False)
         self._set_slider_label(amount_key, clamped)
+
+    def _sync_crop_ratio(self) -> None:
+        """Custom is the only proportion that needs its own width and height."""
+        if "crop_ratio" not in self._specs:
+            return
+        custom = str(self.session.option("crop_ratio", "free")) == "custom"
+        for key in ("crop_ratio_w", "crop_ratio_h"):
+            widget = self._widgets.get(key)
+            if widget is not None:
+                self.form.setRowVisible(widget, custom)
 
     def _set_slider_label(self, key: str, value: int) -> None:
         label = self._labels.get(key)
@@ -427,9 +758,11 @@ class ToolOptions(QWidget):
                 self._set_slider_label(key, slider.value())
             else:
                 on_change(slider.value())
-            return slider
+            return _track_column(slider)
+        if kind == "choice" and spec.get("icons"):
+            return self._make_icon_choice(spec)
         if kind == "choice":
-            combo = QComboBox()
+            combo = ColumnComboBox()
             for choice in spec["choices"]:
                 if isinstance(choice, (tuple, list)):
                     combo.addItem(str(choice[1]), str(choice[0]))
@@ -444,8 +777,8 @@ class ToolOptions(QWidget):
                     return
                 value = combo.itemData(index)
                 self.session.options[key] = value
-                if key == "text_align":
-                    self._apply_text_style(transient=False)
+                if key == "crop_ratio":
+                    self._sync_crop_ratio()
                 if spec.get("amounts"):
                     # Clamp first, then commit the effect once. The slider's
                     # own handler must not also commit, so its signals stay blocked.
@@ -460,6 +793,9 @@ class ToolOptions(QWidget):
                         transient=False,
                         color=color,
                     )
+                # Shape, select, and mask change the canvas pointer.
+                if self._on_option is not None:
+                    self._on_option(key, value)
 
             combo.currentIndexChanged.connect(on_choice)
             return combo
@@ -475,6 +811,26 @@ class ToolOptions(QWidget):
             box.toggled.connect(on_check)
             return box
         return QLabel(str(self.session.option(key, "")))
+
+    def _make_icon_choice(self, spec: dict) -> IconChoice:
+        choices = [(str(choice[0]), str(choice[1]), str(choice[2])) for choice in spec["choices"]]
+        widget = IconChoice(str(spec["label"]), choices)
+        widget.set_value(str(self.session.option(spec["key"], spec.get("default"))))
+        key = str(spec["key"])
+
+        def on_choice(value: str, key: str = key) -> None:
+            # Checking the stored picture while the panel is built is not an edit.
+            if self._loading:
+                return
+            self.session.options[key] = value
+            if key == "text_align":
+                self._apply_text_style(transient=False)
+            # Shape, select, and mask change the canvas pointer.
+            if self._on_option is not None:
+                self._on_option(key, value)
+
+        widget.changed.connect(on_choice)
+        return widget
 
     def refresh_brush_preview(self) -> None:
         """Redraw the stamp from the current size, hardness, opacity, and color."""
@@ -564,7 +920,7 @@ class ToolOptions(QWidget):
 
     def _make_font(self, key: str) -> QComboBox:
         self._load_font_catalog()
-        combo = QComboBox()
+        combo = ColumnComboBox()
         combo.addItem("Default", None)
         for family in self._font_catalog:
             combo.addItem(family, family)
@@ -593,7 +949,7 @@ class ToolOptions(QWidget):
     def _make_font_style(self) -> QComboBox:
         if not self._font_catalog and not self._font_by_path:
             self._load_font_catalog()
-        combo = QComboBox()
+        combo = ColumnComboBox()
         path = self.session.option("text_font")
         self._reload_style_for(combo, path)
 
@@ -653,7 +1009,7 @@ class ToolOptions(QWidget):
                 self._apply_text_style(transient=False)
 
         box.valueChanged.connect(on_spin)
-        return box
+        return _track_column(box)
 
 
 def stack_move(model_ids: list, visual_ids_front_first: list) -> tuple[int, int] | None:
@@ -677,8 +1033,63 @@ def stack_move(model_ids: list, visual_ids_front_first: list) -> tuple[int, int]
     return None
 
 
-class LayerList(QListWidget):
-    """The layer rows. Dragging one row restacks it.
+def _text_mark_pixmap(pixels: int) -> QPixmap:
+    """The text-tool icon centered on a checker square of ``pixels`` pixels."""
+    pixmap = pil_to_pixmap(checker_image(pixels))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    # A margin keeps the mark inside the square, matching the other thumbnails.
+    margin = pixels // 6
+    if margin * 2 >= pixels:
+        margin = 0
+    span = max(1, pixels - 2 * margin)
+    icon_named("text").paint(painter, margin, margin, span, span)
+    painter.end()
+    return pixmap
+
+
+class LayerRowDelegate(QStyledItemDelegate):
+    """Rows stay as wide as the list, so a long name or caption ellipsizes.
+
+    The default item width is the full text, which opens a sideways scrollbar
+    in this narrow column. Matching the viewport width lets ElideRight cut the
+    line that does not fit.
+    """
+
+    def sizeHint(self, option, index):
+        hint = super().sizeHint(option, index)
+        widget = option.widget
+        if widget is not None:
+            width = widget.viewport().width()
+            if width > 0:
+                hint.setWidth(width)
+        return hint
+
+
+_ITEM_ID = Qt.ItemDataRole.UserRole
+_ITEM_KIND = Qt.ItemDataRole.UserRole + 1
+
+
+def _drop_index(visual_front_first: list[str], moved: set[str]) -> int:
+    """Model index where a block dropped into a page should be inserted.
+
+    The list is front-first, matching the layer tree. Layers in ``moved`` are
+    the incoming rows. Destination layers after that block are behind it, so
+    their count is the index in the page's back-to-front stack.
+    """
+    behind = 0
+    seen = False
+    for layer_id in visual_front_first:
+        if layer_id in moved:
+            seen = True
+            continue
+        if seen:
+            behind += 1
+    return behind
+
+
+class LayerTree(QTreeWidget):
+    """Groups, then the layers inside each group.
 
     ``startDrag`` does not return until the drop or cancel has finished, so
     ``drag_finished`` is emitted outside Qt's nested drag loop. The panel
@@ -688,10 +1099,47 @@ class LayerList(QListWidget):
     drag_started = pyqtSignal()
     drag_finished = pyqtSignal()
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.setColumnCount(1)
+        self.setHeaderHidden(True)
+        self.setIndentation(16)
+
     def startDrag(self, supported_actions) -> None:
         self.drag_started.emit()
         super().startDrag(supported_actions)
         self.drag_finished.emit()
+
+    def dropEvent(self, event) -> None:
+        super().dropEvent(event)
+        # Dropping on the middle of a row nests the layer under it. A layer
+        # has no children; the row belongs beside that layer, just below it.
+        for index in range(self.topLevelItemCount()):
+            group = self.topLevelItem(index)
+            if group is None:
+                continue
+            child_index = 0
+            while child_index < group.childCount():
+                child = group.child(child_index)
+                nested = [child.takeChild(0) for _ in range(child.childCount())]
+                for offset, item in enumerate(nested, start=1):
+                    group.insertChild(child_index + offset, item)
+                child_index += 1
+
+    def keyPressEvent(self, event) -> None:
+        # Space is the temporary hand tool. The base tree would use it to
+        # flip this row's checkbox, which is the layer's visibility.
+        if event.key() == Qt.Key.Key_Space:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        # The matching release has to reach the canvas, or the hand cursor sticks.
+        if event.key() == Qt.Key.Key_Space:
+            event.ignore()
+            return
+        super().keyReleaseEvent(event)
 
 
 class LayerPanel(QWidget):
@@ -703,21 +1151,31 @@ class LayerPanel(QWidget):
         # True from the drop until the document matches the list, so a
         # selection change during the drag does not pick the wrong layer.
         self._reordering = False
-        self._pending_visual_ids: list | None = None
         self._opacity_before: float | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         title = QLabel("Layers")
         title.setObjectName("section")
         layout.addWidget(title)
-        self.list = LayerList()
+        self.list = LayerTree()
+        self.list.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setItemDelegate(LayerRowDelegate(self.list))
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.list.setDropIndicatorShown(True)
-        self.list.setToolTip("Drag a row to change stacking order. The top row is in front.")
-        self.list.currentRowChanged.connect(self._on_row)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setToolTip(
+            "Click a group, or a layer in it, to show that page. "
+            "Drag a layer to restack it, or onto another group to move it. "
+            "Drag a group to change the PDF page order. "
+            "Shift-click selects a range inside one group. "
+            "Command-click or Ctrl-click adds or removes a layer."
+        )
+        self.list.itemSelectionChanged.connect(self._on_selection)
         self.list.itemChanged.connect(self._on_item_changed)
-        self.list.itemDoubleClicked.connect(lambda _item: self.on_rename())
+        self.list.itemDoubleClicked.connect(self._on_double_click)
         self.list.drag_started.connect(self._on_drag_started)
         # Queued so a rebuild of the rows waits until the drag's mouse
         # handling has returned, not while Qt is still inside it.
@@ -725,20 +1183,37 @@ class LayerPanel(QWidget):
         layout.addWidget(self.list, 1)
 
         buttons = QHBoxLayout()
-        self._add_button(buttons, "New", self.session.add_blank_layer)
-        self._add_button(buttons, "Copy", self.session.duplicate_active)
-        self._add_button(buttons, "Delete", self.session.delete_active)
+        self._add_button(buttons, "New", self.session.add_blank_layer, icon="layer-new")
+        self._add_button(buttons, "Copy", self.session.duplicate_active, icon="layer-copy")
+        self._add_button(buttons, "Delete", self.session.delete_active, icon="layer-delete")
+        self._add_button(
+            buttons,
+            "Visibility",
+            self.session.toggle_selected_visibility,
+            "Toggle visibility of every selected layer. Click again to put them back.",
+            icon="layer-visibility",
+        )
+        buttons.addStretch(1)
         layout.addLayout(buttons)
         buttons2 = QHBoxLayout()
-        self._add_button(buttons2, "Up", lambda: self.session.move_active(1))
-        self._add_button(buttons2, "Down", lambda: self.session.move_active(-1))
+        self._add_button(buttons2, "Up", lambda: self.session.move_active(1), icon="layer-up")
+        self._add_button(buttons2, "Down", lambda: self.session.move_active(-1), icon="layer-down")
+        self._add_button(
+            buttons2,
+            "Group",
+            self.session.add_group,
+            "New group. It has its own canvas and does not mix with the other groups.",
+            icon="folder",
+        )
         self._add_button(
             buttons2,
             "Merge down",
             self.session.merge_down_active,
-            "Bake this layer into the one below it. Other layers stay as they are. "
-            "Flatten image, in the Layer menu, collapses the whole stack.",
+            "Bake this layer into the one below it. A mask bakes into the layer it belongs to. "
+            "Flatten image, in the Layer menu, collapses the group you are viewing (Ctrl+Shift+E).",
+            icon="layer-merge-down",
         )
+        buttons2.addStretch(1)
         layout.addLayout(buttons2)
 
         self.opacity = QSlider(Qt.Orientation.Horizontal)
@@ -757,98 +1232,327 @@ class LayerPanel(QWidget):
         layout.addWidget(QLabel("Blend"))
         layout.addWidget(self.blend)
 
-    def _add_button(self, layout: QHBoxLayout, text: str, callback, tip: str = "") -> None:
-        button = QPushButton(text)
-        if tip:
-            button.setToolTip(tip)
+    def _add_button(self, layout: QHBoxLayout, text: str, callback, tip: str = "", icon: str = "") -> None:
+        if icon:
+            button = _icon_button(text, icon, tip, side=_ACTION_SIDE, icon_px=_ACTION_ICON)
+        else:
+            button = QPushButton(text)
+            button.setAccessibleName(text)
+            if tip:
+                button.setToolTip(tip)
+        # A focused button treats Space as a click. These actions stay on
+        # the pointer so Space can still pan.
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.clicked.connect(callback)
         layout.addWidget(button)
 
     def refresh(self) -> None:
         self._building = True
-        # Block the list widget, not its model.
-        # 1. clear() and addItem() would otherwise emit currentRowChanged and
-        #    itemChanged, which this panel treats as a click or a visibility toggle.
+        # Block the tree, not its model.
+        # 1. clear() and addTopLevelItem() would otherwise emit itemSelectionChanged
+        #    and itemChanged, which this panel treats as a click or a visibility toggle.
         # 2. The view lays rows out only from the model's reset and insert
         #    signals. Blocking those leaves the default Background row, and
         #    every layer opened later, in the model but not on screen.
         self.list.blockSignals(True)
         self.list.clear()
-        layers = self.session.document.layers
-        # The list shows the front of the stack first, which is the last model entry.
-        for layer in reversed(layers):
-            item = QListWidgetItem(self._label(layer))
-            item.setData(Qt.ItemDataRole.UserRole, layer.id)
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsSelectable
+        document = self.session.document
+        active_group_id = document.active_group_id
+        active_layer_id = None
+        active_layers = document.layers
+        if 0 <= self.session.layer_index < len(active_layers):
+            active_layer_id = active_layers[self.session.layer_index].id
+        chosen = set(self.session.selected_ids())
+        current_item = None
+        rows: list[tuple[QTreeWidgetItem, str, str]] = []
+        # Pages run top to bottom in export order. Inside a page the front
+        # layer is the first row, matching the old flat list.
+        for group in document.groups:
+            header = QTreeWidgetItem([self._group_label(group)])
+            header.setData(0, _ITEM_ID, group.id)
+            header.setData(0, _ITEM_KIND, "group")
+            header.setFlags(
+                Qt.ItemFlag.ItemIsSelectable
                 | Qt.ItemFlag.ItemIsEnabled
                 | Qt.ItemFlag.ItemIsDragEnabled
                 | Qt.ItemFlag.ItemIsDropEnabled
             )
-            item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
-            self.list.addItem(item)
-        if self.session.layer_index >= 0:
-            row = len(layers) - 1 - self.session.layer_index
-            self.list.setCurrentRow(row)
+            if group.id == active_group_id:
+                font = QFont()
+                font.setBold(True)
+                header.setFont(0, font)
+                header.setBackground(0, QBrush(QColor("#1c3a4a")))
+            self.list.addTopLevelItem(header)
+            for layer in reversed(group.layers):
+                item = QTreeWidgetItem([self._label(layer, group.layers)])
+                item.setData(0, _ITEM_ID, layer.id)
+                item.setData(0, _ITEM_KIND, "layer")
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
+                item.setIcon(0, self._thumb_icon(layer))
+                if layer.kind == "text" and layer.text is not None and layer.text.text.strip():
+                    item.setToolTip(0, layer.text.text)
+                header.addChild(item)
+                rows.append((item, layer.id, group.id))
+                if group.id == active_group_id and layer.id == active_layer_id:
+                    current_item = item
+            header.setExpanded(True)
+        # setCurrentItem clears every other row. The selection flags are
+        # applied after that, or a multi-selection would collapse to one layer.
+        if current_item is not None:
+            self.list.setCurrentItem(current_item)
+        for item, layer_id, group_id in rows:
+            item.setSelected(group_id == active_group_id and layer_id in chosen)
         self.list.blockSignals(False)
         self._sync_controls()
         self._building = False
 
-    def _label(self, layer) -> str:
-        kind = {"redaction": "mask", "text": "text"}.get(layer.kind, layer.blend_mode)
-        return f"{layer.name}   {int(round(layer.opacity * 100))}%  {kind}"
+    def _group_label(self, group) -> str:
+        name = group.name.replace("\r", " ").replace("\n", " ").strip()
+        return f"{name}    {group.width} × {group.height}"
+
+    def _label(self, layer, layers) -> str:
+        """Name on the first line. Opacity, and the text head or the kind, on the second.
+
+        A text layer quotes the opening words instead of the word "text".
+        The icon already says that the layer is text. A mask is indented and
+        names the picture it filters, such as "on Photo".
+        """
+        opacity = f"{int(round(layer.opacity * 100))}%"
+        if layer.kind == "text" and layer.text is not None:
+            head = text_head(layer.text.text)
+            detail = f"“{head}”  {opacity}" if head else opacity
+        elif layer.kind == "redaction":
+            target = mask_target(layers, layer)
+            owner = target.name if target is not None else "no layer"
+            detail = f"on {owner}  {opacity}"
+        else:
+            detail = f"{opacity}  {layer.blend_mode}"
+        name = layer.name.replace("\r", " ").replace("\n", " ").strip()
+        if layer.kind == "redaction":
+            name = f"  {name}"
+        return f"{name}\n{detail}"
+
+    def _thumb_icon(self, layer) -> QIcon:
+        """Pixel preview, or the text-tool mark on the same checker square.
+
+        The pixmap is built at the screen's pixel size and tagged with the
+        device ratio so a retina display does not blur the 32px slot.
+        """
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        pixels = max(1, int(round(THUMB_SIZE * dpr)))
+        if layer.kind == "text":
+            pixmap = _text_mark_pixmap(pixels)
+        else:
+            pixmap = pil_to_pixmap(layer_thumb(layer, pixels))
+        pixmap.setDevicePixelRatio(dpr)
+        return QIcon(pixmap)
 
     def _on_drag_started(self) -> None:
         self._reordering = True
+        # Restack moves one row. A multi-selection would otherwise drag every
+        # highlighted row, which the document cannot record as one move.
+        current = self.list.currentItem()
+        selected = self.list.selectedItems()
+        if current is None or len(selected) <= 1:
+            return
+        self.list.blockSignals(True)
+        for item in selected:
+            if item is not current:
+                item.setSelected(False)
+        self.list.blockSignals(False)
 
     def _on_drag_finished(self) -> None:
         if self._building:
             self._reordering = False
             return
-        # The list is already in the dropped order. The document still has
+        # The tree is already in the dropped order. The document still has
         # the previous order until the apply below.
-        self._pending_visual_ids = [
-            self.list.item(index).data(Qt.ItemDataRole.UserRole) for index in range(self.list.count())
-        ]
         self._reordering = True
         self._apply_pending_drop()
 
+    def _read_visual(self) -> list[tuple[str, list[str]]] | None:
+        """(group id, layer ids front-first) or None when the drop nested badly."""
+        seen_groups: list[str] = []
+        seen_layers: list[str] = []
+        visual: list[tuple[str, list[str]]] = []
+        for index in range(self.list.topLevelItemCount()):
+            item = self.list.topLevelItem(index)
+            if item is None or item.data(0, _ITEM_KIND) != "group":
+                return None
+            group_id = item.data(0, _ITEM_ID)
+            if not isinstance(group_id, str) or group_id in seen_groups:
+                return None
+            seen_groups.append(group_id)
+            layer_ids: list[str] = []
+            for child_index in range(item.childCount()):
+                child = item.child(child_index)
+                if child.data(0, _ITEM_KIND) != "layer" or child.childCount():
+                    return None
+                layer_id = child.data(0, _ITEM_ID)
+                if not isinstance(layer_id, str) or layer_id in seen_layers:
+                    return None
+                seen_layers.append(layer_id)
+                layer_ids.append(layer_id)
+            visual.append((group_id, layer_ids))
+        return visual
+
     def _apply_pending_drop(self) -> None:
-        visual_ids = self._pending_visual_ids
-        self._pending_visual_ids = None
+        # One drag does one thing, then the tree is rebuilt from the document.
+        # 1. Group headers reordered, layers unmoved: that becomes the page order.
+        # 2. One layer moved inside its page: restack, masks staying with their picture.
+        # 3. A picture dropped on another page: move it and its masks, then show that page.
+        # A mask dropped without its picture, or a group nested inside a group, snaps back.
         try:
-            if not visual_ids:
+            visual = self._read_visual()
+            document = self.session.document
+            if visual is None:
                 return
-            model_ids = [layer.id for layer in self.session.document.layers]
-            move = stack_move(model_ids, visual_ids)
-            if move is not None:
-                old_index, new_index = move
-                self.session.move_layer(old_index, new_index)
+            model = [(group.id, [layer.id for layer in reversed(group.layers)]) for group in document.groups]
+            if visual == model:
+                return
+            visual_ids = [group_id for group_id, _layer_ids in visual]
+            model_ids = [group_id for group_id, _layer_ids in model]
+            if set(visual_ids) != set(model_ids) or len(visual_ids) != len(model_ids):
+                return
+            model_layers = {group_id: layer_ids for group_id, layer_ids in model}
+            membership = {
+                layer_id: group_id for group_id, layer_ids in model for layer_id in layer_ids
+            }
+            moved = [
+                layer_id
+                for group_id, layer_ids in visual
+                for layer_id in layer_ids
+                if membership.get(layer_id) != group_id
+            ]
+            if not moved and visual_ids != model_ids:
+                if all(layer_ids == model_layers[group_id] for group_id, layer_ids in visual):
+                    self.session.reorder_groups(visual_ids)
+                return
+            if not moved and visual_ids == model_ids:
+                changes = [
+                    (group_id, layer_ids)
+                    for group_id, layer_ids in visual
+                    if layer_ids != model_layers[group_id]
+                ]
+                if len(changes) != 1:
+                    return
+                group_id, visual_front = changes[0]
+                if document.active_group_id != group_id:
+                    self.session.activate_group(group_id)
+                group = document.group_by_id(group_id)
+                if group is None:
+                    return
+                move = stack_move([layer.id for layer in group.layers], visual_front)
+                if move is not None:
+                    old_index, new_index = move
+                    self.session.move_layer(old_index, new_index)
+                return
+            if moved and visual_ids == model_ids:
+                sources = {membership[layer_id] for layer_id in moved if layer_id in membership}
+                dests = {group_id for group_id, layer_ids in visual for layer_id in layer_ids if layer_id in moved}
+                if len(sources) != 1 or len(dests) != 1:
+                    return
+                source_id = next(iter(sources))
+                dest_id = next(iter(dests))
+                source = document.group_by_id(source_id)
+                if source is None:
+                    return
+                leaving = layers_leaving(source.layers, moved)
+                leaving_ids = {layer.id for layer in leaving}
+                # A lone mask is not in the leaving set. Reject it so the mask
+                # cannot be separated from the picture it filters.
+                if not leaving or not set(moved) <= leaving_ids:
+                    return
+                dest_visual = next(layer_ids for group_id, layer_ids in visual if group_id == dest_id)
+                self.session.move_layers_to_group(moved, dest_id, _drop_index(dest_visual, set(moved)))
         finally:
             self._reordering = False
             # Rebuild from the document so a rejected drop snaps back, and
             # labels stay in sync when no window listener refreshes us.
             self.refresh()
 
-    def _on_row(self, row: int) -> None:
-        if self._building or self._reordering or row < 0:
+    def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
+        if item.data(0, _ITEM_KIND) == "group":
+            group_id = item.data(0, _ITEM_ID)
+            group = self.session.document.group_by_id(group_id) if isinstance(group_id, str) else None
+            if group is None:
+                return
+            name, ok = QInputDialog.getText(self, "Rename group", "Name", text=group.name)
+            if ok:
+                self.session.rename_group(group.id, name)
             return
-        index = len(self.session.document.layers) - 1 - row
-        self.session.layer_index = index
+        self.on_rename()
+
+    def _on_selection(self) -> None:
+        if self._building or self._reordering:
+            return
+        items = self.list.selectedItems()
+        if not items:
+            # The active layer always stays selected. Rebuild from the session
+            # so a toggle of the last row does not leave the list empty.
+            self.refresh()
+            return
+        current = self.list.currentItem()
+        if current is None or not current.isSelected():
+            current = items[-1]
+        if current.data(0, _ITEM_KIND) == "group":
+            group_id = current.data(0, _ITEM_ID)
+            if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
+                self.session.activate_group(group_id)
+            else:
+                # The header is not a paint target. Put the highlight back
+                # on the layer this page was already using.
+                self.refresh()
+            return
+        parent = current.parent()
+        if parent is None:
+            return
+        group_id = parent.data(0, _ITEM_ID)
+        if not isinstance(group_id, str):
+            return
+        layer_ids = []
+        for item in items:
+            if item.data(0, _ITEM_KIND) != "layer" or item.parent() is not parent:
+                continue
+            layer_id = item.data(0, _ITEM_ID)
+            if isinstance(layer_id, str):
+                layer_ids.append(layer_id)
+        active_id = current.data(0, _ITEM_ID)
+        if not isinstance(active_id, str):
+            active_id = None
+        if group_id != self.session.document.active_group_id:
+            self.session.activate_group(group_id, layer_ids=layer_ids, active_id=active_id)
+            return
+        self.session.select_layers(layer_ids, active_id=active_id)
         self._sync_controls()
         self.session.preview()
 
-    def _on_item_changed(self, item: QListWidgetItem) -> None:
-        if self._building:
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._building or column != 0:
             return
-        layer_id = item.data(Qt.ItemDataRole.UserRole)
-        try:
-            layer = self.session.document.layer_by_id(layer_id)
-        except KeyError:
+        if item.data(0, _ITEM_KIND) != "layer":
             return
-        visible = item.checkState() == Qt.CheckState.Checked
+        layer_id = item.data(0, _ITEM_ID)
+        if not isinstance(layer_id, str):
+            return
+        layer = None
+        for group in self.session.document.groups:
+            for candidate in group.layers:
+                if candidate.id == layer_id:
+                    layer = candidate
+                    break
+            if layer is not None:
+                break
+        if layer is None:
+            return
+        visible = item.checkState(0) == Qt.CheckState.Checked
         if layer.visible != visible:
             self.session.set_visibility(layer, visible)
 

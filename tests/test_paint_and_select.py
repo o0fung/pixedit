@@ -6,11 +6,43 @@ from PIL import Image, ImageDraw
 
 from pixedit.factory import raster_layer, redaction_layer
 from pixedit.model import new_document
-from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing
+from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing, wand_mask
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.builtins import BrushTool, ColorTool, EraserTool, FillTool, SelectTool, ShapeTool
 import numpy as np
+
+
+def _stroke_alpha(hardness: int, passes: int) -> int:
+    """Alpha at the middle of a horizontal stroke, after ``passes`` separate gestures.
+
+    The layer is cropped to the paint, so the sample is in canvas coordinates.
+    """
+    session = Session(new_document(96, 64, "transparent"))
+    session.foreground = (255, 0, 0, 255)
+    session.options["brush_size"] = 24
+    session.options["brush_hardness"] = hardness
+    session.options["brush_opacity"] = 100
+    tool = BrushTool()
+    for _ in range(passes):
+        tool.pointer_down(session, PointerEvent(12, 32))
+        tool.pointer_up(session, PointerEvent(84, 32))
+    return _pixel(session.active_layer(), 48, 32)[3]
+
+
+def test_soft_brush_builds_up_instead_of_filling_solid():
+    """Hardness 0 lays down a light coat. Many passes reach solid; 85 and 100 do it in one.
+
+    One coat is about 25/255. Twenty-five passes are already near solid, and
+    the last few points of 255 take a couple more because each pass only
+    fills what is still missing.
+    """
+    once = _stroke_alpha(0, 1)
+    assert 15 <= once <= 50, once
+    assert _stroke_alpha(0, 25) > 220
+    assert _stroke_alpha(0, 28) > 240
+    assert _stroke_alpha(100, 1) > 240
+    assert _stroke_alpha(85, 1) > 240
 
 
 def test_hard_brush_is_a_disk_and_respects_selection():
@@ -101,6 +133,147 @@ def test_magic_wand_is_contiguous():
     assert session.document.selection is None
 
 
+def _soft_circle(size: int = 80, radius: float = 22.0) -> Image.Image:
+    """Red disk on white with a one-pixel blend at the edge.
+
+    The center is a pixel, so the blend lands on whole pixels instead of a
+    sub-pixel sliver that is already the background.
+    """
+    arr = np.zeros((size, size, 4), np.uint8)
+    yy, xx = np.mgrid[0:size, 0:size]
+    center = float(size // 2)
+    dist = np.sqrt((xx - center) ** 2 + (yy - center) ** 2)
+    cover = np.clip(radius - dist, 0, 1)
+    red = np.array([220, 30, 40], np.float32)
+    white = np.array([255, 255, 255], np.float32)
+    arr[..., :3] = np.rint(red * cover[..., None] + white * (1 - cover[..., None])).astype(np.uint8)
+    arr[..., 3] = 255
+    return Image.fromarray(arr, "RGBA")
+
+
+def _colored_opaque(arr: np.ndarray, background: tuple[int, int, int, int]) -> np.ndarray:
+    delta = np.max(np.abs(arr.astype(np.int16) - np.array(background, dtype=np.int16)), axis=-1)
+    return (delta > 0) & (arr[..., 3] > 0)
+
+
+def _wand_and_cut(image: Image.Image, x: int, y: int, background: str) -> Session:
+    session = Session(new_document(image.width, image.height, background))
+    session.document.layers[0].image = image
+    session.options["select_mode"] = "wand"
+    session.options["tolerance"] = 32
+    SelectTool().pointer_down(session, PointerEvent(x, y))
+    session.cut_selection_to_layer()
+    return session
+
+
+def test_wand_cut_takes_the_soft_rim():
+    """A blended edge used to stay on the source after cut to layer."""
+    circle = _soft_circle()
+    flood = np.asarray(connected_mask(circle, 40, 40, 32)) > 0
+    wand = np.asarray(wand_mask(circle, 40, 40, 32)) > 0
+    shape = _colored_opaque(np.asarray(circle), (255, 255, 255, 255))
+    assert int((shape & ~flood).sum()) > 0
+    assert int((shape & ~wand).sum()) == 0
+
+    session = _wand_and_cut(circle, 40, 40, "white")
+    source = np.asarray(session.document.layers[0].image)
+    assert int(_colored_opaque(source, (255, 255, 255, 255)).sum()) == 0
+    moved = np.asarray(session.document.layers[1].image)
+    seed = np.array([220, 30, 40, 255], dtype=np.int16)
+    blend = (moved[..., 3] > 0) & (np.max(np.abs(moved.astype(np.int16) - seed), axis=-1) > 32)
+    assert int(blend.sum()) > 0
+
+    dabbed = np.full((80, 80, 4), 255, np.uint8)
+    dab(dabbed, 40, 40, radius=15, hardness=0.85, color=(220, 30, 40, 255), opacity=1, erase=False, selection=None)
+    session = _wand_and_cut(Image.fromarray(dabbed, "RGBA"), 40, 40, "white")
+    source = np.asarray(session.document.layers[0].image)
+    assert int(_colored_opaque(source, (255, 255, 255, 255)).sum()) == 0
+    moved = np.asarray(session.document.layers[1].image)
+    blend = (moved[..., 3] > 0) & (np.max(np.abs(moved.astype(np.int16) - seed), axis=-1) > 32)
+    assert int(blend.sum()) > 0
+
+    clear = np.zeros((80, 80, 4), np.uint8)
+    dab(clear, 40, 40, radius=15, hardness=0.85, color=(220, 30, 40, 255), opacity=1, erase=False, selection=None)
+    session = _wand_and_cut(Image.fromarray(clear, "RGBA"), 40, 40, "transparent")
+    source = np.asarray(session.document.layers[0].image)
+    assert int((source[..., 3] > 0).sum()) == 0
+    moved = np.asarray(session.document.layers[1].image)
+    faded = (moved[..., 3] > 0) & (moved[..., 3] < 250)
+    assert int(faded.sum()) > 0
+
+
+def test_wand_rim_on_a_wide_image():
+    """A seed to the right of the image height still takes the soft rim.
+
+    Pillow's size is (width, height). Reading that backwards used to reject
+    this click and return the flood alone, so the blend stayed unselected.
+    """
+    width, height = 120, 40
+    arr = np.full((height, width, 4), 255, np.uint8)
+    yy, xx = np.mgrid[0:height, 0:width]
+    # Integer center, same as the square disk, so the blend sits on whole pixels.
+    cx, cy, radius = 80, 20, 12.0
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    cover = np.clip(radius - dist, 0, 1)
+    red = np.array([220, 30, 40], np.float32)
+    white = np.array([255, 255, 255], np.float32)
+    arr[..., :3] = np.rint(red * cover[..., None] + white * (1 - cover[..., None])).astype(np.uint8)
+    image = Image.fromarray(arr, "RGBA")
+    assert cx > height
+    flood = np.asarray(connected_mask(image, cx, cy, 32)) > 0
+    wand = np.asarray(wand_mask(image, cx, cy, 32)) > 0
+    shape = _colored_opaque(arr, (255, 255, 255, 255))
+    assert int((shape & ~flood).sum()) > 0
+    assert int((shape & ~wand).sum()) == 0
+
+    session = Session(new_document(width, height, "white"))
+    session.document.layers[0].image = image
+    session.options["select_mode"] = "wand"
+    session.options["tolerance"] = 32
+    SelectTool().pointer_down(session, PointerEvent(cx, cy))
+    assert np.array_equal(np.asarray(session.document.selection) > 0, wand)
+
+
+def test_wand_hard_edge_matches_the_flood():
+    image = Image.new("RGBA", (80, 80), (255, 255, 255, 255))
+    ImageDraw.Draw(image).ellipse((15, 15, 65, 65), fill=(220, 30, 40, 255))
+    flood = np.asarray(connected_mask(image, 40, 40, 32))
+    assert np.array_equal(np.asarray(wand_mask(image, 40, 40, 32)), flood)
+
+    session = Session(new_document(80, 80, "white"))
+    session.document.layers[0].image = image
+    session.options["select_mode"] = "wand"
+    session.options["tolerance"] = 32
+    SelectTool().pointer_down(session, PointerEvent(40, 40))
+    assert np.array_equal(np.asarray(session.document.selection), flood)
+    session.cut_selection_to_layer()
+    source = np.asarray(session.document.layers[0].image)
+    assert int(_colored_opaque(source, (255, 255, 255, 255)).sum()) == 0
+
+
+def test_wand_does_not_take_a_flat_neighbor_or_a_slow_gradient():
+    flat = np.full((40, 40, 4), (200, 200, 200, 255), np.uint8)
+    flat[:, :20] = (220, 30, 40, 255)
+    image = Image.fromarray(flat, "RGBA")
+    mask = wand_mask(image, 5, 5, 32)
+    assert mask.getpixel((19, 5)) == 255
+    assert mask.getpixel((20, 5)) == 0
+    assert mask.getpixel((30, 5)) == 0
+    other = wand_mask(image, 30, 5, 32)
+    assert other.getpixel((20, 5)) == 255
+    assert other.getpixel((19, 5)) == 0
+
+    gradient = np.zeros((80, 80, 4), np.uint8)
+    for x in range(80):
+        gradient[:, x, :3] = int(x * 255 / 79)
+        gradient[:, x, 3] = 255
+    ramp = Image.fromarray(gradient, "RGBA")
+    assert np.array_equal(
+        np.asarray(wand_mask(ramp, 10, 40, 32)),
+        np.asarray(connected_mask(ramp, 10, 40, 32)),
+    )
+
+
 def test_rect_selection_shift_adds():
     session = Session(new_document(30, 30, "white"))
     session.options["select_mode"] = "rect"
@@ -113,6 +286,61 @@ def test_rect_selection_shift_adds():
     assert selection.getpixel((3, 3)) == 255
     assert selection.getpixel((15, 15)) == 255
     assert selection.getpixel((10, 10)) == 0
+
+
+def test_freehand_select_keeps_sampled_bends():
+    """Points from the cursor poll fill a jog that the straight chord misses."""
+    from pixedit.geom import mask_freehand
+
+    session = Session(new_document(80, 80, "white"))
+    tool = SelectTool()
+    for mode in ("rect", "ellipse", "wand"):
+        session.options["select_mode"] = mode
+        assert not tool.wants_stroke_sampling(session)
+
+    session.options["select_mode"] = "rect"
+    tool.pointer_down(session, PointerEvent(1, 1))
+    tool.pointer_up(session, PointerEvent(8, 8))
+    assert not tool.stroke_live()
+    selection = session.document.selection
+    assert selection.getpixel((4, 4)) == 255
+
+    # Right triangle. (48, 38) sits in the corner, off the hypotenuse.
+    start = (10.0, 40.0)
+    bend = (50.0, 40.0)
+    end = (50.0, 10.0)
+    inside = (48, 38)
+    session.options["select_mode"] = "freehand"
+    assert tool.wants_stroke_sampling(session)
+    notes: list[str] = []
+    session.add_listener(notes.append)
+    tool.pointer_down(session, PointerEvent(*start))
+    assert tool.stroke_live()
+    tool.pointer_move(session, PointerEvent(*bend))
+    # A sample 0.02px from the bend is the same point. The poll drops it.
+    # The new point only redraws the rubber band, so the photo is not rebuilt.
+    tool.extend_points(session, [(bend[0] + 0.02, bend[1]), end])
+    assert tool._points == [start, bend, end]
+    # pointer_move and the batch each redraw the line. Neither rebuilds the photo.
+    assert notes == ["overlay", "overlay"]
+    tool.commit_stroke(session, PointerEvent(*end, shift=True))
+    assert not tool.stroke_live()
+    selection = session.document.selection
+    assert selection.getpixel(inside) == 255
+    assert selection.getpixel((4, 4)) == 255
+    chord = mask_freehand(session.document.width, session.document.height, [start, end], radius=1)
+    assert chord.getpixel(inside) == 0
+
+    # A later rectangle drag still replaces the selection through pointer_up.
+    session.options["select_mode"] = "rect"
+    assert not tool.wants_stroke_sampling(session)
+    tool.pointer_down(session, PointerEvent(2, 2))
+    assert not tool.stroke_live()
+    tool.pointer_move(session, PointerEvent(12, 14))
+    tool.pointer_up(session, PointerEvent(12, 14))
+    selection = session.document.selection
+    assert selection.getpixel((6, 6)) == 255
+    assert selection.getpixel(inside) == 0
 
 
 def test_inverted_drag_still_fills_rect_and_ellipse():
@@ -191,14 +419,15 @@ def test_fill_tool_click_path_tolerance_selection_and_messages():
     steps = len(session.history.undo_stack)
     FillTool().pointer_down(session, PointerEvent(4, 5))
     layer = session.active_layer()
-    # Empty pixels run to the layer edge, so the canvas stays transparent.
-    assert layer.image.getpixel((4, 5))[3] == 0
-    assert layer.image.getpixel((15, 15))[3] == 0
+    # The empty canvas is one connected transparent region, so the click paints it.
+    assert layer.image.getpixel((4, 5)) == (20, 30, 40, 255)
+    assert layer.image.getpixel((15, 15)) == (20, 30, 40, 255)
     assert layer.image.size == (16, 16)
-    assert any("empty pixels" in message for message in messages)
-    assert len(session.history.undo_stack) == steps
+    assert (layer.x, layer.y) == (0, 0)
+    assert messages == []
+    assert len(session.history.undo_stack) == steps + 1
 
-    # A small sprite stays small. Fill recolors the seed's component only.
+    # A click on one color recolors that component only. The layer stays tight.
     sprite = raster_layer("Sprite", Image.new("RGBA", (6, 6), (255, 0, 0, 255)), 8, 8)
     sprite.image.putpixel((2, 2), (0, 0, 255, 255))
     session.add_layer(sprite)
@@ -212,27 +441,36 @@ def test_fill_tool_click_path_tolerance_selection_and_messages():
     assert edited.image.getpixel((2, 2))[:3] == (0, 255, 0)
     assert edited.image.getpixel((0, 0))[:3] == (255, 0, 0)
 
-    messages: list[str] = []
-    session.set_message_handler(messages.append)
-    before = edited.image.getpixel((0, 0))
-    steps = len(session.history.undo_stack)
+    # A click in the empty margin fills that region and leaves the sprite colors.
+    session.foreground = (0, 0, 255, 255)
     FillTool().pointer_down(session, PointerEvent(1, 1))
-    assert any("outside the active layer" in message for message in messages)
-    assert session.active_layer().image.getpixel((0, 0)) == before
+    edited = session.active_layer()
+    assert edited.image.size == (16, 16)
+    assert (edited.x, edited.y) == (0, 0)
+    assert edited.image.getpixel((1, 1))[:3] == (0, 0, 255)
+    assert edited.image.getpixel((8, 8))[:3] == (255, 0, 0)
+    assert edited.image.getpixel((10, 10))[:3] == (0, 255, 0)
+    assert session.document.layers[0].image.getpixel((1, 1))[:3] == (20, 30, 40)
+
+    messages.clear()
+    steps = len(session.history.undo_stack)
+    before = edited.image.getpixel((1, 1))
+    FillTool().pointer_down(session, PointerEvent(-1, 1))
+    assert any("outside the canvas" in message for message in messages)
+    assert session.active_layer().image.getpixel((1, 1)) == before
     assert len(session.history.undo_stack) == steps
 
     mask = Image.new("L", (16, 16), 0)
     mask.paste(255, (0, 0, 8, 16))
     session.set_selection(mask)
     messages.clear()
-    # The sprite sits at x=8, so a click on its left edge is canvas x=8, outside
-    # the selection (0..7). Use a click on the white background inside the layer
-    # but the background is not the active layer. Click the sprite at (9, 9),
-    # which is outside the selection, and confirm nothing is recolored.
+    # Canvas (9, 9) is the sprite's red pixel and sits outside the selection.
     session.foreground = (255, 255, 0, 255)
+    steps = len(session.history.undo_stack)
     FillTool().pointer_down(session, PointerEvent(9, 9))
     assert any("outside the selection" in message for message in messages)
-    assert session.active_layer().image.getpixel((1, 1))[:3] == (255, 0, 0)
+    assert session.active_layer().image.getpixel((9, 9))[:3] == (255, 0, 0)
+    assert len(session.history.undo_stack) == steps
 
     messages.clear()
     session.layer_index = 0
@@ -244,6 +482,58 @@ def test_fill_tool_click_path_tolerance_selection_and_messages():
     assert base.image.getpixel((2, 2))[:3] == (0, 0, 255)
     assert base.image.getpixel((12, 12))[:3] == (255, 255, 255)
     assert base.image.size == (16, 16)
+
+
+def test_fill_on_an_empty_layer_covers_the_canvas():
+    session = Session(new_document(20, 12, "white"))
+    session.add_blank_layer()
+    assert session.active_layer().image.size == (1, 1)
+    session.foreground = (9, 8, 7, 255)
+    session.options["tolerance"] = 0
+    FillTool().pointer_down(session, PointerEvent(15, 6))
+    layer = session.active_layer()
+    assert layer.image.size == (20, 12)
+    assert (layer.x, layer.y) == (0, 0)
+    assert layer.image.getpixel((15, 6)) == (9, 8, 7, 255)
+    assert layer.image.getpixel((0, 0)) == (9, 8, 7, 255)
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
+
+
+def test_fill_outside_a_small_layer_stays_inside_the_selection():
+    session = Session(new_document(16, 16, "transparent"))
+    sprite = raster_layer("Sprite", Image.new("RGBA", (6, 6), (255, 0, 0, 255)), 8, 8)
+    session.add_layer(sprite)
+    session.layer_index = session.document.index_of(sprite.id)
+    mask = Image.new("L", (16, 16), 0)
+    mask.paste(255, (0, 0, 8, 16))
+    session.set_selection(mask)
+    session.foreground = (0, 0, 255, 255)
+    session.options["tolerance"] = 0
+    FillTool().pointer_down(session, PointerEvent(1, 1))
+    edited = session.active_layer()
+    assert edited.image.getpixel((1 - edited.x, 1 - edited.y))[:3] == (0, 0, 255)
+    assert edited.image.getpixel((8 - edited.x, 8 - edited.y))[:3] == (255, 0, 0)
+    # Canvas (12, 1) is outside the selection and outside the sprite.
+    assert edited.image.getpixel((12 - edited.x, 1 - edited.y))[3] == 0
+
+
+def test_fill_keeps_pixels_that_hang_off_the_canvas():
+    session = Session(new_document(16, 16, "white"))
+    layer = raster_layer("Overhang", Image.new("RGBA", (8, 8), (255, 0, 0, 255)), -4, -4)
+    session.add_layer(layer)
+    session.layer_index = session.document.index_of(layer.id)
+    session.foreground = (0, 0, 255, 255)
+    session.options["tolerance"] = 0
+    FillTool().pointer_down(session, PointerEvent(10, 10))
+    edited = session.active_layer()
+    # Local (0, 0) is canvas (-4, -4), outside the document, and stays red.
+    assert (edited.x, edited.y) == (-4, -4)
+    assert edited.image.getpixel((0, 0))[:3] == (255, 0, 0)
+    # Local (4, 4) is canvas (0, 0), the red that sits on the canvas.
+    assert edited.image.getpixel((4, 4))[:3] == (255, 0, 0)
+    # Local (14, 14) is canvas (10, 10), empty space that takes the fill.
+    assert edited.image.getpixel((14, 14))[:3] == (0, 0, 255)
+    assert session.document.layers[0].image.getpixel((10, 10))[:3] == (255, 255, 255)
 
 
 def _outline_on_transparent_layer() -> Session:
@@ -259,12 +549,12 @@ def _outline_on_transparent_layer() -> Session:
     return session
 
 
-def test_fill_paints_an_enclosed_hole_and_skips_open_empty_pixels():
+def test_fill_paints_an_enclosed_hole_and_the_open_margin():
     session = _outline_on_transparent_layer()
     FillTool().pointer_down(session, PointerEvent(26, 26))
     edited = session.active_layer()
-    # The hole is painted. Transparent margins are cropped; the layer does not
-    # grow out to the canvas.
+    # The hole is painted. The open margin stays empty, so the layer stays
+    # smaller than the canvas.
     assert edited.image.size != (64, 64)
     assert edited.image.width < 64 and edited.image.height < 64
     filled = edited.image.getpixel((26 - edited.x, 26 - edited.y))
@@ -272,18 +562,84 @@ def test_fill_paints_an_enclosed_hole_and_skips_open_empty_pixels():
     assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
 
     session = _outline_on_transparent_layer()
+    FillTool().pointer_down(session, PointerEvent(11, 11))
+    layer = session.active_layer()
+    # The open margin reaches the canvas edge, so the layer grows to the canvas.
+    # The outline stops the flood, and the hole inside it stays empty.
+    assert layer.image.size == (64, 64)
+    assert (layer.x, layer.y) == (0, 0)
+    assert layer.image.getpixel((11, 11))[:3] == (0, 180, 40)
+    assert layer.image.getpixel((0, 0))[:3] == (0, 180, 40)
+    assert layer.image.getpixel((26, 26))[3] == 0
+    assert layer.image.getpixel((18, 18))[:3] == (0, 0, 0)
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
+
+
+def test_wand_selects_empty_space_outside_a_small_layer():
+    session = Session(new_document(16, 16, "transparent"))
+    sprite = raster_layer("Sprite", Image.new("RGBA", (6, 6), (255, 0, 0, 255)), 8, 8)
+    sprite.image.putpixel((2, 2), (0, 0, 255, 255))
+    session.add_layer(sprite)
+    session.layer_index = session.document.index_of(sprite.id)
+    session.options["select_mode"] = "wand"
+    session.options["tolerance"] = 0
+
+    SelectTool().pointer_down(session, PointerEvent(1, 1))
+    selection = session.document.selection
+    assert selection is not None
+    assert selection.size == (16, 16)
+    # The empty margin is one connected region. The sprite colors are not.
+    assert selection.getpixel((1, 1)) == 255
+    assert selection.getpixel((15, 15)) == 255
+    assert selection.getpixel((8, 8)) == 0
+    assert selection.getpixel((10, 10)) == 0
+
+    SelectTool().pointer_down(session, PointerEvent(8, 8))
+    selection = session.document.selection
+    assert selection.getpixel((8, 8)) == 255
+    assert selection.getpixel((13, 13)) == 255
+    # The blue pixel is a different color, and the far margin is outside the sprite.
+    assert selection.getpixel((10, 10)) == 0
+    assert selection.getpixel((1, 1)) == 0
+
+
+def test_wand_enclosed_hole_and_open_margin():
+    session = _outline_on_transparent_layer()
+    session.options["select_mode"] = "wand"
+    SelectTool().pointer_down(session, PointerEvent(26, 26))
+    selection = session.document.selection
+    assert selection is not None
+    assert selection.getpixel((26, 26)) == 255
+    # The outline stops the walk, so the open margin and the canvas edge stay out.
+    assert selection.getpixel((11, 11)) == 0
+    assert selection.getpixel((0, 0)) == 0
+    assert selection.getpixel((18, 18)) == 0
+
+    session = _outline_on_transparent_layer()
+    session.options["select_mode"] = "wand"
+    SelectTool().pointer_down(session, PointerEvent(11, 11))
+    selection = session.document.selection
+    assert selection.size == (64, 64)
+    assert selection.getpixel((11, 11)) == 255
+    assert selection.getpixel((0, 0)) == 255
+    assert selection.getpixel((26, 26)) == 0
+    assert selection.getpixel((18, 18)) == 0
+
+
+def test_wand_click_outside_the_canvas_leaves_the_selection():
+    session = Session(new_document(16, 16, "white"))
+    session.options["select_mode"] = "wand"
+    mask = Image.new("L", (16, 16), 0)
+    mask.putpixel((2, 2), 255)
+    session.set_selection(mask)
+    before = np.asarray(session.document.selection).copy()
+    steps = len(session.history.undo_stack)
     messages: list[str] = []
     session.set_message_handler(messages.append)
-    steps = len(session.history.undo_stack)
-    FillTool().pointer_down(session, PointerEvent(11, 11))
-    assert any("empty pixels" in message for message in messages)
-    layer = session.active_layer()
-    assert layer.image.size == (32, 32)
-    assert (layer.x, layer.y) == (10, 10)
-    assert layer.image.getpixel((1, 1))[3] == 0
-    assert layer.image.getpixel((0, 0))[3] == 0
+    SelectTool().pointer_down(session, PointerEvent(-1, 1))
+    assert any("outside the canvas" in message for message in messages)
+    assert np.array_equal(np.asarray(session.document.selection), before)
     assert len(session.history.undo_stack) == steps
-    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (255, 255, 255)
 
 
 def test_brush_and_shape_on_a_new_layer_stay_content_sized():
@@ -399,7 +755,13 @@ def _pixel(layer, x: int, y: int):
 
 
 def test_fast_stroke_stays_continuous_for_brush_and_eraser():
-    assert stroke_spacing(12, 0.85) <= 1.5
+    # radius 12, hardness 0.85: the solid core is 10.2 and the step is 15% of it.
+    assert abs(stroke_spacing(12, 0.85) - (12 * 0.85 * 0.15)) < 1e-9
+    # A large hard brush may step more than a pixel. The step stays inside the core.
+    assert stroke_spacing(80, 1.0) > 1.5
+    assert stroke_spacing(80, 1.0) < 80
+    # A small or soft brush keeps the sub-pixel floor.
+    assert stroke_spacing(1.0, 0.2) == 0.35
     assert len(interpolate((0, 0), (30, 0), 0.4)) >= 60
 
     session = Session(new_document(80, 80, "transparent"))
@@ -427,6 +789,91 @@ def test_fast_stroke_stays_continuous_for_brush_and_eraser():
     cleared = session.active_layer()
     for x in range(8, 66, 4):
         assert _pixel(cleared, x, 40)[:4] == (0, 0, 0, 0)
+
+
+def test_sparse_circle_bows_past_the_straight_chords():
+    """Eight samples of a circle. The spline covers the arc; the chords do not."""
+    cx, cy, radius = 50.0, 50.0, 36.0
+    points = []
+    for index in range(8):
+        angle = 2 * np.pi * index / 8
+        points.append((cx + radius * np.cos(angle), cy + radius * np.sin(angle)))
+    points.append(points[0])
+    arc = 2 * np.pi * 0.5 / 8
+    pixel = (int(round(cx + radius * np.cos(arc))), int(round(cy + radius * np.sin(arc))))
+
+    session = Session(new_document(100, 100, "transparent"))
+    session.foreground = (255, 0, 0, 255)
+    session.options["brush_size"] = 3
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    tool = BrushTool()
+    tool.pointer_down(session, PointerEvent(*points[0]))
+    for point in points[1:-1]:
+        tool.pointer_move(session, PointerEvent(*point))
+    tool.pointer_up(session, PointerEvent(*points[-1]))
+    curve = np.array(session.active_layer().image)
+    assert curve[pixel[1], pixel[0], 3] > 200
+
+    spacing = stroke_spacing(1.5, 1.0)
+    centers = [points[0]]
+    for start, end in zip(points, points[1:]):
+        centers.extend(interpolate(start, end, spacing))
+    chords = np.array(
+        paint_points(
+            Image.new("RGBA", (100, 100), (0, 0, 0, 0)),
+            centers,
+            1.5,
+            1.0,
+            (255, 0, 0, 255),
+            1.0,
+        )
+    )
+    assert chords[pixel[1], pixel[0], 3] == 0
+
+
+def test_tip_redraw_does_not_darken_a_translucent_stroke():
+    """Redrawing the provisional tip must match painting the same points once."""
+    points = [(8.0, 20.0), (28.0, 20.0), (48.0, 21.0), (68.0, 20.0), (90.0, 20.0)]
+
+    def _stroke(incremental: bool) -> np.ndarray:
+        session = Session(new_document(110, 40, "transparent"))
+        session.foreground = (0, 0, 0, 255)
+        session.options["brush_size"] = 6
+        session.options["brush_hardness"] = 100
+        session.options["brush_opacity"] = 50
+        tool = BrushTool()
+        tool.pointer_down(session, PointerEvent(*points[0]))
+        if incremental:
+            for point in points[1:-1]:
+                tool.pointer_move(session, PointerEvent(*point))
+            tool.pointer_up(session, PointerEvent(*points[-1]))
+        else:
+            tool.extend_points(session, points[1:])
+            tool.commit_stroke(session)
+        return np.array(session.active_layer().image)
+
+    incremental = _stroke(True)
+    batched = _stroke(False)
+    assert incremental.shape == batched.shape
+    assert np.max(np.abs(incremental.astype(int) - batched.astype(int))) <= 1
+    # The outer pixels of a 50% stamp are the only coverage there. Redrawing
+    # the tip would push those up toward opaque.
+    assert np.any((incremental[..., 3] > 40) & (incremental[..., 3] < 200))
+
+
+def test_region_composite_matches_a_cropped_document():
+    from pixedit.composite import composite, composite_region
+
+    document = new_document(40, 30, "white")
+    spot = raster_layer("Spot", Image.new("RGBA", (12, 10), (255, 0, 0, 180)), 8, 6)
+    spot.opacity = 0.6
+    spot.blend_mode = "multiply"
+    document.layers.append(spot)
+    full = np.array(composite(document))
+    box = (4, 2, 24, 20)
+    region = np.array(composite_region(document, box))
+    assert np.array_equal(region, full[box[1] : box[3], box[0] : box[2]])
 
 
 def test_fill_meets_a_soft_brush_outline_without_a_rim_or_a_leak():
@@ -671,6 +1118,9 @@ def test_brush_preview_shows_size_hardness_opacity_and_eraser_hole():
     faint = np.array(brush_preview_image(48, 1.0, 0.35, color, erase=False))
     assert hard[48, 88, 0] > 240
     assert hard[48, 108, 0] > 200
+    # Hardness 0 is a light coat at the center, not a solid disk with a soft edge.
+    assert soft[48, 88, 0] < 140
+    assert hard[48, 88, 0] - soft[48, 88, 0] > 100
     assert soft[48, 108, 0] < 120
     assert faint[48, 88, 0] < hard[48, 88, 0] - 40
 
