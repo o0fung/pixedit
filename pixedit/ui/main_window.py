@@ -1103,22 +1103,27 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def _drop_paths(self, paths: list[str]) -> None:
-        """Open a dropped project. Any other file is placed on the current page.
+        """Place dropped files on the open document.
 
-        A ``.pix`` file is a project, so it replaces the document the way Open
-        does. Placing it would nest one project inside another.
+        An image or PDF lands on the page on screen. A ``.pix`` project is
+        appended as new groups at the end. The document already open stays
+        open, including its save path.
         """
         self._stop_play()
-        projects = [path for path in paths if Path(path).suffix.lower() == ".pix"]
-        if projects:
-            if not self._confirm_discard():
-                return
-            self.open_path(projects[0])
-            if len(paths) > 1:
-                self._toast(f"Opened {Path(projects[0]).name}. The other dropped files were left alone.")
-            return
         for path in paths:
-            self._place_path(path)
+            if Path(path).suffix.lower() == ".pix":
+                self._place_project(path)
+            else:
+                self._place_path(path)
+
+    def _place_project(self, path: str) -> None:
+        """Append each page of a ``.pix`` file as a group at the end."""
+        try:
+            incoming = load_path(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
+            return
+        self.session.place_groups(incoming.groups)
 
     def _toggle_play(self) -> None:
         if self._playing:

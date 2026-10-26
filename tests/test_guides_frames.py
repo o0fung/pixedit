@@ -197,9 +197,16 @@ def test_hidden_layers_are_gif_frames_and_a_drop_places_or_opens(tmp_path: Path)
     project = tmp_path / "page.pix"
     save_project(new_document(5, 5, "black"), str(project))
     window.session.dirty = False
+    kept_id = window.session.document.groups[0].id
+    kept_path = window.session.path
+    group_count = len(window.session.document.groups)
     window._drop_paths([str(project)])
     app.processEvents()
-    assert window.session.path == str(project)
+    # The open document stays. The project is a new group at the end.
+    assert window.session.path == kept_path
+    assert window.session.document.groups[0].id == kept_id
+    assert len(window.session.document.groups) == group_count + 1
+    assert window.session.document.active_group_id == window.session.document.groups[-1].id
     assert window.session.document.layers[0].image.getpixel((0, 0))[:3] == (0, 0, 0)
 
     window.session.add_group()
