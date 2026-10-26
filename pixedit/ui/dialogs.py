@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 from pixedit import __version__
 
 from pixedit.adjust import apply_masked
+from pixedit.session.selection import FEATHER_MAX, FEATHER_MIN
 from pixedit.geom import (
     MAX_EDGE,
     inches_from_pixels,
@@ -666,6 +667,30 @@ class ImageSizeDialog(QDialog):
         return width, height, float(self.resolution.value()), method, self.resample.isChecked()
 
 
+class FeatherDialog(QDialog):
+    """Pixel radius for Select → Feather. The session clamps to the same range."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Feather selection")
+        form = QFormLayout(self)
+        self.pixels = QSpinBox()
+        self.pixels.setRange(FEATHER_MIN, FEATHER_MAX)
+        self.pixels.setValue(8)
+        self.pixels.setSuffix(" px")
+        form.addRow("Radius", self.pixels)
+        note = QLabel("Softens the edge. Paint and filters fade across it.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def radius(self) -> int:
+        return int(self.pixels.value())
+
+
 class RotateDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -774,7 +799,9 @@ class ShortcutsDialog(QDialog):
                     "Ctrl+A  Select all   Ctrl+D or Esc  Deselect   Ctrl+Shift+I  Invert",
                     "Ctrl+X  Cut selection to a new layer",
                     "Ctrl+C  Copy selection to a new layer",
+                    "Ctrl+Shift+C  Copy to the clipboard    Ctrl+V  Paste",
                     "Delete or Backspace  Clear pixels inside the selection",
+                    "Select → Feather…  Soften the selection edge",
                     "Ctrl+Shift+O  Place an image as new layers (File → Place, Layer → Place image)",
                     "Ctrl+0  Fit          Ctrl+1  100%       Ctrl++ / Ctrl+-  Zoom",
                     "V Transform   B Brush   E Eraser   T Text   R Mask   S Select",

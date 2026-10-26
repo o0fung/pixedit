@@ -392,8 +392,8 @@ class LayerGroup:
     height: int
     layers: list[Layer] = field(default_factory=list)
     # None means "no selection" (edits hit the whole target). An L image is a
-    # real selection: 255 is included, 0 is excluded. The mask is this page's
-    # size, not the size of any other group.
+    # real selection: 255 is fully included, 0 is excluded, and a value in
+    # between fades the edit. The mask is this page's size, not another group's.
     selection: Image.Image | None = None
     # Pixel positions. Vertical guides are x, horizontal guides are y.
     guides_v: tuple[int, ...] = ()

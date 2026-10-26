@@ -7,18 +7,23 @@ from pathlib import Path
 from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QButtonGroup,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QTextEdit,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -52,9 +57,11 @@ from pixedit.session import Session
 from pixedit.session.core import START_HINT
 from pixedit.tools.base import Tool, builtin_tools
 from pixedit.ui.canvas import CanvasView, _is_clear_shortcut
+from pixedit.ui.clipboard import copy_image, image_from_clipboard
 from pixedit.ui.dialogs import (
     AboutDialog,
     CanvasSizeDialog,
+    FeatherDialog,
     ImageSizeDialog,
     LiveFilterDialog,
     NewDocumentDialog,
@@ -368,6 +375,12 @@ class MainWindow(QMainWindow):
         )
         clear_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
         clear_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        edit_menu.addSeparator()
+        # Ctrl+C stays "copy to a new layer". Clipboard copy is a different
+        # action, so it takes Shift. Paste is the standard key. A focused
+        # text field still receives Ctrl+V.
+        self._action(edit_menu, "Copy to clipboard", self._copy_to_clipboard, QKeySequence("Ctrl+Shift+C"))
+        self._action(edit_menu, "Paste", self._paste_from_clipboard, QKeySequence.StandardKey.Paste)
 
         self._action(image_menu, "Crop to selection", self._crop_selection, icon="crop-to-selection")
         self._action(image_menu, "Trim transparent edges", self.session.trim)
@@ -436,6 +449,7 @@ class MainWindow(QMainWindow):
         self._action(select_menu, "All", self.session.select_all, QKeySequence.StandardKey.SelectAll, icon="select-all")
         select_menu.addAction(self._deselect_action)
         self._action(select_menu, "Invert", self.session.invert_selection, QKeySequence("Ctrl+Shift+I"), icon="select-invert")
+        self._action(select_menu, "Feather…", self._feather_selection)
         select_menu.addSeparator()
         select_menu.addAction(self._cut_action)
         select_menu.addAction(self._copy_action)
@@ -842,6 +856,43 @@ class MainWindow(QMainWindow):
 
     def _toast(self, text: str) -> None:
         self.statusBar().showMessage(text, 4000)
+
+    def _copy_to_clipboard(self) -> None:
+        """Write the selection, or the active layer, to the system clipboard."""
+        image = self.session.image_for_clipboard()
+        if image is None:
+            return
+        copy_image(image)
+
+    def _paste_from_clipboard(self) -> None:
+        """Paste an image as a new layer, or text when a text field is focused.
+
+        The Paste shortcut belongs to this window, so it runs before a line
+        edit sees Ctrl+V. A text field still has to paste text, even when no
+        page is open. Pixel paste needs a page and does not resize that page.
+        """
+        editor = _focused_text_editor()
+        if editor is not None:
+            editor.paste()
+            return
+        if not self.session.require_page():
+            return
+        image = image_from_clipboard()
+        if image is None:
+            self.session.show_message("The clipboard has no image.")
+            return
+        self.session.paste_image(image)
+
+    def _feather_selection(self) -> None:
+        if not self.session.require_page():
+            return
+        if self.session.document.selection is None:
+            self.session.show_message("No selection. Draw one with Select (S), then Feather softens its edge.")
+            return
+        dialog = FeatherDialog(self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self.session.feather_selection(dialog.radius())
 
     def _prompt_text(self, initial):
         dialog = TextDialog(initial, self)
@@ -1316,6 +1367,14 @@ class _VersionLabel(QLabel):
             if opener is not None:
                 opener()
         super().mouseReleaseEvent(event)
+
+
+def _focused_text_editor():
+    """The focused line, text, or spin box, when it should keep Ctrl+V."""
+    widget = QApplication.focusWidget()
+    if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+        return widget
+    return None
 
 
 def paths_from_drop(event) -> list[str]:

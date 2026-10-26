@@ -64,6 +64,9 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
     assert any("Vignette" in label for label in labels)
     assert any("Trim" in label for label in labels)
     assert any("Clear selection contents" in label for label in labels)
+    assert any(label == "Copy to clipboard" for label in labels)
+    assert any(label == "Paste" for label in labels)
+    assert any(label == "Feather…" for label in labels)
     assert "example.marker" in window.tool_by_id
     assert "mask" in window.tool_by_id
     for tool_id, button in window._buttons.items():
@@ -1809,6 +1812,87 @@ def test_layer_list_draws_background_and_opened_project(tmp_path):
         assert layers.visualItemRect(item).height() > 0
         names.append(item.text(0).split()[0])
     assert names == ["Blur", "Caption", "Photo"]
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
+def test_clipboard_round_trip_paste_and_feather_outline():
+    """Copy keeps alpha, paste does not resize the page, and a text field keeps Ctrl+V."""
+    import numpy as np
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication, QLineEdit
+
+    from pixedit.session.core import START_HINT
+    from pixedit.ui.canvas import _selection_core, _selection_tint
+    from pixedit.ui.clipboard import image_from_clipboard
+    from pixedit.ui.dialogs import FeatherDialog, ShortcutsDialog
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    app.clipboard().clear()
+    window.canvas.setFocus()
+    app.processEvents()
+    # Launch has no page, so paste says how to start one instead of reading the clipboard.
+    window._paste_from_clipboard()
+    assert window.statusBar().currentMessage() == START_HINT
+    window.session.new_canvas(20, 20, "white")
+    window._paste_from_clipboard()
+    assert "no image" in window.statusBar().currentMessage().lower()
+
+    # A click-focused text field keeps Ctrl+V. The color code bounces
+    # programmatic focus back to the canvas, so this uses its own line edit.
+    edit = QLineEdit(window)
+    edit.show()
+    edit.setFocus(Qt.FocusReason.MouseFocusReason)
+    app.processEvents()
+    assert app.focusWidget() is edit
+    app.clipboard().setText("abc")
+    layers = len(window.session.document.layers)
+    window._paste_from_clipboard()
+    assert edit.text() == "abc"
+    assert len(window.session.document.layers) == layers
+    edit.hide()
+
+    window.canvas.setFocus()
+    app.processEvents()
+    window.session.new_canvas(20, 20, "white")
+    window.session.active_layer().image = Image.new("RGBA", (20, 20), (255, 0, 0, 128))
+    window._copy_to_clipboard()
+    copied = image_from_clipboard()
+    assert copied is not None
+    assert copied.getpixel((4, 4))[:3] == (255, 0, 0)
+    assert abs(copied.getpixel((4, 4))[3] - 128) <= 1
+
+    window.session.new_canvas(10, 10, "white")
+    window._paste_from_clipboard()
+    assert (window.session.document.width, window.session.document.height) == (10, 10)
+    pasted = window.session.active_layer()
+    assert pasted.image.size == (20, 20)
+    assert (pasted.x, pasted.y) == (-5, -5)
+
+    dialog = FeatherDialog(window)
+    assert dialog.pixels.minimum() == 1
+    assert dialog.pixels.maximum() == 250
+    assert dialog.radius() == 8
+    guide = ShortcutsDialog(window)
+    text = guide.layout().itemAt(0).widget().text()
+    assert "Ctrl+Shift+C" in text
+    assert "Feather" in text
+
+    mask = np.zeros((5, 5), np.uint8)
+    mask[1:4, 1:4] = 255
+    mask[0, 2] = 100
+    core = _selection_core(mask)
+    assert core[2, 2] and not core[0, 2]
+    tint = np.asarray(_selection_tint(Image.fromarray(mask, "L")))
+    assert int(tint[2, 2, 3]) == 70
+    assert int(tint[1, 1, 3]) == 220
+    assert 0 < int(tint[0, 2, 3]) < 70
+
     window.session.dirty = False
     window.close()
     app.processEvents()

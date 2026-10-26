@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw
 
+from pixedit.adjust import desaturate
 from pixedit.factory import raster_layer, redaction_layer
 from pixedit.model import new_document
 from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing, wand_mask
@@ -1134,3 +1135,180 @@ def test_brush_preview_shows_size_hardness_opacity_and_eraser_hole():
     assert hole[48, 88, 3] == 0
     soft_hole = np.array(brush_preview_image(48, 0.0, 1.0, color, erase=True))
     assert 0 < int(soft_hole[48, 108, 3]) < 255
+
+
+def test_clipboard_copy_and_paste_keep_the_page_size():
+    session = Session(new_document(20, 20, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    redacted = redaction_layer("Hide", Image.new("L", (20, 20), 0), "blur", 4)
+    session.add_layer(redacted)
+    session.layer_index = session.document.index_of(redacted.id)
+    assert session.image_for_clipboard() is None
+    assert any("mask" in message.lower() for message in messages)
+
+    session.layer_index = 0
+    session.active_layer().image = Image.new("RGBA", (20, 20), (0, 0, 0, 0))
+    messages.clear()
+    assert session.image_for_clipboard() is None
+    assert any("no opaque" in message.lower() for message in messages)
+
+    session.active_layer().image = Image.new("RGBA", (20, 20), (255, 0, 0, 255))
+    draw = ImageDraw.Draw(session.active_layer().image)
+    draw.rectangle((4, 4, 15, 15), fill=(0, 0, 255, 255))
+    whole = session.image_for_clipboard()
+    assert whole is not None and whole.size == (20, 20)
+    assert whole.getpixel((6, 6))[:3] == (0, 0, 255)
+    assert len(session.document.layers) == 2
+
+    mask = Image.new("L", (20, 20), 0)
+    mask.paste(255, (4, 4, 10, 10))
+    session.set_selection(mask)
+    selected = session.image_for_clipboard()
+    assert selected is not None
+    assert selected.size == (6, 6)
+    assert selected.getpixel((2, 2))[:3] == (0, 0, 255)
+    assert session.document.selection is not None
+
+    soft = Image.new("L", (20, 20), 0)
+    soft.paste(128, (4, 4, 10, 10))
+    session.set_selection(soft)
+    faded = session.image_for_clipboard()
+    assert faded is not None
+    assert faded.getpixel((2, 2))[2] == 255
+    assert abs(faded.getpixel((2, 2))[3] - 128) <= 1
+
+    session.deselect()
+    wide = Image.new("RGBA", (30, 10), (0, 255, 0, 255))
+    steps = len(session.history.undo_stack)
+    session.paste_image(wide)
+    assert (session.document.width, session.document.height) == (20, 20)
+    pasted = session.active_layer()
+    assert pasted.name == "Pasted"
+    assert pasted.image.size == (30, 10)
+    assert (pasted.x, pasted.y) == (-5, 5)
+    from pixedit.composite import composite
+
+    flat = composite(session.document)
+    assert flat.size == (20, 20)
+    assert flat.getpixel((0, 8))[1] > 200
+    assert flat.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert len(session.history.undo_stack) == steps + 1
+    assert session.history.undo_stack[-1].name == "Paste"
+    session.undo()
+    assert len(session.document.layers) == 2
+    assert (session.document.width, session.document.height) == (20, 20)
+
+    empty = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    messages.clear()
+    session.paste_image(empty)
+    assert any("no opaque" in message.lower() for message in messages)
+    assert len(session.document.layers) == 2
+
+    first_id = session.document.active_group_id
+    session.add_group()
+    assert session.document.active_group_id != first_id
+    session.paste_image(Image.new("RGBA", (4, 4), (9, 9, 9, 255)))
+    assert session.active_layer().name == "Pasted"
+    assert (session.document.width, session.document.height) == (20, 20)
+    session.activate_group(first_id)
+    assert all(layer.name != "Pasted" for layer in session.document.layers)
+
+
+def test_feather_softens_the_selection_and_fades_edits():
+    session = Session(new_document(48, 48, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    session.feather_selection(8)
+    assert any("No selection" in message for message in messages)
+
+    session.select_all()
+    messages.clear()
+    steps = len(session.history.undo_stack)
+    session.feather_selection(9999)
+    assert any("250" in message and "did not change" in message for message in messages)
+    assert len(session.history.undo_stack) == steps
+
+    dot = Image.new("L", (48, 48), 0)
+    dot.putpixel((24, 24), 255)
+    session.set_selection(dot)
+    messages.clear()
+    steps = len(session.history.undo_stack)
+    kept = session.document.selection
+    session.feather_selection(40)
+    assert session.document.selection is kept
+    assert kept.getpixel((24, 24)) == 255
+    assert any("clears the selection" in message for message in messages)
+    assert len(session.history.undo_stack) == steps
+
+    mask = Image.new("L", (48, 48), 0)
+    mask.paste(255, (12, 12, 36, 36))
+    session.set_selection(mask)
+    messages.clear()
+    session.feather_selection(0)
+    assert any("by 1 px" in message for message in messages)
+    session.undo()
+    session.feather_selection(4)
+    sel = np.asarray(session.document.selection)
+    assert sel[24, 24] == 255
+    assert 0 < int(sel[8, 24]) < 128
+    assert int(sel[0, 0]) == 0
+    assert session.history.undo_stack[-1].name == "Feather"
+    hard = sel.copy()
+    session.invert_selection()
+    inverted = np.asarray(session.document.selection)
+    assert int(inverted[24, 24]) == 255 - int(hard[24, 24])
+    assert int(inverted[8, 24]) == 255 - int(hard[8, 24])
+    session.undo()
+    session.deselect()
+    assert session.document.selection is None
+    session.undo()
+    assert session.document.selection is not None
+
+    session.set_selection(Image.fromarray(hard, "L"))
+    layer = session.active_layer()
+    layer.image = Image.new("RGBA", (48, 48), (255, 0, 0, 255))
+    session.run_filter("Desaturate", desaturate)
+    graded = np.asarray(layer.image)
+    assert graded[24, 24, 1] > 40 and graded[24, 24, 0] < 80
+    assert tuple(graded[0, 0, :3]) == (255, 0, 0)
+    assert graded[8, 24, 1] > 0
+    assert graded[8, 24, 0] > graded[8, 24, 1]
+
+    session.undo()
+    session.clear_selection_contents()
+    cleared = np.asarray(session.active_layer().image)
+    assert cleared[24, 24, 3] == 0
+    assert abs(int(cleared[8, 24, 3]) - int(round(255 * (1 - hard[8, 24] / 255.0)))) <= 1
+    assert cleared[0, 0, 3] == 255
+
+    paint = Session(new_document(40, 40, "transparent"))
+    half = Image.new("L", (40, 40), 0)
+    half.paste(128, (0, 0, 20, 40))
+    half.paste(255, (20, 0, 40, 40))
+    paint.set_selection(half)
+    paint.foreground = (0, 0, 255, 255)
+    paint.options["brush_size"] = 6
+    paint.options["brush_hardness"] = 100
+    paint.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(paint, PointerEvent(10, 20))
+    brush.pointer_up(paint, PointerEvent(10, 20))
+    soft_alpha = paint.active_layer().image.getpixel((10, 20))[3]
+    brush.pointer_down(paint, PointerEvent(30, 20))
+    brush.pointer_up(paint, PointerEvent(30, 20))
+    assert paint.active_layer().image.getpixel((30, 20))[3] == 255
+    assert abs(soft_alpha - 128) <= 8
+
+    white = Image.new("RGBA", (20, 20), (255, 255, 255, 255))
+    gate = Image.new("L", (20, 20), 0)
+    gate.paste(255, (0, 0, 10, 20))
+    gate.paste(128, (10, 0, 20, 20))
+    filled = fill_region(white, 2, 2, 0, (0, 0, 255, 255), gate)
+    assert filled.getpixel((2, 2)) == (0, 0, 255, 255)
+    # White and blue share a full blue channel, so the fade shows up in red.
+    mixed = filled.getpixel((15, 2))
+    assert abs(mixed[0] - 127) <= 2
+    assert abs(mixed[1] - 127) <= 2
+    assert mixed[2] == 255
+    assert mixed[3] == 255
