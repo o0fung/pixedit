@@ -6,11 +6,14 @@ import math
 
 from pixedit.geom import (
     _orbit_point,
+    clip_box,
     hit_layer,
     layer_union_bounds,
+    placed_box,
     rotate_visual_around,
     scale_visual_in_box,
     size_from_anchor,
+    union_boxes,
 )
 from pixedit.guides import snap_delta, snap_point
 from pixedit.model import (
@@ -146,6 +149,84 @@ class TransformTool(Tool):
     def pointer_move(self, session, event: PointerEvent) -> None:
         if self._mode is None or not self._starts or self._start_box is None:
             return
+        self._apply(session, event, final=False)
+        rows = self._rows(session, self._ids, self._starts, self._origins)
+        session.preview(self._changed_box(session, rows))
+
+    def _changed_box(self, session, rows) -> tuple[int, int, int, int] | None:
+        """Document rectangle covering where the layers were and where they are."""
+        doc = session.document
+        box = None
+        for layer, start, _origin in rows:
+            box = union_boxes(box, placed_box(layer, doc.width, doc.height))
+            image = start["image"]
+            box = union_boxes(
+                box,
+                clip_box(
+                    (int(start["x"]), int(start["y"]), int(start["x"]) + image.width, int(start["y"]) + image.height),
+                    doc.width,
+                    doc.height,
+                ),
+            )
+        return box
+
+    def _scale_group(
+        self,
+        rows: list[tuple[Layer, dict, tuple[int, int]]],
+        event: PointerEvent,
+        *,
+        final: bool,
+    ) -> None:
+        assert self._start_box is not None
+        box = self._start_box
+        _left, _top, width, height = size_from_anchor(
+            self._anchor,
+            (event.x, event.y),
+            lock_aspect=event.shift,
+            aspect=box[2] / max(box[3], 1e-6),
+        )
+        new_w = max(1, int(round(width)))
+        new_h = max(1, int(round(height)))
+        scale_x = new_w / max(box[2], 1e-6)
+        scale_y = new_h / max(box[3], 1e-6)
+        for layer, start, _origin in rows:
+            apply_visual(
+                layer,
+                scale_visual_in_box(
+                    start,
+                    self._anchor,
+                    self._anchor_name,
+                    scale_x,
+                    scale_y,
+                    zoom=event.zoom,
+                    final=final,
+                ),
+            )
+
+    def _rotate_group(
+        self,
+        rows: list[tuple[Layer, dict, tuple[int, int]]],
+        event: PointerEvent,
+        *,
+        final: bool,
+    ) -> None:
+        assert self._start_box is not None
+        x, y, width, height = self._start_box
+        cx = x + width / 2.0
+        cy = y + height / 2.0
+        angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
+        # Screen Y grows downward, so atan2 increases clockwise. Wrap so the
+        # gesture doesn't jump at ±180. Same rule as a single layer.
+        # The frame turns by this angle and ignores the bitmap bounds, which
+        # grow into a straight box as the rectangle turns.
+        delta = (angle - self._start_angle + 180.0) % 360.0 - 180.0
+        self._angle = delta
+        center = (cx, cy)
+        for layer, start, _origin in rows:
+            apply_visual(layer, rotate_visual_around(start, delta, center, zoom=event.zoom, final=final))
+
+    def _apply(self, session, event: PointerEvent, *, final: bool) -> None:
+        """Move, scale, or rotate. ``final`` resamples at full resolution."""
         rows = self._rows(session, self._ids, self._starts, self._origins)
         if self._mode == "move":
             dx = event.x - self._start_mouse[0]
@@ -172,59 +253,30 @@ class TransformTool(Tool):
                 bool(session.option("snap", True)),
             )
             snapped = PointerEvent(sx, sy, event.shift, event.alt, event.ctrl, event.button, event.zoom)
-            self._scale_group(rows, snapped)
+            self._scale_group(rows, snapped, final=final)
         elif self._mode == "rot":
-            self._rotate_group(rows, event)
-        session.preview()
-
-    def _scale_group(self, rows: list[tuple[Layer, dict, tuple[int, int]]], event: PointerEvent) -> None:
-        assert self._start_box is not None
-        box = self._start_box
-        _left, _top, width, height = size_from_anchor(
-            self._anchor,
-            (event.x, event.y),
-            lock_aspect=event.shift,
-            aspect=box[2] / max(box[3], 1e-6),
-        )
-        new_w = max(1, int(round(width)))
-        new_h = max(1, int(round(height)))
-        scale_x = new_w / max(box[2], 1e-6)
-        scale_y = new_h / max(box[3], 1e-6)
-        for layer, start, _origin in rows:
-            apply_visual(layer, scale_visual_in_box(start, self._anchor, self._anchor_name, scale_x, scale_y))
-
-    def _rotate_group(self, rows: list[tuple[Layer, dict, tuple[int, int]]], event: PointerEvent) -> None:
-        assert self._start_box is not None
-        x, y, width, height = self._start_box
-        cx = x + width / 2.0
-        cy = y + height / 2.0
-        angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
-        # Screen Y grows downward, so atan2 increases clockwise. Wrap so the
-        # gesture doesn't jump at ±180. Same rule as a single layer.
-        # The frame turns by this angle and ignores the bitmap bounds, which
-        # grow into a straight box as the rectangle turns.
-        delta = (angle - self._start_angle + 180.0) % 360.0 - 180.0
-        self._angle = delta
-        center = (cx, cy)
-        for layer, start, _origin in rows:
-            apply_visual(layer, rotate_visual_around(start, delta, center))
+            self._rotate_group(rows, event, final=final)
 
     def pointer_up(self, session, event: PointerEvent) -> None:
         if self._mode is None or not self._starts:
             return
-        self.pointer_move(session, event)
         mode = self._mode
         ids = list(self._ids)
         starts = list(self._starts)
         origins = list(self._origins)
         moved = math.hypot(event.x - self._start_mouse[0], event.y - self._start_mouse[1])
-        self._clear()
-        rows = self._rows(session, ids, starts, origins)
         if moved < 0.5:
+            rows = self._rows(session, ids, starts, origins)
             for layer, start, _origin in rows:
                 apply_visual(layer, start)
+            self._clear()
             session.preview()
             return
+        # The drag showed a stand-in when the layer was large. Release writes
+        # the Lanczos or bicubic pixels that get stored.
+        self._apply(session, event, final=True)
+        self._clear()
+        rows = self._rows(session, ids, starts, origins)
         if mode == "move":
             session.commit_layer_moves(
                 [(layer, layer.x, layer.y, origin[0], origin[1]) for layer, _start, origin in rows]

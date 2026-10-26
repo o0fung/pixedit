@@ -11,8 +11,9 @@ from typing import Callable
 from PIL import Image
 
 from pixedit.adjust import apply_masked, color_grade
-from pixedit.geom import selection_for_layer
+from pixedit.geom import placed_box, selection_for_layer
 from pixedit.model import Layer, MutateLayerCommand, apply_visual, visual_state
+from pixedit.proxy import downscale, preview_scale, set_preview_source
 
 _COLOR_OPTION_KEYS = (
     "color_hue",
@@ -46,6 +47,8 @@ class ColorMixin:
         layer = self._color_layer
         self._color_before = None
         self._color_layer = None
+        if layer is not None:
+            set_preview_source(layer, None)
         if before is None or layer is None:
             return False
         apply_visual(layer, before)
@@ -97,6 +100,7 @@ class ColorMixin:
         values = self.color_adjust_values()
         if self._color_is_neutral(values):
             if self._color_before is not None and self._color_layer is layer:
+                set_preview_source(layer, None)
                 apply_visual(layer, self._color_before)
                 self._color_before = None
                 self._color_layer = None
@@ -105,25 +109,38 @@ class ColorMixin:
         if self._color_before is None:
             self._color_before = visual_state(layer)
             self._color_layer = layer
-        self._paint_color_preview(layer)
-        self.preview()
+        self._paint_color_preview(layer, final=False)
+        self.preview(placed_box(layer, self.document.width, self.document.height))
 
-    def _paint_color_preview(self, layer: Layer) -> None:
+    def _paint_color_preview(self, layer: Layer, *, final: bool) -> None:
         before = self._color_before
         if before is None:
             return
         values = self.color_adjust_values()
-        edited = color_grade(
-            before["image"],
-            hue=values["color_hue"],
-            saturation=values["color_saturation"],
-            brightness=values["color_brightness"],
-            contrast=values["color_contrast"],
-            highlight=values["color_highlight"],
-            shade=values["color_shade"],
-        )
+        source = before["image"]
         selection = selection_for_layer(self.document, layer)
-        layer.image = apply_masked(before["image"], edited, selection)
+        zoom = float(getattr(self, "view_zoom", 1.0) or 1.0)
+        scale = 1.0 if final else preview_scale(source.width, source.height, zoom)
+
+        def grade(image: Image.Image) -> Image.Image:
+            return color_grade(
+                image,
+                hue=values["color_hue"],
+                saturation=values["color_saturation"],
+                brightness=values["color_brightness"],
+                contrast=values["color_contrast"],
+                highlight=values["color_highlight"],
+                shade=values["color_shade"],
+            )
+
+        if scale >= 1.0:
+            set_preview_source(layer, None)
+            layer.image = apply_masked(source, grade(source), selection)
+        else:
+            small = downscale(source, scale)
+            small_selection = None if selection is None else selection.resize(small.size, Image.Resampling.NEAREST)
+            layer.image = source
+            set_preview_source(layer, apply_masked(small, grade(small), small_selection))
         # Text is shown as pixels for the preview. Cancel restores ``before``,
         # which still has the text metadata. Apply keeps the pixels.
         layer.kind = "raster"
@@ -136,7 +153,7 @@ class ColorMixin:
         if layer is None or before is None or self._color_is_neutral():
             self.cancel_color_adjust()
             return
-        self._paint_color_preview(layer)
+        self._paint_color_preview(layer, final=True)
         new_state = visual_state(layer)
         new_state["kind"] = "raster"
         new_state["text"] = None

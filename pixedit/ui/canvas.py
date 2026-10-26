@@ -10,7 +10,7 @@ from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, QRectF, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygon, QPolygonF
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from pixedit.composite import composite, composite_region, composite_view, shows_redaction
+from pixedit.composite import composite, composite_region, composite_view, redaction_padding, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
@@ -85,7 +85,9 @@ def pil_to_pixmap(image: Image.Image) -> QPixmap:
     rgba = image.convert("RGBA")
     data = rgba.tobytes("raw", "RGBA")
     qimage = QImage(data, rgba.width, rgba.height, rgba.width * 4, QImage.Format.Format_RGBA8888)
-    return QPixmap.fromImage(qimage.copy())
+    # fromImage copies the pixels, so the extra QImage copy is not needed.
+    # ``data`` stays alive until that copy returns.
+    return QPixmap.fromImage(qimage)
 
 
 class CanvasView(QWidget):
@@ -976,7 +978,9 @@ class CanvasView(QWidget):
             return False
         if self._pixmap.width() != doc.width or self._pixmap.height() != doc.height:
             return False
-        if shows_redaction(doc):
+        # Noise grain is one field the size of the page. Other masks can be
+        # patched: composite_region pads the sample and crops it back.
+        if redaction_padding(doc) is None:
             return False
         box = _clip_document_box(doc.width, doc.height, bounds)
         if box is None:

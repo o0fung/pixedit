@@ -6,10 +6,11 @@ import math
 
 from PIL import Image
 
-from pixedit.geom import grow_layer_to_cover, selection_for_layer
+from pixedit.geom import grow_layer_to_cover, placed_box, selection_for_layer
 from pixedit.guides import snap_point
 from pixedit.model import Layer
 from pixedit.paint import draw_gradient
+from pixedit.proxy import downscale, preview_scale, set_preview_source
 from pixedit.tools.base import PointerEvent, Tool
 
 
@@ -44,6 +45,7 @@ class GradientTool(Tool):
         self._created = False
         self._snap_image: Image.Image | None = None
         self._snap_xy = (0, 0)
+        self._base: Image.Image | None = None
 
     def option_schema(self):
         return [
@@ -82,7 +84,7 @@ class GradientTool(Tool):
             self._cancel_edit(session)
             session.preview()
             return
-        self._show_preview(session)
+        self._show_preview(session, final=True)
         layer, before, created = self._take_edit()
         if layer is None:
             return
@@ -107,33 +109,54 @@ class GradientTool(Tool):
         self._created = created
         self._snap_image = layer.image.copy()
         self._snap_xy = (layer.x, layer.y)
-
-    def _restore_snap(self) -> None:
-        if self._layer is None or self._snap_image is None:
-            return
-        self._layer.image = self._snap_image.copy()
-        self._layer.x, self._layer.y = self._snap_xy
-
-    def _show_preview(self, session) -> None:
-        self._ensure_edit(session)
-        self._restore_snap()
-        layer = self._layer
-        if layer is None:
-            return
-        # The blend covers the page, not just the drag line. A selection
-        # still limits it, the same way a shape is clipped.
+        layer.image = self._snap_image.copy()
+        # The blend covers the page. Grow once so later moves do not allocate
+        # another full plate just to throw the previous one away.
         grow_layer_to_cover(layer, (0, 0, session.document.width, session.document.height))
-        ox, oy = float(layer.x), float(layer.y)
-        layer.image = draw_gradient(
-            layer.image,
-            str(session.option("gradient_kind", "linear")),
-            (self._start[0] - ox, self._start[1] - oy),
-            (self._end[0] - ox, self._end[1] - oy),
-            session.foreground,
-            gradient_end_color(session),
-            selection_for_layer(session.document, layer),
-        )
-        session.preview()
+        self._base = layer.image
+
+    def _show_preview(self, session, *, final: bool = False) -> None:
+        self._ensure_edit(session)
+        layer = self._layer
+        base = getattr(self, "_base", None)
+        if layer is None or base is None:
+            return
+        kind = str(session.option("gradient_kind", "linear"))
+        selection = selection_for_layer(session.document, layer)
+        zoom = float(getattr(session, "view_zoom", 1.0) or 1.0)
+        scale = 1.0 if final else preview_scale(base.width, base.height, zoom)
+        if scale >= 1.0:
+            set_preview_source(layer, None)
+            ox, oy = float(layer.x), float(layer.y)
+            layer.image = draw_gradient(
+                base,
+                kind,
+                (self._start[0] - ox, self._start[1] - oy),
+                (self._end[0] - ox, self._end[1] - oy),
+                session.foreground,
+                gradient_end_color(session),
+                selection,
+            )
+        else:
+            # Keep the full plate underneath. The stand-in is what the canvas
+            # scales into that rectangle until release draws the real gradient.
+            layer.image = base
+            small = downscale(base, scale)
+            small_selection = None if selection is None else selection.resize(small.size, Image.Resampling.NEAREST)
+            ox, oy = float(layer.x), float(layer.y)
+            set_preview_source(
+                layer,
+                draw_gradient(
+                    small,
+                    kind,
+                    ((self._start[0] - ox) * scale, (self._start[1] - oy) * scale),
+                    ((self._end[0] - ox) * scale, (self._end[1] - oy) * scale),
+                    session.foreground,
+                    gradient_end_color(session),
+                    small_selection,
+                ),
+            )
+        session.preview(placed_box(layer, session.document.width, session.document.height))
 
     def _take_edit(self) -> tuple[Layer | None, dict | None, bool]:
         layer, before, created = self._layer, self._before, self._created
@@ -141,6 +164,9 @@ class GradientTool(Tool):
         self._before = None
         self._created = False
         self._snap_image = None
+        self._base = None
+        if layer is not None:
+            set_preview_source(layer, None)
         return layer, before, created
 
     def _cancel_edit(self, session) -> None:

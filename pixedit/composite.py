@@ -23,6 +23,7 @@ from PIL import Image
 from pixedit.geom import alpha_bbox, covers_document
 from pixedit.model import BLEND_MODES, Document, Layer, LayerGroup, masks_for
 from pixedit.pixels import mask_effect
+from pixedit.proxy import layer_sample
 
 # geom.place_image is imported lazily inside mask placement to keep import
 # order boring: composite -> model, and geom -> model, neither imports the other
@@ -132,6 +133,45 @@ def _intersection(
     return x0, y0, x1 - x0, y1 - y0, x0 - ax, y0 - ay
 
 
+def _read_sample(
+    layer: Layer,
+    sx0: float,
+    sy0: float,
+    sx1: float,
+    sy1: float,
+    dest_w: int,
+    dest_h: int,
+    resample: Image.Resampling,
+) -> Image.Image:
+    """Pixels of ``layer`` covering layer-space ``(sx0, sy0, sx1, sy1)``.
+
+    A live stand-in is a reduced copy of the same rectangle. It is scaled up
+    to the destination here, so the drag never has to store a full-size preview.
+    """
+    sample, scale_x, scale_y = layer_sample(layer)
+    box = (sx0 * scale_x, sy0 * scale_y, sx1 * scale_x, sy1 * scale_y)
+    if dest_w < 1 or dest_h < 1:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    exact = (
+        scale_x == 1.0
+        and scale_y == 1.0
+        and dest_w == int(round(sx1 - sx0))
+        and dest_h == int(round(sy1 - sy0))
+        and float(sx0).is_integer()
+        and float(sy0).is_integer()
+    )
+    if exact:
+        return sample.crop((int(sx0), int(sy0), int(sx0) + dest_w, int(sy0) + dest_h))
+    sw, sh = sample.size
+    x0 = min(max(0.0, box[0]), float(sw))
+    y0 = min(max(0.0, box[1]), float(sh))
+    x1 = min(max(x0, box[2]), float(sw))
+    y1 = min(max(y0, box[3]), float(sh))
+    if x1 - x0 < 1e-4 or y1 - y0 < 1e-4:
+        return Image.new("RGBA", (dest_w, dest_h), (0, 0, 0, 0))
+    return sample.resize((dest_w, dest_h), resample, box=(x0, y0, x1, y1))
+
+
 def blit_layer(canvas: np.ndarray, layer: Layer, origin_x: int = 0, origin_y: int = 0) -> np.ndarray:
     image = layer.image
     overlap = _intersection(
@@ -145,19 +185,30 @@ def blit_layer(canvas: np.ndarray, layer: Layer, origin_x: int = 0, origin_y: in
     if overlap is None or layer.opacity <= 0:
         return canvas
     x0, y0, width, height, sx, sy = overlap
-    cropped = image.crop((sx, sy, sx + width, sy + height))
+    cropped = _read_sample(layer, sx, sy, sx + width, sy + height, width, height, Image.Resampling.BOX)
     src = pil_to_float(cropped)
     dst = canvas[y0 : y0 + height, x0 : x0 + width]
     canvas[y0 : y0 + height, x0 : x0 + width] = blend_arrays(dst, src, layer.opacity, layer.blend_mode)
     return canvas
 
 
-def mask_to_canvas(layer: Layer, width: int, height: int) -> np.ndarray:
-    """Place a redaction mask into a float HxW array covering the document."""
+def mask_to_canvas(layer: Layer, width: int, height: int, origin_x: int = 0, origin_y: int = 0) -> np.ndarray:
+    """Place a redaction mask into a float HxW array.
+
+    ``(origin_x, origin_y)`` is the document pixel at the buffer's top-left,
+    so a partial flatten can hold a crop instead of the whole page.
+    """
     full = np.zeros((height, width), dtype=np.float32)
     if layer.mask is None:
         return full
-    overlap = _intersection(layer.x, layer.y, layer.mask.width, layer.mask.height, width, height)
+    overlap = _intersection(
+        layer.x - origin_x,
+        layer.y - origin_y,
+        layer.mask.width,
+        layer.mask.height,
+        width,
+        height,
+    )
     if overlap is None:
         return full
     x0, y0, mw, mh, sx, sy = overlap
@@ -166,7 +217,9 @@ def mask_to_canvas(layer: Layer, width: int, height: int) -> np.ndarray:
     return full
 
 
-def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
+def apply_redaction(
+    canvas: np.ndarray, layer: Layer, origin_x: int = 0, origin_y: int = 0
+) -> np.ndarray:
     """Mix the mask effect through ``layer``'s mask.
 
     ``canvas`` is the picture the mask belongs to, not the stack underneath.
@@ -174,7 +227,7 @@ def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
     fades the effect.
     """
     height, width = canvas.shape[:2]
-    mask = mask_to_canvas(layer, width, height) * float(layer.opacity)
+    mask = mask_to_canvas(layer, width, height, origin_x, origin_y) * float(layer.opacity)
     if float(mask.max()) <= 0.0:
         return canvas
     info = layer.redaction
@@ -188,8 +241,114 @@ def apply_redaction(canvas: np.ndarray, layer: Layer) -> np.ndarray:
 
 
 def shows_redaction(document: Document) -> bool:
-    """A visible mask layer. Blur and noise read outside a partial repaint."""
+    """A visible mask layer. The zoomed-out view cache does not downsample one."""
     return any(layer.visible and layer.opacity > 0 and layer.kind == "redaction" for layer in document.layers)
+
+
+def redaction_padding(document: Document) -> int | None:
+    """Extra pixels a partial flatten needs, or None when a crop cannot match.
+
+    Noise is one random field the size of the plate, so a crop would draw
+    different grain. Blur, pixelate, and sharpen read a neighborhood. Solid,
+    dim, invert, and desaturate are per pixel and need no padding.
+    """
+    pad = 0
+    for layer in document.layers:
+        if layer.kind != "redaction" or not layer.visible or layer.opacity <= 0:
+            continue
+        info = layer.redaction
+        kind = info.kind if info is not None else "pixelate"
+        amount = float(info.amount if info is not None else 12.0)
+        if kind == "noise":
+            return None
+        if kind == "blur":
+            pad = max(pad, int(math.ceil(amount * 2.0)) + 2)
+        elif kind == "pixelate":
+            pad = max(pad, max(1, int(round(amount))))
+        elif kind == "sharpen":
+            pad = max(pad, 4)
+    return pad
+
+
+def _pixelate_block(document: Document) -> int:
+    block = 1
+    for layer in document.layers:
+        if layer.kind != "redaction" or not layer.visible or layer.opacity <= 0:
+            continue
+        info = layer.redaction
+        kind = info.kind if info is not None else "pixelate"
+        if kind != "pixelate":
+            continue
+        amount = float(info.amount if info is not None else 12.0)
+        block = max(block, max(1, int(round(amount))))
+    return block
+
+
+# Reused full-page float plates. A later flatten clears the same array instead
+# of allocating another. Results are copied out before the next call.
+_FLOATS: dict[str, np.ndarray | None] = {"canvas": None, "solo": None}
+
+
+def _borrow_float(name: str, height: int, width: int) -> np.ndarray:
+    buf = _FLOATS.get(name)
+    if buf is None or buf.shape != (height, width, 4):
+        buf = np.zeros((height, width, 4), dtype=np.float32)
+        _FLOATS[name] = buf
+    else:
+        buf.fill(0)
+    return buf
+
+
+def _opaque_pixels(layer: Layer) -> np.ndarray | None:
+    """RGBA of an opaque Normal layer, or None when it has to be blended."""
+    if layer.opacity < 1.0 or layer.blend_mode != "normal":
+        return None
+    if getattr(layer, "preview_source", None) is not None:
+        return None
+    image = layer.image if layer.image.mode == "RGBA" else layer.image.convert("RGBA")
+    array = np.asarray(image)
+    if array.ndim != 3 or array.shape[-1] != 4 or array.shape[0] < 1 or array.shape[1] < 1:
+        return None
+    if int(array[..., 3].min()) != 255:
+        return None
+    return array
+
+
+def _composite_opaque(document: Document) -> Image.Image | None:
+    """Copy opaque Normal layers straight into a byte plate.
+
+    None when any visible pixel needs a blend, a mask, or a live stand-in.
+    Those stay on the float path so partial opacity does not change.
+    """
+    prepared: list[tuple[Layer, np.ndarray]] = []
+    for layer in document.layers:
+        if layer.kind == "redaction":
+            if layer.visible and layer.opacity > 0:
+                return None
+            continue
+        if not layer.visible or layer.opacity <= 0:
+            continue
+        if any(mask.visible and mask.opacity > 0 for mask in masks_for(document.layers, layer)):
+            return None
+        pixels = _opaque_pixels(layer)
+        if pixels is None:
+            return None
+        prepared.append((layer, pixels))
+    canvas = np.zeros((document.height, document.width, 4), dtype=np.uint8)
+    for layer, pixels in prepared:
+        overlap = _intersection(
+            layer.x,
+            layer.y,
+            int(pixels.shape[1]),
+            int(pixels.shape[0]),
+            document.width,
+            document.height,
+        )
+        if overlap is None:
+            continue
+        x0, y0, width, height, sx, sy = overlap
+        canvas[y0 : y0 + height, x0 : x0 + width] = pixels[sy : sy + height, sx : sx + width]
+    return Image.fromarray(canvas, "RGBA")
 
 
 def _plain_target(layer: Layer) -> Layer:
@@ -219,7 +378,7 @@ def target_with_masks(document: Document, target: Layer, masks: list[Layer]) -> 
     empty, so a blur samples this layer's pixels and transparency, not the
     pictures underneath.
     """
-    solo = np.zeros((document.height, document.width, 4), dtype=np.float32)
+    solo = _borrow_float("solo", document.height, document.width)
     blit_layer(solo, _plain_target(target))
     for mask in masks:
         if not mask.visible or mask.opacity <= 0:
@@ -314,10 +473,8 @@ def _blit_scaled(
     sy1 = min(max(0.0, to_src_y(iy1)), float(image.height))
     if sx1 - sx0 < 1e-4 or sy1 - sy0 < 1e-4:
         return
-    resized = image.resize(
-        (ix1 - ix0, iy1 - iy0),
-        Image.Resampling.BOX,
-        box=(sx0, sy0, sx1, sy1),
+    resized = _read_sample(
+        layer, sx0, sy0, sx1, sy1, ix1 - ix0, iy1 - iy0, Image.Resampling.BOX
     )
     src = pil_to_float(resized)
     dst = canvas[iy0:iy1, ix0:ix1]
@@ -355,17 +512,45 @@ def composite_view(
 def composite_region(document: Document, box: tuple[int, int, int, int]) -> Image.Image:
     """Flatten ``box`` so it matches ``composite`` cropped to the same pixels.
 
-    ``box`` is ``(x0, y0, x1, y1)`` already clipped to the document. Redaction
-    layers are skipped: blur and noise read pixels outside the box, so the
-    caller flattens the whole document when a mask is visible.
+    ``box`` is ``(x0, y0, x1, y1)`` already clipped to the document. A mask
+    that reads a neighborhood is given that padding, then the padding is
+    cropped off. Noise cannot be cropped, so that case flattens the page and
+    returns the box.
     """
+    if redaction_padding(document) is None:
+        x0, y0, x1, y1 = box
+        return composite(document).crop((x0, y0, x1, y1))
     x0, y0, x1, y1 = box
-    canvas = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.float32)
-    for layer in document.layers:
-        if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
+    pad = int(redaction_padding(document) or 0)
+    block = _pixelate_block(document)
+    ex0 = max(0, x0 - pad)
+    ey0 = max(0, y0 - pad)
+    if block > 1:
+        ex0 -= ex0 % block
+        ey0 -= ey0 % block
+    ex1 = min(document.width, x1 + pad)
+    ey1 = min(document.height, y1 + pad)
+    if block > 1:
+        ex1 = min(document.width, int(math.ceil(ex1 / block)) * block)
+        ey1 = min(document.height, int(math.ceil(ey1 / block)) * block)
+    if ex1 <= ex0 or ey1 <= ey0:
+        return Image.new("RGBA", (max(1, x1 - x0), max(1, y1 - y0)), (0, 0, 0, 0))
+    canvas = np.zeros((ey1 - ey0, ex1 - ex0, 4), dtype=np.float32)
+    layers = document.layers
+    for layer in layers:
+        if layer.kind == "redaction" or not layer.visible or layer.opacity <= 0:
             continue
-        blit_layer(canvas, layer, x0, y0)
-    return float_to_pil(canvas)
+        owned = [mask for mask in masks_for(layers, layer) if mask.visible and mask.opacity > 0]
+        if not owned:
+            blit_layer(canvas, layer, ex0, ey0)
+            continue
+        solo = np.zeros_like(canvas)
+        blit_layer(solo, _plain_target(layer), ex0, ey0)
+        for mask in owned:
+            solo = apply_redaction(solo, mask, ex0, ey0)
+        canvas = blend_arrays(canvas, solo, layer.opacity, layer.blend_mode)
+    flat = float_to_pil(canvas)
+    return flat.crop((x0 - ex0, y0 - ey0, x1 - ex0, y1 - ey0))
 
 
 def composite(document: Document) -> Image.Image:
@@ -374,8 +559,13 @@ def composite(document: Document) -> Image.Image:
     Masks are skipped on their own turn and applied when their picture is
     drawn. A hidden picture hides its masks. A hidden mask is left out of
     that picture's buffer, and the other masks of the same picture still run.
+    Opaque Normal layers are copied as bytes. Anything blended uses a reused
+    float plate so a second flatten does not allocate another one.
     """
-    canvas = np.zeros((document.height, document.width, 4), dtype=np.float32)
+    fast = _composite_opaque(document)
+    if fast is not None:
+        return fast
+    canvas = _borrow_float("canvas", document.height, document.width)
     layers = document.layers
     for layer in layers:
         if layer.kind == "redaction":
