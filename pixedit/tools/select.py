@@ -93,7 +93,9 @@ class SelectTool(Tool):
             self.extend_points(session, [(event.x, event.y)])
             return
         self._points.append((event.x, event.y))
-        session.preview()
+        # The rectangle and ellipse are chrome on top of the photo. A full
+        # preview would flatten the document on every move.
+        session.notify("overlay")
 
     def extend_points(self, session, points: list[tuple[float, float]]) -> None:
         """Append freehand samples. The canvas polls the cursor and flushes batches here.
@@ -156,7 +158,7 @@ class SelectTool(Tool):
         self._freehand = False
         self._points = []
         if active:
-            session.preview()
+            session.notify("overlay")
         return active
 
     def _mask(self, session, event: PointerEvent) -> Image.Image:

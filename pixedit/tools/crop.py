@@ -109,7 +109,8 @@ class CropTool(Tool):
             return
         self._end = (event.x, event.y)
         self._overlay_rect = self._crop_box(session, event)
-        session.preview()
+        # The crop window is drawn over the photo. Releasing is what changes pixels.
+        session.notify("overlay")
 
     def pointer_up(self, session, event: PointerEvent) -> None:
         if not self._dragging:
@@ -119,7 +120,7 @@ class CropTool(Tool):
         box = self._crop_box(session, event)
         self._overlay_rect = None
         if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 2:
-            session.preview()
+            session.notify("overlay")
             return
         session.crop_to(*box)
 
@@ -128,7 +129,7 @@ class CropTool(Tool):
         self._dragging = False
         self._overlay_rect = None
         if active:
-            session.preview()
+            session.notify("overlay")
         return active
 
     def overlays(self, session) -> list[Overlay]:

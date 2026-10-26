@@ -103,6 +103,26 @@ def test_redact_tool_is_undoable_and_nondestructive():
     assert np.array_equal(np.array(session.document.layers[0].image), before)
 
 
+def test_mask_drag_redraws_the_outline_without_flattening():
+    session = Session()
+    session.new_canvas(32, 32, "white")
+    notes: list[str] = []
+    session.add_listener(notes.append)
+    tool = MaskTool()
+    tool.pointer_down(session, PointerEvent(4, 4))
+    tool.pointer_move(session, PointerEvent(18, 12))
+    assert notes == ["overlay"]
+    assert all(layer.kind != "redaction" for layer in session.document.layers)
+    tool.pointer_cancel(session)
+    assert notes == ["overlay", "overlay"]
+
+    tool.pointer_down(session, PointerEvent(4, 4))
+    tool.pointer_up(session, PointerEvent(20, 18))
+    assert any(layer.kind == "redaction" for layer in session.document.layers)
+    assert "preview" not in notes
+    assert "change" in notes
+
+
 def _split_mask_doc(kind: str, amount: float, *, color=(0, 0, 0, 255), seed=7, fill=(200, 30, 30, 255)):
     image = Image.new("RGBA", (8, 8), fill)
     before = np.array(image)

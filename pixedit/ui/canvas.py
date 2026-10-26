@@ -10,7 +10,7 @@ from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, QRectF, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygon, QPolygonF
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from pixedit.composite import composite, composite_region, shows_redaction
+from pixedit.composite import composite, composite_region, composite_view, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
@@ -101,6 +101,12 @@ class CanvasView(QWidget):
         self.offset_y = 24.0
         self._pixmap: QPixmap | None = None
         self._dirty = True
+        # "full" is a document-sized pixmap. "view" is the visible rectangle at
+        # screen resolution, used while zoomed out so a large photo is not
+        # flattened at full size just to fit the window.
+        self._pixmap_mode = "full"
+        self._view_box: tuple[float, float, float, float] | None = None
+        self._view_key: tuple | None = None
         self._view_group_id = session.document.active_group_id
         # Zoom and pan for pages already visited. The first visit of a page fits it.
         self._group_views: dict[str, tuple[float, float, float]] = {}
@@ -338,9 +344,10 @@ class CanvasView(QWidget):
         )
         painter.setClipRect(ruler, ruler, max(0, self.width() - ruler), max(0, self.height() - ruler))
         self._paint_checker(painter, target)
+        dest = self._pixmap_dest(target)
         if self._pixmap is not None and not self._pixmap.isNull():
-            painter.drawPixmap(target, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
-        self._paint_selection(painter, target)
+            painter.drawPixmap(dest, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+        self._paint_selection(painter, dest)
         self._paint_ants(painter)
         self._paint_overlays(painter)
         painter.setClipping(False)
@@ -455,22 +462,125 @@ class CanvasView(QWidget):
         self.on_drop(event)
 
     def _ensure_pixmap(self) -> None:
-        if not self._dirty and self._pixmap is not None:
+        if self._pixmap_is_current():
             return
-        image = composite(self.session.document)
-        self._pixmap = pil_to_pixmap(image)
+        doc = self.session.document
+        box = self._visible_document_box() if self._use_view_cache() else None
+        if box is not None:
+            self._pixmap = pil_to_pixmap(composite_view(doc, box, self._view_scale()))
+            self._pixmap_mode = "view"
+            self._view_box = box
+            self._view_key = self._current_view_key()
+        else:
+            self._pixmap = pil_to_pixmap(composite(doc))
+            self._pixmap_mode = "full"
+            self._view_box = None
+            self._view_key = None
         self._dirty = False
+        self._sync_selection_chrome()
+
+    def _pixmap_is_current(self) -> bool:
+        if self._dirty or self._pixmap is None or self._pixmap.isNull():
+            return False
+        if self._use_view_cache():
+            return self._pixmap_mode == "view" and self._view_key == self._current_view_key()
+        return self._pixmap_mode == "full"
+
+    def _use_view_cache(self) -> bool:
+        """True when a screen-sized picture is enough and no mask needs the full plate.
+
+        At 100% and above the cache stays document-sized, so a brush patch lines
+        up with document pixels. A visible mask also stays on the full flatten:
+        blur and noise read pixels outside a downscaled rectangle.
+        """
+        doc = self.session.document
+        if self.zoom >= 1.0 or shows_redaction(doc):
+            return False
+        box = self._visible_document_box()
+        if box is None:
+            return False
+        x0, y0, x1, y1 = box
+        screen_w = (x1 - x0) * self._view_scale()
+        screen_h = (y1 - y0) * self._view_scale()
+        # Either edge being smaller than the document is enough. A wide window
+        # can show the full width at 1:1 and still only a strip of the height.
+        smaller = screen_w + 0.5 < doc.width or screen_h + 0.5 < doc.height
+        return smaller and screen_w >= 1 and screen_h >= 1
+
+    def _view_scale(self) -> float:
+        """Device pixels per document pixel, capped so the view never upscales."""
+        dpr = float(self.devicePixelRatioF() or 1.0)
+        return min(1.0, self.zoom * max(1.0, dpr))
+
+    def _visible_document_box(self) -> tuple[float, float, float, float] | None:
+        """Document rectangle currently inside the widget, or None when it misses."""
+        doc = self.session.document
+        if self.zoom <= 0 or doc.width < 1 or doc.height < 1:
+            return None
+        ruler = self.ruler()
+        x0 = max(0.0, -self.offset_x / self.zoom)
+        y0 = max(0.0, -self.offset_y / self.zoom)
+        x1 = min(float(doc.width), (self.width() - ruler - self.offset_x) / self.zoom)
+        y1 = min(float(doc.height), (self.height() - ruler - self.offset_y) / self.zoom)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    def _current_view_key(self) -> tuple:
+        doc = self.session.document
+        return (
+            self.zoom,
+            self.offset_x,
+            self.offset_y,
+            self.width(),
+            self.height(),
+            self.ruler(),
+            float(self.devicePixelRatioF() or 1.0),
+            doc.width,
+            doc.height,
+            self._visible_document_box(),
+        )
+
+    def _pixmap_dest(self, full_target: QRectF) -> QRectF:
+        """Widget rectangle the cached pixmap covers.
+
+        A full-resolution cache is the whole document. A zoomed-out cache is
+        only the part that is on screen, so it must not be stretched across
+        the off-screen part of the document.
+        """
+        if self._pixmap_mode != "view" or self._view_box is None:
+            return full_target
+        x0, y0, x1, y1 = self._view_box
+        ruler = self.ruler()
+        return QRectF(
+            ruler + self.offset_x + x0 * self.zoom,
+            ruler + self.offset_y + y0 * self.zoom,
+            (x1 - x0) * self.zoom,
+            (y1 - y0) * self.zoom,
+        )
+
+    def _sync_selection_chrome(self) -> None:
         selection = self.session.document.selection
         if selection is None:
             self._selection_pixmap = None
             self._selection_id = None
             self._sync_ants(None)
             return
-        # Rebuild only when the selection object changes. Commands replace it,
-        # so identity is a reliable cache key.
-        if id(selection) != self._selection_id or self._selection_pixmap is None:
-            self._selection_pixmap = pil_to_pixmap(_selection_tint(selection))
-            self._selection_id = id(selection)
+        # The tint follows the pixmap: full document, or the visible rectangle
+        # only. Identity plus the view key catches a pan without a new mask.
+        cache_id = (id(selection), self._pixmap_mode, self._view_key)
+        if cache_id != self._selection_id or self._selection_pixmap is None:
+            if self._pixmap_mode == "view" and self._view_box is not None and self._pixmap is not None:
+                tint = _view_selection_tint(
+                    selection,
+                    self._view_box,
+                    self._pixmap.width(),
+                    self._pixmap.height(),
+                )
+            else:
+                tint = _selection_tint(selection)
+            self._selection_pixmap = pil_to_pixmap(tint)
+            self._selection_id = cache_id
         self._sync_ants(selection)
 
     def _paint_checker(self, painter: QPainter, target: QRectF) -> None:
@@ -860,6 +970,10 @@ class CanvasView(QWidget):
         doc = self.session.document
         if self._dirty or self._pixmap is None or self._pixmap.isNull():
             return False
+        # A zoomed-out cache is screen-sized, so a document-pixel patch would
+        # land in the wrong place. The caller rebuilds that small cache instead.
+        if self._pixmap_mode != "full":
+            return False
         if self._pixmap.width() != doc.width or self._pixmap.height() != doc.height:
             return False
         if shows_redaction(doc):
@@ -952,6 +1066,30 @@ def _is_clear_shortcut(event) -> bool:
     if mods & blocked:
         return False
     return event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
+
+
+def _view_selection_tint(
+    selection: Image.Image,
+    box: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> Image.Image:
+    """Tint the visible part of a selection at the view cache's size."""
+    x0, y0, x1, y1 = box
+    if width < 1 or height < 1:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    sx0 = min(max(0.0, x0), float(selection.width))
+    sy0 = min(max(0.0, y0), float(selection.height))
+    sx1 = min(max(sx0, x1), float(selection.width))
+    sy1 = min(max(sy0, y1), float(selection.height))
+    if sx1 <= sx0 or sy1 <= sy0:
+        return Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    mask = selection.convert("L").resize(
+        (width, height),
+        Image.Resampling.BOX,
+        box=(sx0, sy0, sx1, sy1),
+    )
+    return _selection_tint(mask)
 
 
 def _selection_tint(selection: Image.Image) -> Image.Image:

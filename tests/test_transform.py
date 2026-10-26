@@ -184,6 +184,30 @@ def test_crop_drag_can_expand_and_lock_proportion():
     assert tool._overlay_rect[2] / tool._overlay_rect[3] == 2
 
 
+def test_crop_drag_redraws_the_window_without_flattening():
+    session = Session(new_document(20, 10, "white"))
+    notes: list[str] = []
+    session.add_listener(notes.append)
+    tool = CropTool()
+    tool.pointer_down(session, PointerEvent(1, 1))
+    tool.pointer_move(session, PointerEvent(8, 6))
+    assert notes == ["overlay"]
+    assert session.document.width == 20
+    tool.pointer_cancel(session)
+    assert notes == ["overlay", "overlay"]
+
+    tool.pointer_down(session, PointerEvent(1, 1))
+    tool.pointer_up(session, PointerEvent(1.4, 1.4))
+    assert notes[-1] == "overlay"
+    assert session.document.width == 20
+
+    tool.pointer_down(session, PointerEvent(1, 1))
+    tool.pointer_up(session, PointerEvent(12, 8))
+    assert session.document.width == 11
+    assert "change" in notes
+    assert "preview" not in notes
+
+
 def test_resample_document_scales_pixels_or_only_dpi():
     assert scales_match(40, 20, 20, 10)
     assert scales_match(3, 2, 2, 1)

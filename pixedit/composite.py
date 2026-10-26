@@ -15,6 +15,8 @@ Pipeline for each visible layer, bottom to top:
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from PIL import Image
 
@@ -251,6 +253,103 @@ def baked_placement(
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0)), int(target.x), int(target.y)
     x0, y0, x1, y1 = box
     return flat.crop((x0, y0, x1, y1)), x0, y0
+
+
+def _view_size(span: float, scale: float) -> int:
+    """Screen pixels covering ``span`` document pixels, never above one per source pixel."""
+    if span <= 0 or scale <= 0:
+        return 1
+    return max(1, min(int(math.ceil(span)), int(round(span * scale))))
+
+
+def _blit_scaled(
+    canvas: np.ndarray,
+    layer: Layer,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> None:
+    """Blend ``layer`` into a view that maps ``(x0, y0, x1, y1)`` onto ``canvas``.
+
+    The source is resampled with a box filter, so a zoomed-out view averages the
+    document pixels that land in each screen pixel instead of flattening the
+    whole canvas first.
+    """
+    image = layer.image
+    out_h, out_w = canvas.shape[:2]
+    span_x = x1 - x0
+    span_y = y1 - y0
+    if image.width < 1 or image.height < 1 or span_x <= 0 or span_y <= 0:
+        return
+    ox0 = max(x0, float(layer.x))
+    oy0 = max(y0, float(layer.y))
+    ox1 = min(x1, float(layer.x + image.width))
+    oy1 = min(y1, float(layer.y + image.height))
+    if ox1 <= ox0 or oy1 <= oy0:
+        return
+
+    def to_px_x(doc_x: float) -> float:
+        return (doc_x - x0) / span_x * out_w
+
+    def to_px_y(doc_y: float) -> float:
+        return (doc_y - y0) / span_y * out_h
+
+    ix0 = max(0, math.floor(to_px_x(ox0)))
+    iy0 = max(0, math.floor(to_px_y(oy0)))
+    ix1 = min(out_w, math.ceil(to_px_x(ox1)))
+    iy1 = min(out_h, math.ceil(to_px_y(oy1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        return
+
+    def to_src_x(px: float) -> float:
+        return x0 + px / out_w * span_x - layer.x
+
+    def to_src_y(py: float) -> float:
+        return y0 + py / out_h * span_y - layer.y
+
+    sx0 = min(max(0.0, to_src_x(ix0)), float(image.width))
+    sy0 = min(max(0.0, to_src_y(iy0)), float(image.height))
+    sx1 = min(max(0.0, to_src_x(ix1)), float(image.width))
+    sy1 = min(max(0.0, to_src_y(iy1)), float(image.height))
+    if sx1 - sx0 < 1e-4 or sy1 - sy0 < 1e-4:
+        return
+    resized = image.resize(
+        (ix1 - ix0, iy1 - iy0),
+        Image.Resampling.BOX,
+        box=(sx0, sy0, sx1, sy1),
+    )
+    src = pil_to_float(resized)
+    dst = canvas[iy0:iy1, ix0:ix1]
+    canvas[iy0:iy1, ix0:ix1] = blend_arrays(dst, src, layer.opacity, layer.blend_mode)
+
+
+def composite_view(
+    document: Document,
+    box: tuple[float, float, float, float],
+    scale: float,
+) -> Image.Image:
+    """Flatten ``box`` at ``scale`` screen pixels per document pixel.
+
+    ``box`` is ``(x0, y0, x1, y1)`` in document pixels. The result is only as
+    large as that rectangle on screen, and never larger than the rectangle in
+    document pixels. Redaction layers are skipped: blur and noise read outside
+    a downscaled box, so the caller uses ``composite`` when a mask is visible.
+    Export and the eyedropper stay on ``composite``.
+    """
+    x0, y0, x1, y1 = (float(value) for value in box)
+    span_x = x1 - x0
+    span_y = y1 - y0
+    if span_x <= 0 or span_y <= 0:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    out_w = _view_size(span_x, scale)
+    out_h = _view_size(span_y, scale)
+    canvas = np.zeros((out_h, out_w, 4), dtype=np.float32)
+    for layer in document.layers:
+        if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
+            continue
+        _blit_scaled(canvas, layer, x0, y0, x1, y1)
+    return float_to_pil(canvas)
 
 
 def composite_region(document: Document, box: tuple[int, int, int, int]) -> Image.Image:
