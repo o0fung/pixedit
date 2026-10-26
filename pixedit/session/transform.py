@@ -14,6 +14,7 @@ from pixedit.geom import (
     canvas_flip,
     canvas_rotate_ccw,
     canvas_rotate_cw,
+    canvas_window,
     crop_document,
     flip_visual,
     flip_visual_across,
@@ -25,11 +26,13 @@ from pixedit.geom import (
     trim_rect,
     union_bounds,
 )
+from pixedit.guides import flip_guides, rotate_guides_ccw, rotate_guides_cw, scale_guides, shift_guides
 from pixedit.model import (
     CompoundCommand,
     Layer,
     MutateLayerCommand,
     ReplaceDocumentContent,
+    SetGuidesCommand,
     SetPositionCommand,
     apply_visual,
     visual_state,
@@ -50,7 +53,8 @@ class TransformMixin:
         if left == 0 and top == 0 and width == self.document.width and height == self.document.height:
             return
         layers, selection = crop_document(self.document, left, top, width, height)
-        self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name="Crop"))
+        guides = shift_guides(self.document.group.guides_v, self.document.group.guides_h, left, top)
+        self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name="Crop", guides=guides))
 
     def resize_canvas(
         self,
@@ -66,8 +70,12 @@ class TransformMixin:
             self.show_message("Canvas is already that size.")
             return
         layers, selection = refit_canvas(self.document, width, height, anchor, fill)
+        origin_x, origin_y, _, _ = canvas_window(self.document.width, self.document.height, width, height, anchor)
+        guides = shift_guides(self.document.group.guides_v, self.document.group.guides_h, origin_x, origin_y)
         self.commit(
-            ReplaceDocumentContent(self.document, layers, width, height, selection, name="Canvas size")
+            ReplaceDocumentContent(
+                self.document, layers, width, height, selection, name="Canvas size", guides=guides
+            )
         )
 
     def resize_image(
@@ -110,9 +118,17 @@ class TransformMixin:
             )
             return
         layers, selection = resample_document(document, width, height, interpolation)
+        guides = scale_guides(
+            document.group.guides_v,
+            document.group.guides_h,
+            document.width,
+            document.height,
+            width,
+            height,
+        )
         self.commit(
             ReplaceDocumentContent(
-                document, layers, width, height, selection, name="Image size", dpi=dpi
+                document, layers, width, height, selection, name="Image size", dpi=dpi, guides=guides
             )
         )
 
@@ -159,7 +175,25 @@ class TransformMixin:
             name = "Flip canvas"
         else:
             return
-        self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name=name))
+        group = self.document.group
+        if kind == "rotate-cw":
+            guides = rotate_guides_cw(group.guides_v, group.guides_h, self.document.height)
+        elif kind == "rotate-ccw":
+            guides = rotate_guides_ccw(group.guides_v, group.guides_h, self.document.width)
+        elif kind == "flip-h":
+            guides = flip_guides(group.guides_v, group.guides_h, self.document.width, self.document.height, horizontal_flip=True)
+        else:
+            guides = flip_guides(group.guides_v, group.guides_h, self.document.width, self.document.height, horizontal_flip=False)
+        self.commit(ReplaceDocumentContent(self.document, layers, width, height, selection, name=name, guides=guides))
+
+    def set_guides(self, vertical: tuple[int, ...] | list[int], horizontal: tuple[int, ...] | list[int]) -> None:
+        """Replace the guides on the page on screen. One undo step."""
+        new_v = tuple(sorted({int(round(value)) for value in vertical}))
+        new_h = tuple(sorted({int(round(value)) for value in horizontal}))
+        group = self.document.group
+        if new_v == tuple(sorted(group.guides_v)) and new_h == tuple(sorted(group.guides_h)):
+            return
+        self.commit(SetGuidesCommand(self.document, new_v, new_h))
 
     def flip_active_horizontal(self) -> None:
         self.transform_selected("flip-h")

@@ -11,6 +11,7 @@ from pixedit.geom import (
     grow_layer_to_cover,
     selection_for_layer,
 )
+from pixedit.guides import snap_point
 from pixedit.model import Layer
 from pixedit.paint import draw_shape
 from pixedit.tools.base import (
@@ -65,13 +66,13 @@ class ShapeTool(Tool):
     def pointer_down(self, session, event: PointerEvent) -> None:
         self._cancel_edit(session)
         self._dragging = True
-        self._start = (event.x, event.y)
-        self._end = (event.x, event.y)
+        self._start = self._snap(session, event.x, event.y)
+        self._end = self._start
 
     def pointer_move(self, session, event: PointerEvent) -> None:
         if not self._dragging:
             return
-        self._end = (event.x, event.y)
+        self._end = self._snap(session, event.x, event.y)
         if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 1:
             return
         self._show_preview(session)
@@ -79,7 +80,7 @@ class ShapeTool(Tool):
     def pointer_up(self, session, event: PointerEvent) -> None:
         if not self._dragging:
             return
-        self._end = (event.x, event.y)
+        self._end = self._snap(session, event.x, event.y)
         self._dragging = False
         if math.hypot(self._end[0] - self._start[0], self._end[1] - self._start[1]) < 1:
             self._cancel_edit(session)
@@ -167,6 +168,10 @@ class ShapeTool(Tool):
         if layer is None:
             return
         session.cancel_raster_edit(layer, before, created)
+
+    def _snap(self, session, x: float, y: float) -> tuple[float, float]:
+        group = session.document.group
+        return snap_point(x, y, group.guides_v, group.guides_h, bool(session.option("snap", True)))
 
     def _canvas_box(self, session) -> tuple[int, int, int, int] | None:
         """Half-open document box covering the shape, including its stroke."""

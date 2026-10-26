@@ -89,6 +89,34 @@ _ITEM_ID = Qt.ItemDataRole.UserRole
 _ITEM_KIND = Qt.ItemDataRole.UserRole + 1
 
 
+def place_group_block(
+    model_ids: list[str],
+    visual_ids: list[str],
+    moved_ids: list[str],
+    current_id: str,
+) -> list[str] | None:
+    """Page order after a multi-page drag.
+
+    ``moved_ids`` stay in their previous relative order and land as one block
+    where ``current_id`` sits in ``visual_ids``. Other selected pages are
+    ignored in that visual list, so the result is the same whether the tree
+    moved every selected page or only the row under the pointer.
+    """
+    moved_set = set(moved_ids)
+    if current_id not in moved_set:
+        return None
+    if len(visual_ids) != len(model_ids) or set(visual_ids) != set(model_ids):
+        return None
+    moved = [group_id for group_id in model_ids if group_id in moved_set]
+    others = moved_set - {current_id}
+    stripped = [group_id for group_id in visual_ids if group_id not in others]
+    if current_id not in stripped:
+        return None
+    index = stripped.index(current_id)
+    rest = [group_id for group_id in stripped if group_id != current_id]
+    return rest[:index] + moved + rest[index:]
+
+
 def _drop_index(visual_front_first: list[str], moved: set[str]) -> int:
     """Model index where a block dropped into a page should be inserted.
 
@@ -131,19 +159,35 @@ class LayerTree(QTreeWidget):
 
     def dropEvent(self, event) -> None:
         super().dropEvent(event)
-        # Dropping on the middle of a row nests the layer under it. A layer
-        # has no children; the row belongs beside that layer, just below it.
-        for index in range(self.topLevelItemCount()):
+        self._flatten_group_nesting()
+
+    def _flatten_group_nesting(self) -> None:
+        """Keep every page as a top-level row.
+
+        A drop on the middle of a page nests the row under it. Pages have to
+        stay siblings so their order is the PDF page order. A layer that
+        landed under another layer is lifted back beside it.
+        """
+        index = 0
+        while index < self.topLevelItemCount():
             group = self.topLevelItem(index)
-            if group is None:
+            if group is None or group.data(0, _ITEM_KIND) != "group":
+                index += 1
                 continue
             child_index = 0
+            inserted = 0
             while child_index < group.childCount():
                 child = group.child(child_index)
+                if child.data(0, _ITEM_KIND) == "group":
+                    group.takeChild(child_index)
+                    self.insertTopLevelItem(index + 1 + inserted, child)
+                    inserted += 1
+                    continue
                 nested = [child.takeChild(0) for _ in range(child.childCount())]
                 for offset, item in enumerate(nested, start=1):
                     group.insertChild(child_index + offset, item)
                 child_index += 1
+            index += 1 + inserted
 
     def keyPressEvent(self, event) -> None:
         # Space is the temporary hand tool. The base tree would use it to
@@ -171,6 +215,13 @@ class LayerPanel(QWidget):
         # selection change during the drag does not pick the wrong layer.
         self._reordering = False
         self._opacity_before: float | None = None
+        # Group ids the user folded. Refresh rebuilds the rows, so the arrow
+        # state has to be put back or every page opens again.
+        self._collapsed: set[str] = set()
+        # Group ids highlighted as pages. Empty means the highlight is layers.
+        self._selected_groups: list[str] = []
+        self._drag_groups: list[str] = []
+        self._drag_current: str | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         title = QLabel("Layers")
@@ -185,13 +236,17 @@ class LayerPanel(QWidget):
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.list.setDropIndicatorShown(True)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setRootIsDecorated(True)
+        self.list.setItemsExpandable(True)
         self.list.setToolTip(
             "Click a group, or a layer in it, to show that page. "
+            "The arrow folds a page. Shift-click or Command-click folded pages, "
+            "then drag them to change the page order. "
             "Drag a layer to restack it, or onto another group to move it. "
-            "Drag a group to change the PDF page order. "
-            "Shift-click selects a range inside one group. "
-            "Command-click or Ctrl-click adds or removes a layer."
+            "Shift-click selects a range inside one group."
         )
+        self.list.itemCollapsed.connect(self._on_group_folded)
+        self.list.itemExpanded.connect(self._on_group_folded)
         self.list.itemSelectionChanged.connect(self._on_selection)
         self.list.itemChanged.connect(self._on_item_changed)
         self.list.itemDoubleClicked.connect(self._on_double_click)
@@ -321,13 +376,37 @@ class LayerPanel(QWidget):
                 rows.append((item, layer.id, group.id))
                 if group.id == active_group_id and layer.id == active_layer_id:
                     current_item = item
-            header.setExpanded(True)
+            header.setExpanded(group.id not in self._collapsed)
         # setCurrentItem clears every other row. The selection flags are
         # applied after that, or a multi-selection would collapse to one layer.
-        if current_item is not None:
-            self.list.setCurrentItem(current_item)
-        for item, layer_id, group_id in rows:
-            item.setSelected(group_id == active_group_id and layer_id in chosen)
+        page_ids = [group_id for group_id in self._selected_groups if document.group_by_id(group_id) is not None]
+        self._selected_groups = page_ids
+        if page_ids:
+            current_group = active_group_id if active_group_id in page_ids else page_ids[-1]
+            chosen_header = None
+            headers = []
+            for index in range(self.list.topLevelItemCount()):
+                header = self.list.topLevelItem(index)
+                if header is None:
+                    continue
+                headers.append(header)
+                if header.data(0, _ITEM_ID) == current_group:
+                    chosen_header = header
+            if chosen_header is not None:
+                self.list.setCurrentItem(chosen_header)
+            for header in headers:
+                header.setSelected(header.data(0, _ITEM_ID) in page_ids)
+        else:
+            if current_item is not None:
+                self.list.setCurrentItem(current_item)
+            for item, layer_id, group_id in rows:
+                item.setSelected(group_id == active_group_id and layer_id in chosen)
+        # Selecting a layer scrolls its row into view and opens the page.
+        # Put the arrows back so a folded page stays folded.
+        for index in range(self.list.topLevelItemCount()):
+            header = self.list.topLevelItem(index)
+            if header is not None:
+                header.setExpanded(header.data(0, _ITEM_ID) not in self._collapsed)
         self.list.blockSignals(False)
         self._sync_controls()
         self._building = False
@@ -373,12 +452,43 @@ class LayerPanel(QWidget):
         pixmap.setDevicePixelRatio(dpr)
         return QIcon(pixmap)
 
+    def _on_group_folded(self, item: QTreeWidgetItem) -> None:
+        if self._building or item.data(0, _ITEM_KIND) != "group":
+            return
+        group_id = item.data(0, _ITEM_ID)
+        if not isinstance(group_id, str):
+            return
+        if item.isExpanded():
+            self._collapsed.discard(group_id)
+        else:
+            self._collapsed.add(group_id)
+
     def _on_drag_started(self) -> None:
         self._reordering = True
-        # Restack moves one row. A multi-selection would otherwise drag every
-        # highlighted row, which the document cannot record as one move.
-        current = self.list.currentItem()
+        self._drag_groups = []
+        self._drag_current = None
         selected = self.list.selectedItems()
+        # Folded pages are the rows. Several of them move as one block.
+        # A layer multi-selection still drags only the current row, because
+        # restack records one layer move.
+        if selected and all(item.data(0, _ITEM_KIND) == "group" for item in selected):
+            chosen = {
+                item.data(0, _ITEM_ID)
+                for item in selected
+                if isinstance(item.data(0, _ITEM_ID), str)
+            }
+            self._drag_groups = [
+                item.data(0, _ITEM_ID)
+                for index in range(self.list.topLevelItemCount())
+                if (item := self.list.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
+            ]
+            current = self.list.currentItem()
+            if current is not None and current.data(0, _ITEM_ID) in chosen:
+                self._drag_current = current.data(0, _ITEM_ID)
+            elif self._drag_groups:
+                self._drag_current = self._drag_groups[-1]
+            return
+        current = self.list.currentItem()
         if current is None or len(selected) <= 1:
             return
         self.list.blockSignals(True)
@@ -451,8 +561,16 @@ class LayerPanel(QWidget):
                 if membership.get(layer_id) != group_id
             ]
             if not moved and visual_ids != model_ids:
-                if all(layer_ids == model_layers[group_id] for group_id, layer_ids in visual):
-                    self.session.reorder_groups(visual_ids)
+                if not all(layer_ids == model_layers[group_id] for group_id, layer_ids in visual):
+                    return
+                if len(self._drag_groups) > 1 and self._drag_current is not None:
+                    ordered = place_group_block(model_ids, visual_ids, self._drag_groups, self._drag_current)
+                    if ordered is None:
+                        return
+                    self._selected_groups = list(self._drag_groups)
+                    self.session.reorder_groups(ordered)
+                    return
+                self.session.reorder_groups(visual_ids)
                 return
             if not moved and visual_ids == model_ids:
                 changes = [
@@ -492,6 +610,8 @@ class LayerPanel(QWidget):
                 dest_visual = next(layer_ids for group_id, layer_ids in visual if group_id == dest_id)
                 self.session.move_layers_to_group(moved, dest_id, _drop_index(dest_visual, set(moved)))
         finally:
+            self._drag_groups = []
+            self._drag_current = None
             self._reordering = False
             # Rebuild from the document so a rejected drop snaps back, and
             # labels stay in sync when no window listener refreshes us.
@@ -516,20 +636,39 @@ class LayerPanel(QWidget):
         if not items:
             # The active layer always stays selected. Rebuild from the session
             # so a toggle of the last row does not leave the list empty.
+            self._selected_groups = []
             self.refresh()
             return
         current = self.list.currentItem()
         if current is None or not current.isSelected():
             current = items[-1]
-        if current.data(0, _ITEM_KIND) == "group":
+        if all(item.data(0, _ITEM_KIND) == "group" for item in items):
+            # Page rows, not layers. One open page still shows that page and
+            # then highlights its layer. Folded pages, or more than one page,
+            # stay highlighted so they can be dragged together.
+            folded = all(not item.isExpanded() for item in items)
+            if len(items) == 1 and not folded:
+                self._selected_groups = []
+                group_id = current.data(0, _ITEM_ID)
+                if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
+                    self.session.activate_group(group_id)
+                else:
+                    self.refresh()
+                return
+            self._selected_groups = [
+                group_id
+                for index in range(self.list.topLevelItemCount())
+                if (item := self.list.topLevelItem(index)) is not None
+                and item.isSelected()
+                and isinstance(group_id := item.data(0, _ITEM_ID), str)
+            ]
             group_id = current.data(0, _ITEM_ID)
             if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
                 self.session.activate_group(group_id)
             else:
-                # The header is not a paint target. Put the highlight back
-                # on the layer this page was already using.
-                self.refresh()
+                self._sync_controls()
             return
+        self._selected_groups = []
         parent = current.parent()
         if parent is None:
             return

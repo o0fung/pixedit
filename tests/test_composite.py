@@ -45,6 +45,26 @@ def test_overlay_known_sample():
     assert np.allclose(out[0, 0, :3], (0.5, 0.5, 0.5), atol=1e-5)
 
 
+def test_darken_lighten_color_and_luminosity():
+    dst = np.zeros((1, 1, 4), np.float32)
+    src = np.zeros((1, 1, 4), np.float32)
+    dst[..., :] = (0.2, 0.6, 0.2, 1)
+    src[..., :] = (0.4, 0.4, 0.4, 1)
+    darken = blend_arrays(dst, src, 1, "darken")
+    lighten = blend_arrays(dst, src, 1, "lighten")
+    assert np.allclose(darken[0, 0, :3], (0.2, 0.4, 0.2), atol=1e-5)
+    assert np.allclose(lighten[0, 0, :3], (0.4, 0.6, 0.4), atol=1e-5)
+    # Color keeps the source's gray hue and the backdrop's luminosity.
+    color = blend_arrays(dst, src, 1, "color")
+    assert np.allclose(color[0, 0, :3], (0.436, 0.436, 0.436), atol=1e-3)
+    # Luminosity keeps the backdrop's green hue and the source's gray luminosity.
+    luma = blend_arrays(dst, src, 1, "luminosity")
+    assert np.allclose(luma[0, 0, :3], (0.164, 0.564, 0.164), atol=1e-3)
+    clear = np.zeros((1, 1, 4), np.float32)
+    kept = blend_arrays(clear, src, 1, "darken")
+    assert np.allclose(kept[0, 0], (0.4, 0.4, 0.4, 1), atol=1e-5)
+
+
 def test_multiply_over_transparent_keeps_source():
     dst = np.zeros((1, 1, 4), np.float32)
     src = np.zeros((1, 1, 4), np.float32)

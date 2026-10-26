@@ -27,6 +27,33 @@ from pixedit.pixels import mask_effect
 # at module level for placement helpers defined here.
 
 
+def _lum(rgb: np.ndarray) -> np.ndarray:
+    """CSS relative luminance weights used by Color and Luminosity."""
+    return rgb[..., 0] * 0.3 + rgb[..., 1] * 0.59 + rgb[..., 2] * 0.11
+
+
+def _set_lum(color: np.ndarray, lum: np.ndarray) -> np.ndarray:
+    """Give ``color`` the luminosity ``lum``, then clip it back into 0..1.
+
+    This is the CSS compositing SetLum. The dark clip runs first, then the
+    light clip, each from the luminosity of the shifted color.
+    """
+    shifted = color + (lum - _lum(color))[..., None]
+    luma = _lum(shifted)
+    low = np.min(shifted, axis=-1)
+    dark = low < 0
+    span = np.maximum(luma - low, 1e-6)
+    scaled = luma[..., None] + (shifted - luma[..., None]) * (luma / span)[..., None]
+    shifted = np.where(dark[..., None], scaled, shifted)
+    luma = _lum(shifted)
+    high = np.max(shifted, axis=-1)
+    light = high > 1
+    span = np.maximum(high - luma, 1e-6)
+    scaled = luma[..., None] + (shifted - luma[..., None]) * ((1.0 - luma) / span)[..., None]
+    shifted = np.where(light[..., None], scaled, shifted)
+    return np.clip(shifted, 0.0, 1.0)
+
+
 def _blend_color(mode: str, dst: np.ndarray, src: np.ndarray) -> np.ndarray:
     if mode == "multiply":
         return src * dst
@@ -39,6 +66,16 @@ def _blend_color(mode: str, dst: np.ndarray, src: np.ndarray) -> np.ndarray:
             2.0 * src * dst,
             1.0 - 2.0 * (1.0 - src) * (1.0 - dst),
         )
+    if mode == "darken":
+        return np.minimum(src, dst)
+    if mode == "lighten":
+        return np.maximum(src, dst)
+    if mode == "color":
+        # Source hue and saturation, backdrop luminosity.
+        return _set_lum(src, _lum(dst))
+    if mode == "luminosity":
+        # Backdrop hue and saturation, source luminosity.
+        return _set_lum(dst, _lum(src))
     return src
 
 

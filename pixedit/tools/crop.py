@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from pixedit.geom import size_from_anchor
+from pixedit.guides import snap_point
 from pixedit.tools.base import (
     Overlay,
     PointerEvent,
@@ -80,9 +81,13 @@ class CropTool(Tool):
 
     def _crop_box(self, session, event: PointerEvent) -> tuple[int, int, int, int]:
         aspect = self._locked_aspect(session, event)
+        group = session.document.group
+        enabled = bool(session.option("snap", True))
+        start = snap_point(self._start[0], self._start[1], group.guides_v, group.guides_h, enabled)
+        end = snap_point(event.x, event.y, group.guides_v, group.guides_h, enabled)
         left, top, width, height = size_from_anchor(
-            self._start,
-            (event.x, event.y),
+            start,
+            end,
             lock_aspect=aspect is not None,
             aspect=aspect or 1.0,
         )

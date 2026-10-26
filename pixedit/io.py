@@ -284,6 +284,27 @@ def _read_layer(archive: zipfile.ZipFile, entry: dict, width: int, height: int) 
     return layer
 
 
+def _guides_from_entry(entry: dict) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Guide positions stored on a page. Missing or junk values are skipped."""
+    raw = entry.get("guides")
+    if not isinstance(raw, dict):
+        return (), ()
+
+    def clean(key: str) -> tuple[int, ...]:
+        values = raw.get(key)
+        if not isinstance(values, list):
+            return ()
+        cleaned = []
+        for value in values:
+            try:
+                cleaned.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return tuple(cleaned)
+
+    return clean("vertical"), clean("horizontal")
+
+
 def _read_selection(archive: zipfile.ZipFile, name: str | None) -> Image.Image | None:
     if not name:
         return None
@@ -323,6 +344,10 @@ def save_project(document: Document, path: str) -> None:
                     "height": group.height,
                     "selection": selection_name,
                     "layers": manifest_layers,
+                    "guides": {
+                        "vertical": list(group.guides_v),
+                        "horizontal": list(group.guides_h),
+                    },
                 }
             )
         manifest = {
@@ -373,6 +398,7 @@ def _load_project_v2(archive: zipfile.ZipFile, manifest: dict) -> Document:
         height = int(entry["height"])
         layers = [_read_layer(archive, layer_entry, width, height) for layer_entry in entry.get("layers", [])]
         bind_mask_targets(layers)
+        vertical, horizontal = _guides_from_entry(entry)
         groups.append(
             LayerGroup(
                 id=str(entry.get("id") or new_id()),
@@ -381,6 +407,8 @@ def _load_project_v2(archive: zipfile.ZipFile, manifest: dict) -> Document:
                 height=height,
                 layers=layers,
                 selection=_read_selection(archive, entry.get("selection")),
+                guides_v=vertical,
+                guides_h=horizontal,
             )
         )
     active = manifest.get("active_group")

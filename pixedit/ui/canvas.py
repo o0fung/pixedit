@@ -11,6 +11,7 @@ from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolyg
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from pixedit.composite import composite, composite_region, shows_redaction
+from pixedit.frames import letterbox_offset, shared_frame_zoom
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
 
@@ -88,11 +89,13 @@ def pil_to_pixmap(image: Image.Image) -> QPixmap:
 
 
 class CanvasView(QWidget):
-    def __init__(self, session, tool_getter, on_status) -> None:
+    def __init__(self, session, tool_getter, on_status, on_drop=None) -> None:
         super().__init__()
         self.session = session
         self.tool_getter = tool_getter
         self.on_status = on_status
+        self.on_drop = on_drop
+        self.setAcceptDrops(on_drop is not None)
         self.zoom = 1.0
         self.offset_x = 24.0
         self.offset_y = 24.0
@@ -116,6 +119,11 @@ class CanvasView(QWidget):
         self._ant_timer = QTimer(self)
         self._ant_timer.setInterval(120)
         self._ant_timer.timeout.connect(self._advance_ants)
+        # Playback of pages shares one zoom and centers each page. The
+        # document pixels stay at their own size.
+        self.letterbox = False
+        # A guide drag started in a ruler. None when the pointer is a tool.
+        self._guide: dict | None = None
         # Samples only append a coordinate. A second tick flushes the batch
         # so the stroke is not redrawn on every sample. Single-shot, restarted
         # at the end of the tick, so a slow redraw cannot queue a burst.
@@ -160,9 +168,15 @@ class CanvasView(QWidget):
         group_id = self.session.document.active_group_id
         if group_id == self._view_group_id:
             return False
-        if self._view_group_id:
+        # Letterbox zoom is not the user's view. Don't store it, and don't
+        # fit each page on its own, or a small page would grow to fill the window.
+        if self._view_group_id and not self.letterbox:
             self._group_views[self._view_group_id] = (self.zoom, self.offset_x, self.offset_y)
         self._view_group_id = group_id
+        if self.letterbox:
+            self._dirty = True
+            self._selection_id = None
+            return True
         self._dirty = True
         self._selection_id = None
         saved = self._group_views.get(group_id)
@@ -290,8 +304,27 @@ class CanvasView(QWidget):
         self.update()
         self.refresh_tool_cursor()
 
+    def _apply_letterbox(self) -> None:
+        """Fit the largest page, then center the page on screen at that scale."""
+        groups = self.session.document.groups
+        ruler = self.ruler()
+        zoom = shared_frame_zoom(
+            self.width(),
+            self.height(),
+            [(group.width, group.height) for group in groups],
+            ruler=ruler,
+        )
+        doc = self.session.document
+        offset_x, offset_y = letterbox_offset(self.width(), self.height(), doc.width, doc.height, zoom, ruler=ruler)
+        self.zoom = zoom
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.session.view_zoom = self.zoom
+
     def paintEvent(self, event) -> None:
         self._note_group_view()
+        if self.letterbox:
+            self._apply_letterbox()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#101318"))
         self._ensure_pixmap()
@@ -315,8 +348,111 @@ class CanvasView(QWidget):
         pen.setWidth(1)
         painter.setPen(pen)
         painter.drawRect(target.adjusted(0, 0, -1, -1))
+        self._paint_guides(painter, ruler)
         if ruler:
             self._paint_rulers(painter, ruler)
+
+    def _paint_guides(self, painter: QPainter, ruler: int) -> None:
+        group = self.session.document.group
+        vertical = list(group.guides_v)
+        horizontal = list(group.guides_h)
+        if self._guide is not None:
+            # The line under the pointer replaces the guide being moved.
+            if self._guide["axis"] == "v":
+                if self._guide["index"] is not None and 0 <= self._guide["index"] < len(vertical):
+                    vertical.pop(self._guide["index"])
+                vertical.append(int(round(self._guide["value"])))
+            else:
+                if self._guide["index"] is not None and 0 <= self._guide["index"] < len(horizontal):
+                    horizontal.pop(self._guide["index"])
+                horizontal.append(int(round(self._guide["value"])))
+        if not vertical and not horizontal:
+            return
+        pen = QPen(QColor("#5ec8ff"))
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        for x in vertical:
+            sx = ruler + self.offset_x + x * self.zoom
+            painter.drawLine(int(sx), ruler, int(sx), self.height())
+        for y in horizontal:
+            sy = ruler + self.offset_y + y * self.zoom
+            painter.drawLine(ruler, int(sy), self.width(), int(sy))
+
+    def _begin_guide(self, pos) -> bool:
+        """Start a guide drag from a ruler. The canvas tools do not see that press."""
+        ruler = self.ruler()
+        if ruler <= 0 or self._space:
+            return False
+        x, y = float(pos.x()), float(pos.y())
+        if y < ruler and x >= ruler:
+            axis = "h"
+        elif x < ruler and y >= ruler:
+            axis = "v"
+        else:
+            return False
+        cx, cy = self.widget_to_canvas(x, y)
+        value = cy if axis == "h" else cx
+        guides = self.session.document.group.guides_h if axis == "h" else self.session.document.group.guides_v
+        index = None
+        threshold = 6.0 / max(self.zoom, 0.02)
+        for guide_index, guide in enumerate(guides):
+            if abs(float(guide) - value) <= threshold:
+                index = guide_index
+                value = float(guide)
+                break
+        self._guide = {"axis": axis, "index": index, "value": value}
+        self.update()
+        return True
+
+    def _move_guide(self, pos) -> None:
+        if self._guide is None:
+            return
+        cx, cy = self.widget_to_canvas(float(pos.x()), float(pos.y()))
+        self._guide["value"] = cy if self._guide["axis"] == "h" else cx
+        self.update()
+
+    def _finish_guide(self, pos) -> None:
+        drag = self._guide
+        self._guide = None
+        if drag is None:
+            return
+        cx, cy = self.widget_to_canvas(float(pos.x()), float(pos.y()))
+        value = cy if drag["axis"] == "h" else cx
+        doc = self.session.document
+        ruler = self.ruler()
+        on_page = float(pos.x()) >= ruler and float(pos.y()) >= ruler
+        if drag["axis"] == "h":
+            on_page = on_page and 0 <= value <= doc.height
+        else:
+            on_page = on_page and 0 <= value <= doc.width
+        vertical = list(doc.group.guides_v)
+        horizontal = list(doc.group.guides_h)
+        target = horizontal if drag["axis"] == "h" else vertical
+        if drag["index"] is not None and 0 <= drag["index"] < len(target):
+            target.pop(drag["index"])
+        if on_page:
+            target.append(int(round(value)))
+        self.session.set_guides(vertical, horizontal)
+        if on_page:
+            axis_name = "Horizontal" if drag["axis"] == "h" else "Vertical"
+            self.session.show_message(
+                f"{axis_name} guide at {int(round(value))}. Drag it back to the ruler to remove it."
+            )
+        elif drag["index"] is not None:
+            self.session.show_message("Removed the guide.")
+        self.update()
+
+    def dragEnterEvent(self, event) -> None:
+        if self.on_drop is not None and event.mimeData() is not None and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if self.on_drop is None:
+            event.ignore()
+            return
+        self.on_drop(event)
 
     def _ensure_pixmap(self) -> None:
         if not self._dirty and self._pixmap is not None:
@@ -536,6 +672,8 @@ class CanvasView(QWidget):
             self._pan_last = pos
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
+        if event.button() == Qt.MouseButton.LeftButton and self._begin_guide(pos):
+            return
         tool = self.tool_getter()
         if tool is not None and tool.id == "zoom" and event.button() == Qt.MouseButton.LeftButton:
             alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
@@ -558,6 +696,9 @@ class CanvasView(QWidget):
             self._pan_last = pos
             self.update()
             return
+        if self._guide is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self._move_guide(pos)
+            return
         self._sync_hover_cursor(event)
         # The stroke timer owns coordinates for tools that poll, such as the
         # brush and freehand Select. A mouse-move during the drag only
@@ -570,6 +711,9 @@ class CanvasView(QWidget):
                 tool.pointer_move(self.session, self._pointer(event))
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._guide is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_guide(event.position())
+            return
         if self._panning and event.button() in {Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton}:
             self._panning = False
             self._pan_last = None
@@ -600,6 +744,11 @@ class CanvasView(QWidget):
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
         if event.key() == Qt.Key.Key_Escape:
+            if self._guide is not None:
+                self._guide = None
+                self.update()
+                event.accept()
+                return
             # A half-drawn shape or stroke is cancelled first. Escape with
             # nothing in progress clears the selection, which is the step
             # people look for after Select. Drop stored samples without

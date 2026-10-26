@@ -693,6 +693,45 @@ def draw_shape(
     return Image.alpha_composite(image.convert("RGBA"), overlay)
 
 
+def draw_gradient(
+    image: Image.Image,
+    kind: str,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    color_a: tuple[int, int, int, int],
+    color_b: tuple[int, int, int, int],
+    selection: Image.Image | None = None,
+) -> Image.Image:
+    """Blend ``color_a`` at ``start`` into ``color_b`` at ``end`` over ``image``.
+
+    Linear follows the drag and holds each end color beyond that segment.
+    Radial reaches ``color_b`` at the drag length and stays there farther out.
+    ``start`` and ``end`` are in the bitmap's own coordinates.
+    """
+    base = image.convert("RGBA")
+    width, height = base.size
+    ys, xs = np.mgrid[0:height, 0:width]
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    if kind == "radial":
+        radius = max(1.0, math.hypot(ex - sx, ey - sy))
+        dist = np.sqrt((xs - sx) ** 2 + (ys - sy) ** 2)
+        amount = np.clip(dist / radius, 0.0, 1.0)
+    else:
+        vx, vy = ex - sx, ey - sy
+        length2 = vx * vx + vy * vy
+        if length2 < 1e-6:
+            amount = np.zeros((height, width), np.float32)
+        else:
+            amount = np.clip(((xs - sx) * vx + (ys - sy) * vy) / length2, 0.0, 1.0)
+    start_color = np.array(color_a, np.float32)
+    end_color = np.array(color_b, np.float32)
+    mixed = start_color * (1.0 - amount[..., None]) + end_color * amount[..., None]
+    overlay = Image.fromarray(np.clip(np.rint(mixed), 0, 255).astype(np.uint8), "RGBA")
+    overlay = mask_with_selection(overlay, selection)
+    return Image.alpha_composite(base, overlay)
+
+
 def connected_mask(image: Image.Image, x: int, y: int, tolerance: int) -> Image.Image:
     """L mask of pixels 4-connected to ``(x, y)`` and within tolerance of it.
 
