@@ -1,4 +1,4 @@
-"""Zoom tool. Click to zoom in. Alt-click zooms out."""
+"""Zoom tool. Click to step. Drag up or down to scrub, then release to sharpen."""
 
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ class ZoomTool(Tool):
     label = "Zoom"
     shortcut = "Z"
     cursor = "zoom-in"
-    hint = "Click to zoom in. Alt-click zooms out. The wheel zooms at the cursor."
+    hint = (
+        "Click to zoom in. Alt-click zooms out. Drag up or down to zoom, and release "
+        "to sharpen a large picture. The wheel zooms at the cursor."
+    )
 
     def panel_actions(self):
         return [

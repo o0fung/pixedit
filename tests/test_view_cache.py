@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from PIL import Image
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
@@ -15,6 +16,7 @@ from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.brush import BrushTool
 from pixedit.tools.hand import HandTool
+from pixedit.tools.zoom import ZoomTool
 from pixedit.ui.canvas import CanvasView, pil_to_pixmap
 
 
@@ -266,8 +268,183 @@ def test_pan_of_a_small_page_does_not_use_a_stand_in():
     app.processEvents()
 
 
+def test_zoom_drag_of_a_large_page_stays_on_one_low_res_plate(monkeypatch):
+    """Scrubbing zoom scales the stand-in. Release rebuilds the sharp view once."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _zoom_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 0.2
+    canvas.offset_x = 30
+    canvas.offset_y = 30
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 80, 240)
+    assert calls["view"] == 0
+    assert canvas._pan_proxy is None
+    _pointer(canvas, "move", 80, 80)
+    canvas.repaint()
+    assert calls["composite"] == 0
+    assert calls["view"] == 1
+    assert canvas._zoom_scrub
+    assert canvas._pan_proxy is not None
+    assert max(canvas._pan_proxy.width(), canvas._pan_proxy.height()) <= PREVIEW_MAX_EDGE
+    assert canvas.zoom == pytest.approx(0.4)
+    _pointer(canvas, "move", 80, 40)
+    canvas.repaint()
+    assert calls["view"] == 1
+    assert canvas.zoom > 0.4
+
+    _pointer(canvas, "release", 80, 40)
+    canvas.repaint()
+    app.processEvents()
+    assert calls["composite"] == 0
+    assert calls["view"] == 2
+    assert canvas._pan_proxy is None
+    assert not canvas._zooming
+    assert canvas._pixmap_mode == "view"
+    assert canvas.zoom > 0.4
+    canvas.close()
+    app.processEvents()
+
+
+def test_zoom_drag_at_full_zoom_keeps_the_sharp_plate(monkeypatch):
+    """Scrubbing above 100% scales the full plate and does not flatten again."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _zoom_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 1.0
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "full"
+    sharp = canvas._pixmap
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 80, 260)
+    _pointer(canvas, "move", 80, 100)
+    canvas.repaint()
+    assert calls["composite"] == 0
+    assert calls["view"] == 0
+    assert canvas.zoom == pytest.approx(2.0)
+    assert canvas._pixmap is sharp
+    assert canvas._pan_proxy is not None
+
+    _pointer(canvas, "release", 80, 100)
+    canvas.repaint()
+    app.processEvents()
+    assert calls["composite"] == 0
+    assert calls["view"] == 0
+    assert canvas._pixmap is sharp
+    assert canvas._pixmap_mode == "full"
+    assert canvas._pan_proxy is None
+    assert canvas.zoom == pytest.approx(2.0)
+    canvas.close()
+    app.processEvents()
+
+
+def test_zoom_drag_below_full_zoom_rebuilds_the_view(monkeypatch):
+    """Dropping under 100% leaves the full plate and sharpens the screen view once."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _zoom_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 1.0
+    canvas.show()
+    app.processEvents()
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 80, 80)
+    _pointer(canvas, "move", 80, 240)
+    canvas.repaint()
+    assert calls["composite"] == 0
+    assert calls["view"] == 0
+    assert canvas.zoom == pytest.approx(0.5)
+    assert canvas._pixmap_mode == "full"
+
+    _pointer(canvas, "release", 80, 240)
+    canvas.repaint()
+    app.processEvents()
+    assert calls["composite"] == 0
+    assert calls["view"] == 1
+    assert canvas._pixmap_mode == "view"
+    assert canvas._pan_proxy is None
+    assert canvas.zoom == pytest.approx(0.5)
+    canvas.close()
+    app.processEvents()
+
+
+def test_zoom_click_steps_without_a_stand_in(monkeypatch):
+    """A click still steps the zoom. The stand-in is only for a drag."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _zoom_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 0.2
+    canvas.offset_x = 30
+    canvas.offset_y = 30
+    canvas.show()
+    app.processEvents()
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 80, 80)
+    _pointer(canvas, "release", 80, 80)
+    canvas.repaint()
+    app.processEvents()
+    assert canvas.zoom == pytest.approx(0.25)
+    assert canvas._pan_proxy is None
+    assert calls["composite"] == 0
+    assert calls["view"] == 1
+
+    _pointer(canvas, "press", 80, 80, alt=True)
+    _pointer(canvas, "release", 80, 80)
+    canvas.repaint()
+    app.processEvents()
+    assert canvas.zoom == pytest.approx(0.2)
+    assert calls["view"] == 2
+    canvas.close()
+    app.processEvents()
+
+
+def test_zoom_drag_of_a_small_page_does_not_use_a_stand_in():
+    """A page at the preview cap scrubs on its sharp cache."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(PREVIEW_MAX_EDGE, 600, "white"))
+    canvas = _zoom_canvas(session)
+    canvas.resize(400, 300)
+    canvas.zoom = 0.5
+    canvas.offset_x = 16
+    canvas.offset_y = 16
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+
+    _pointer(canvas, "press", 40, 180)
+    _pointer(canvas, "move", 40, 100)
+    canvas.repaint()
+    assert canvas._pan_proxy is None
+    assert canvas._zoom_scrub
+    assert canvas.zoom > 0.5
+    assert canvas._pixmap_mode == "view"
+
+    _pointer(canvas, "release", 40, 100)
+    canvas.repaint()
+    app.processEvents()
+    assert canvas._pan_proxy is None
+    assert canvas._pixmap_mode == "view"
+    canvas.close()
+    app.processEvents()
+
+
 def _hand_canvas(session) -> CanvasView:
     return CanvasView(session, lambda: HandTool(), lambda *_args: None)
+
+
+def _zoom_canvas(session) -> CanvasView:
+    return CanvasView(session, lambda: ZoomTool(), lambda *_args: None)
 
 
 def _spy_flatten(monkeypatch):
@@ -290,19 +467,20 @@ def _spy_flatten(monkeypatch):
     return calls
 
 
-def _pointer(widget, kind: str, x: float, y: float) -> None:
+def _pointer(widget, kind: str, x: float, y: float, *, alt: bool = False) -> None:
     from PyQt6.QtCore import QEvent, QPointF, Qt
     from PyQt6.QtGui import QMouseEvent
     from PyQt6.QtWidgets import QApplication
 
     pos = QPointF(x, y)
+    mods = Qt.KeyboardModifier.AltModifier if alt else Qt.KeyboardModifier.NoModifier
     if kind == "press":
         event = QMouseEvent(
             QEvent.Type.MouseButtonPress,
             pos,
             Qt.MouseButton.LeftButton,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.NoModifier,
+            mods,
         )
     elif kind == "move":
         event = QMouseEvent(
@@ -310,7 +488,7 @@ def _pointer(widget, kind: str, x: float, y: float) -> None:
             pos,
             Qt.MouseButton.NoButton,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.NoModifier,
+            mods,
         )
     else:
         event = QMouseEvent(
@@ -318,7 +496,7 @@ def _pointer(widget, kind: str, x: float, y: float) -> None:
             pos,
             Qt.MouseButton.LeftButton,
             Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
+            mods,
         )
     QApplication.sendEvent(widget, event)
 

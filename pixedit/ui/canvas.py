@@ -20,6 +20,10 @@ from pixedit.ui.cursors import tool_pixmap_cursor
 # Two stores are handed over together, so one redraw covers more than one coordinate.
 _STROKE_SAMPLE_MS = 8
 _STROKE_FLUSH_TICKS = 2
+# A shorter move is still a click. Past this, the zoom tool scrubs instead.
+_ZOOM_DRAG_THRESHOLD = 6.0
+# Vertical pixels that double the zoom, or halve it when dragging down.
+_ZOOM_DRAG_SPAN = 160.0
 
 _CURSORS = {
     "cross": Qt.CursorShape.CrossCursor,
@@ -116,10 +120,17 @@ class CanvasView(QWidget):
         self._space = False
         self._panning = False
         self._pan_last = None
-        # Low-resolution plate shown only while a large page is being panned.
+        # Low-resolution plate shown while a large page is panned or scrub-zoomed.
         # None means this drag is sliding the sharp cache.
         self._pan_proxy: QPixmap | None = None
         self._pan_selection_proxy: QPixmap | None = None
+        # Zoom-tool button. Scrub starts after the pointer moves, and the
+        # sharp picture is built when the button comes up.
+        self._zooming = False
+        self._zoom_scrub = False
+        self._zoom_anchor: tuple[float, float] | None = None
+        self._zoom_origin = 1.0
+        self._zoom_alt = False
         self._selection_id = None
         self._selection_pixmap: QPixmap | None = None
         self._edge_id = None
@@ -188,9 +199,9 @@ class CanvasView(QWidget):
             return
         if self._note_group_view():
             bounds = None
-        # A change under an active pan stays on the low-res plate. Rebuilding
-        # the sharp page here would stall the drag the plate is meant to avoid.
-        if self._panning and self._refresh_pan_proxy():
+        # A change under an active pan or zoom scrub stays on the low-res plate.
+        # Rebuilding the sharp page here would stall the drag the plate is meant to avoid.
+        if (self._panning or self._zoom_scrub) and self._refresh_pan_proxy():
             return
         if bounds is not None and self._patch_preview(bounds):
             self._update_region(bounds)
@@ -878,8 +889,10 @@ class CanvasView(QWidget):
         )
 
     def _using_pan_proxy(self) -> bool:
+        """Pan and zoom scrub share one whole-page plate."""
         proxy = self._pan_proxy
-        return self._panning and proxy is not None and not proxy.isNull()
+        active = self._panning or self._zoom_scrub
+        return active and proxy is not None and not proxy.isNull()
 
     def _clear_pan_proxy(self) -> None:
         self._pan_proxy = None
@@ -958,15 +971,16 @@ class CanvasView(QWidget):
     def _end_pan_proxy(self) -> None:
         """Drop the stand-in and show the sharp picture again.
 
-        A view cache's key includes the offset, so the cached rectangle is the
-        one from before the drag and has to be rebuilt. A full-page cache does
-        not, and release only repaints it unless the document changed.
+        A view cache's key includes the offset and the zoom, so the cached
+        rectangle is the one from before the drag and has to be rebuilt. A
+        full-page cache does not, and release only repaints it unless the
+        document changed or the zoom now wants the screen-sized cache.
         """
         had = self._pan_proxy is not None
         self._clear_pan_proxy()
         if not had:
             return
-        if self._pixmap_mode == "view" or self._dirty:
+        if self._pixmap_mode == "view" or self._dirty or self._use_view_cache():
             self._dirty = True
             self._selection_id = None
         elif self._selection_id is None:
@@ -990,12 +1004,69 @@ class CanvasView(QWidget):
             )
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
+    def _begin_zoom(self, pos, *, alt: bool) -> None:
+        """Remember where a zoom-tool press started. The step waits for release."""
+        self._zooming = True
+        self._zoom_scrub = False
+        self._zoom_anchor = (float(pos.x()), float(pos.y()))
+        self._zoom_origin = self.zoom
+        self._zoom_alt = alt
+
+    def _move_zoom(self, pos) -> None:
+        """Scrub zoom from the press point. The low-res plate covers the drag.
+
+        The plate is built on the first real move, before the zoom changes, so
+        later moves only scale that picture. Release sharpens whatever zoom
+        the drag reached.
+        """
+        anchor = self._zoom_anchor
+        if not self._zooming or anchor is None:
+            return
+        ax, ay = anchor
+        dy = ay - float(pos.y())
+        if not self._zoom_scrub:
+            if abs(dy) < _ZOOM_DRAG_THRESHOLD:
+                return
+            # Whole-page stand-in first. zoom_at would otherwise resample.
+            self._zoom_scrub = True
+            self._begin_pan_proxy()
+        factor = 2.0 ** (dy / _ZOOM_DRAG_SPAN)
+        target = min(32.0, max(0.02, self._zoom_origin * factor))
+        if abs(target - self.zoom) < 1e-4:
+            self.update()
+            return
+        self.zoom_at(ax, ay, target / self.zoom)
+
+    def _finish_zoom(self, event) -> None:
+        """A click steps once. A drag keeps the scrubbed zoom, then sharpens."""
+        anchor = self._zoom_anchor
+        scrubbed = self._zoom_scrub
+        alt = self._zoom_alt or bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        self._zooming = False
+        self._zoom_scrub = False
+        self._zoom_anchor = None
+        if not scrubbed and anchor is not None:
+            self.zoom_at(anchor[0], anchor[1], (1 / 1.25) if alt else 1.25)
+        self._end_pan_proxy()
+
+    def _cancel_zoom(self) -> None:
+        """Escape puts the zoom back and drops the stand-in."""
+        anchor = self._zoom_anchor
+        origin = self._zoom_origin
+        self._zooming = False
+        self._zoom_scrub = False
+        self._zoom_anchor = None
+        if anchor is not None and abs(self.zoom - origin) > 1e-6:
+            self.zoom_at(anchor[0], anchor[1], origin / self.zoom)
+        self._end_pan_proxy()
+
     # Panning a large page flattens once, down to PREVIEW_MAX_EDGE, and slides
-    # that whole-page plate until the button comes up. A full-page cache is
-    # scaled rather than flattened again, and release keeps it. A view cache
-    # is dropped on release because the offset is part of its key, then one
-    # screen-sized flatten takes its place. A document change during the drag
-    # rebuilds the low-res plate instead of the full page.
+    # that whole-page plate until the button comes up. A zoom-tool drag uses
+    # the same plate: the view scales with the pointer, and release is the one
+    # sharp flatten. A full-page cache is scaled rather than flattened again,
+    # and release keeps it while the zoom is still at 100% or more. A view
+    # cache is dropped on release because the offset and zoom are part of its
+    # key. A document change during the drag rebuilds the low-res plate.
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         if not self._has_page():
@@ -1012,7 +1083,7 @@ class CanvasView(QWidget):
         tool = self.tool_getter()
         if tool is not None and tool.id == "zoom" and event.button() == Qt.MouseButton.LeftButton:
             alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
-            self.zoom_at(pos.x(), pos.y(), 1 / 1.25 if alt else 1.25)
+            self._begin_zoom(pos, alt=alt)
             return
         if tool is not None and event.button() == Qt.MouseButton.LeftButton:
             tool.pointer_down(self.session, self._pointer(event))
@@ -1033,6 +1104,9 @@ class CanvasView(QWidget):
             self.offset_y += pos.y() - self._pan_last.y()
             self._pan_last = pos
             self.update()
+            return
+        if self._zooming and event.buttons() & Qt.MouseButton.LeftButton:
+            self._move_zoom(pos)
             return
         if self._guide is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self._move_guide(pos)
@@ -1069,6 +1143,10 @@ class CanvasView(QWidget):
                 self._hover_tool_id = tool.id
             self._apply_cursor()
             return
+        if self._zooming and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_zoom(event)
+            self._apply_cursor()
+            return
         if self._stroke_sampling and event.button() == Qt.MouseButton.LeftButton:
             self._finish_stroke_sampling(event)
             return
@@ -1088,6 +1166,10 @@ class CanvasView(QWidget):
             if self._guide is not None:
                 self._guide = None
                 self.update()
+                event.accept()
+                return
+            if self._zooming:
+                self._cancel_zoom()
                 event.accept()
                 return
             # A half-drawn shape or stroke is cancelled first. Escape with
