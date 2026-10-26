@@ -976,26 +976,41 @@ def fill_region(
     """Flood-fill from ``(x, y)`` and close the gap against a soft stroke.
 
     ``selection``, when given, is a layer-local mask. Pixels outside it are
-    not recolored, including the anti-aliased rim.
+    not recolored, including the anti-aliased rim. A hard selection is only
+    0 or 255 and replaces those pixels. A feathered edge is between those
+    values, so the new color fades back to the pixel that was there.
     """
     rgba = image.convert("RGBA")
     mask = connected_mask(rgba, int(x), int(y), tolerance)
     arr = np.array(rgba)
+    before = arr.copy()
     filled = np.asarray(mask.convert("L")) > 0
+    sel = None
     if selection is not None:
         sel = np.asarray(selection.convert("L"))
         if sel.shape == filled.shape:
             filled &= sel > 0
+        else:
+            sel = None
     if not np.any(filled) or not (0 <= int(y) < arr.shape[0] and 0 <= int(x) < arr.shape[1]):
         return Image.fromarray(arr, "RGBA")
     seed = arr[int(y), int(x)].copy()
     fringe = _inner_stroke_fringe(arr, filled, seed, tolerance)
-    if selection is not None:
-        sel = np.asarray(selection.convert("L"))
-        if sel.shape == fringe.shape:
-            fringe &= sel > 0
+    if sel is not None and sel.shape == fringe.shape:
+        fringe &= sel > 0
     _recolor_fringe(arr, fringe, seed, color, tolerance)
     arr[filled] = color
+    # 0 and 255 skip this mix, so a hard selection stays an exact replacement.
+    # Values between fade only the pixels this fill actually changed.
+    if sel is not None:
+        strength = sel.astype(np.float32) / 255.0
+        partial = (strength > 0.0) & (strength < 1.0) & (filled | fringe)
+        if np.any(partial):
+            mix = strength[partial][..., None]
+            original = before[partial].astype(np.float32)
+            edited = arr[partial].astype(np.float32)
+            mixed = original * (1.0 - mix) + edited * mix
+            arr[partial] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGBA")
 
 

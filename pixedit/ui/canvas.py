@@ -393,7 +393,9 @@ class CanvasView(QWidget):
                 self._ant_timer.start()
             return
         self._edge_id = id(selection)
-        mask = np.asarray(selection.convert("L")) > 0
+        # The outline is the 50% contour. A hard selection is 0 or 255, so
+        # this is the same edge as before. A feather fades through that line.
+        mask = _selection_core(np.asarray(selection.convert("L")))
         # One-pixel boundary: a pixel is an edge when any 4-neighbor is outside.
         eroded = mask.copy()
         if mask.shape[0] > 1:
@@ -805,13 +807,24 @@ def _is_clear_shortcut(event) -> bool:
     return event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
 
 
+def _selection_core(mask: np.ndarray) -> np.ndarray:
+    """True where coverage is at least half. The marching outline follows this edge."""
+    return mask >= 128
+
+
 def _selection_tint(selection: Image.Image) -> Image.Image:
     mask = np.asarray(selection.convert("L"))
     height, width = mask.shape
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    on = mask > 0
-    rgba[on] = (70, 170, 255, 70)
-    # One-pixel edge so the boundary stays readable over a busy photo.
+    # The tint follows coverage, so a feather reads as a fade. A hard
+    # selection is 0 or 255, which keeps the same 70-alpha blue as before.
+    visible = mask > 0
+    rgba[visible, 0] = 70
+    rgba[visible, 1] = 170
+    rgba[visible, 2] = 255
+    rgba[visible, 3] = (mask[visible].astype(np.uint16) * 70 // 255).astype(np.uint8)
+    # One-pixel edge so the 50% boundary stays readable over a busy photo.
+    on = _selection_core(mask)
     eroded = on.copy()
     eroded[1:, :] &= on[:-1, :]
     eroded[:-1, :] &= on[1:, :]

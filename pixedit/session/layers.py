@@ -12,7 +12,7 @@ from PIL import Image
 
 from pixedit.composite import baked_placement, composite, merge_pair
 from pixedit.factory import blank_layer, empty_raster_layer, raster_layer
-from pixedit.geom import tighten_raster_layer
+from pixedit.geom import alpha_bbox, tighten_raster_layer
 from pixedit.model import (
     CompoundCommand,
     DeleteGroupCommand,
@@ -447,3 +447,23 @@ class LayersMixin:
         count = len(copies)
         noun = "page" if count == 1 else "pages"
         self.show_message(f"Placed {count} {noun}. Each one is its own group.")
+
+    def paste_image(self, image: Image.Image) -> None:
+        """Add ``image`` as a new layer on the page on screen, centered.
+
+        The page size does not change. A picture larger than the canvas hangs
+        off the edges, and Transform can move it. Transparent margins are
+        cropped first, so the layer is only as big as its opaque pixels.
+        One undo step.
+        """
+        # Copy so later edits to the caller's image cannot change the layer.
+        rgba = image.convert("RGBA").copy()
+        if alpha_bbox(rgba) is None:
+            self.show_message("The clipboard image has no opaque pixels.")
+            return
+        layer = raster_layer("Pasted", rgba)
+        tighten_raster_layer(layer)
+        layer.x = int(round((self.document.width - layer.image.width) / 2))
+        layer.y = int(round((self.document.height - layer.image.height) / 2))
+        self.add_layer(layer, name="Paste")
+        self.show_message("Pasted the clipboard image as a new layer.")
