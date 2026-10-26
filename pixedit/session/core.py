@@ -33,6 +33,7 @@ def default_options() -> dict[str, Any]:
         "color_shade": 0,
         "select_mode": "rect",
         "tolerance": 32,
+        "feather": 0,
         "shape_kind": "rect",
         "stroke_width": 4,
         "shape_filled": False,

@@ -55,6 +55,7 @@ class SelectTool(Tool):
                 "default": "rect",
             },
             {"key": "tolerance", "label": "Wand tolerance", "type": "int", "min": 0, "max": 255, "default": 32},
+            {"key": "feather", "label": "Feather", "type": "int", "min": 0, "max": 250, "default": 0, "suffix": " px"},
         ]
 
     def cursor_name(self, session) -> str:
@@ -150,7 +151,10 @@ class SelectTool(Tool):
                 mode = "add"
             elif event.alt:
                 mode = "subtract"
-        session.set_selection(combine_selection(session.document.selection, mask, mode))
+        softened = self._feather_new_mask(session, mask)
+        if softened is None:
+            return
+        session.set_selection(combine_selection(session.document.selection, softened, mode))
 
     def pointer_cancel(self, session) -> bool:
         active = self._dragging
@@ -202,7 +206,32 @@ class SelectTool(Tool):
             mode = "add"
         elif event.alt:
             mode = "subtract"
-        session.set_selection(combine_selection(doc.selection, canvas, mode), name="Magic wand")
+        softened = self._feather_new_mask(session, canvas)
+        if softened is None:
+            return
+        session.set_selection(combine_selection(doc.selection, softened, mode), name="Magic wand")
+
+    def _feather_new_mask(self, session, mask: Image.Image) -> Image.Image | None:
+        """Soften a new mask by the Select options radius, before it is combined.
+
+        Flow:
+        1. A radius of 0 is a hard edge. It is not clamped up to 1 px.
+        2. A larger radius uses the same 1..250 blur as Select → Feather, and
+           only this new piece is softened. Shift and Alt combine afterwards.
+        3. None means the blur erased the mask. The status bar already says
+           so, and the selection already on screen stays put.
+        """
+        radius = int(session.option("feather", 0))
+        if radius <= 0:
+            return mask
+        from pixedit.session.selection import FEATHER_MAX, feather_mask
+
+        radius = min(FEATHER_MAX, radius)
+        softened = feather_mask(mask, radius)
+        if softened is None:
+            session.show_message("That feather clears the selection. Try a smaller radius.")
+            return None
+        return softened
 
     def overlays(self, session) -> list[Overlay]:
         if not self._dragging:

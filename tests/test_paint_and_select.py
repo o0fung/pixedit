@@ -280,6 +280,61 @@ def test_wand_does_not_take_a_flat_neighbor_or_a_slow_gradient():
     )
 
 
+def test_select_feather_softens_the_new_mask_only():
+    """Feather 0 stays hard. A larger radius blurs the new piece, then Shift or Alt combines it."""
+    from pixedit.geom import combine_selection
+
+    session = Session(new_document(40, 40, "white"))
+    session.options["select_mode"] = "rect"
+    session.options["feather"] = 0
+    tool = SelectTool()
+    tool.pointer_down(session, PointerEvent(10, 10))
+    tool.pointer_up(session, PointerEvent(29, 29))
+    hard = np.asarray(session.document.selection)
+    assert hard[20, 20] == 255
+    assert hard[10, 20] == 255
+    assert hard[9, 20] == 0
+
+    # Raising the slider does not redo the selection already on screen.
+    session.options["feather"] = 4
+    assert np.array_equal(np.asarray(session.document.selection), hard)
+
+    tool.pointer_down(session, PointerEvent(10, 10))
+    tool.pointer_up(session, PointerEvent(29, 29))
+    soft = np.asarray(session.document.selection)
+    assert int(soft[20, 20]) > 240
+    assert int(soft[10, 20]) < 255
+    assert 0 < int(soft[8, 20]) < 128
+    assert int(soft[0, 0]) == 0
+
+    tool.pointer_down(session, PointerEvent(10, 10, shift=True))
+    tool.pointer_up(session, PointerEvent(29, 29, shift=True))
+    added = np.asarray(session.document.selection)
+    assert int(added[20, 20]) >= int(soft[20, 20])
+    assert int(added[8, 20]) >= int(soft[8, 20])
+
+    full = Image.new("L", (5, 1), 255)
+    punch = Image.new("L", (5, 1), 0)
+    punch.putpixel((2, 0), 255)
+    punched = np.asarray(combine_selection(full, punch, "subtract"))
+    assert list(punched[0]) == [255, 255, 0, 255, 255]
+    fade = Image.new("L", (5, 1), 0)
+    fade.putpixel((2, 0), 128)
+    faded = np.asarray(combine_selection(full, fade, "subtract"))
+    assert int(faded[0, 2]) == int(round(255 * (255 - 128) / 255.0))
+    assert int(faded[0, 0]) == 255
+
+    session.options["feather"] = 0
+    session.select_all()
+    session.options["feather"] = 2
+    tool.pointer_down(session, PointerEvent(5, 5, alt=True))
+    tool.pointer_up(session, PointerEvent(34, 34, alt=True))
+    cut = np.asarray(session.document.selection)
+    assert int(cut[20, 20]) == 0
+    assert 0 < int(cut[3, 20]) < 255
+    assert int(cut[0, 0]) == 255
+
+
 def test_rect_selection_shift_adds():
     session = Session(new_document(30, 30, "white"))
     session.options["select_mode"] = "rect"

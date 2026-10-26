@@ -36,9 +36,22 @@ from pixedit.model import (
 from pixedit.pixels import gaussian_image
 
 # Feather asks for a pixel radius. Wider than this, a small selection blurs
-# away to nothing, so the dialog and the session share the same cap.
+# away to nothing, so the Select slider and the session share the same cap.
+# 0 is a hard edge and is not clamped up to this minimum.
 FEATHER_MIN = 1
 FEATHER_MAX = 250
+
+
+def feather_mask(mask: Image.Image, radius: int) -> Image.Image | None:
+    """Blur an L mask by ``radius`` pixels. None when that blur erases it.
+
+    ``radius`` is already in 1..250. A hard edge does not come here: the
+    caller skips the blur when the Select slider is 0.
+    """
+    blurred = np.asarray(gaussian_image(mask.convert("L"), radius).convert("L"))
+    if int(blurred.max()) == 0:
+        return None
+    return Image.fromarray(np.ascontiguousarray(blurred), "L")
 
 
 def _coverage(local: Image.Image, shape: tuple[int, int]) -> np.ndarray | None:
@@ -243,8 +256,9 @@ class SelectionMixin:
         """Blur the selection by ``radius`` pixels so edits fade at the edge.
 
         With no page open, stop before touching a mask. Otherwise:
-        1. Clamp the radius to 1..250 px. The dialog uses the same range, and
-           a larger request is brought back into it.
+        1. Clamp the radius to 1..250 px. The Select slider uses the same
+           range, and a larger request is brought back into it. A slider at 0
+           is a hard edge and is not passed here.
         2. Blur the page-sized mask. Paint, fill, and filters already treat
            the gray values as coverage.
         3. If that blur rounds away to nothing, leave the selection alone and
@@ -259,14 +273,14 @@ class SelectionMixin:
         radius = int(round(float(radius)))
         radius = min(FEATHER_MAX, max(FEATHER_MIN, radius))
         full = place_image(self.document.selection.convert("L"), 0, 0, self.document.width, self.document.height, 0)
-        blurred = np.asarray(gaussian_image(full, radius).convert("L"))
-        if int(blurred.max()) == 0:
+        blurred = feather_mask(full, radius)
+        if blurred is None:
             self.show_message("That feather clears the selection. Try a smaller radius.")
             return
-        if np.array_equal(np.asarray(full), blurred):
+        if np.array_equal(np.asarray(full), np.asarray(blurred)):
             self.show_message(f"Feather of {radius} px did not change the selection.")
             return
-        self.set_selection(Image.fromarray(np.ascontiguousarray(blurred), "L"), name="Feather")
+        self.set_selection(blurred, name="Feather")
         self.show_message(f"Feathered the selection by {radius} px. The outline is the 50% edge.")
 
     def _can_copy_pixels(self, layer: Layer | None) -> bool:

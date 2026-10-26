@@ -62,7 +62,6 @@ from pixedit.ui.clipboard import copy_image, image_from_clipboard
 from pixedit.ui.dialogs import (
     AboutDialog,
     CanvasSizeDialog,
-    FeatherDialog,
     ImageSizeDialog,
     LiveFilterDialog,
     NewDocumentDialog,
@@ -886,15 +885,22 @@ class MainWindow(QMainWindow):
         self.session.paste_image(image)
 
     def _feather_selection(self) -> None:
+        """Soften the current selection by the Select options radius.
+
+        The slider is the radius. 0 is a hard edge, so this asks for a larger
+        value instead of opening a dialog. No selection still explains how to
+        draw one.
+        """
         if not self.session.require_page():
             return
         if self.session.document.selection is None:
             self.session.show_message("No selection. Draw one with Select (S), then Feather softens its edge.")
             return
-        dialog = FeatherDialog(self)
-        if dialog.exec() != dialog.DialogCode.Accepted:
+        radius = int(self.session.option("feather", 0))
+        if radius <= 0:
+            self.session.show_message("Feather is 0. Raise it in the Select options, then choose Feather… again.")
             return
-        self.session.feather_selection(dialog.radius())
+        self.session.feather_selection(radius)
 
     def _prompt_text(self, initial):
         dialog = TextDialog(initial, self)

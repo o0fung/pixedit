@@ -1826,7 +1826,7 @@ def test_clipboard_round_trip_paste_and_feather_outline():
     from pixedit.session.core import START_HINT
     from pixedit.ui.canvas import _selection_core, _selection_tint
     from pixedit.ui.clipboard import image_from_clipboard
-    from pixedit.ui.dialogs import FeatherDialog, ShortcutsDialog
+    from pixedit.ui.dialogs import ShortcutsDialog
     from pixedit.ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])
@@ -1874,10 +1874,29 @@ def test_clipboard_round_trip_paste_and_feather_outline():
     assert pasted.image.size == (20, 20)
     assert (pasted.x, pasted.y) == (-5, -5)
 
-    dialog = FeatherDialog(window)
-    assert dialog.pixels.minimum() == 1
-    assert dialog.pixels.maximum() == 250
-    assert dialog.radius() == 8
+    from pixedit.ui import dialogs
+
+    assert not hasattr(dialogs, "FeatherDialog")
+    window.set_tool(window.tool_by_id["select"])
+    app.processEvents()
+    slider = window.options._widgets["feather"]
+    assert slider.minimum() == 0
+    assert slider.maximum() == 250
+    assert slider.value() == 0
+    assert window.options._labels["feather"].text() == "Feather  0 px"
+    hard = Image.new("L", (10, 10), 0)
+    hard.paste(255, (2, 2, 8, 8))
+    window.session.set_selection(hard)
+    window._feather_selection()
+    assert "Select options" in window.statusBar().currentMessage()
+    assert window.session.document.selection.getpixel((4, 4)) == 255
+    window.session.options["feather"] = 2
+    window.options.sync("feather", 2)
+    assert slider.value() == 2
+    window.session.set_selection(hard)
+    window._feather_selection()
+    feathered = window.session.document.selection
+    assert 255 > feathered.getpixel((4, 4)) > feathered.getpixel((0, 0)) > 0
     guide = ShortcutsDialog(window)
     text = guide.layout().itemAt(0).widget().text()
     assert "Ctrl+Shift+C" in text

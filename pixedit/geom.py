@@ -1144,7 +1144,9 @@ def combine_selection(
     """Combine a new mask with the current selection.
 
     ``replace`` (or no existing selection) keeps ``new_mask``. ``add`` is a
-    union, ``subtract`` punches ``new_mask`` out of the existing selection.
+    union. ``subtract`` fades the existing coverage by ``new_mask``: 255
+    clears a pixel, and a value between leaves that fraction. A hard mask is
+    only 0 or 255, so it still punches a hole.
     """
     if mode == "replace" or existing is None:
         return new_mask.copy()
@@ -1157,8 +1159,11 @@ def combine_selection(
     if mode == "add":
         out = np.maximum(current, incoming)
     elif mode == "subtract":
-        out = current.copy()
-        out[incoming > 0] = 0
+        # Hard coverage is 0 or 255 and still clears the pixel. A feathered
+        # edge is between those, so it thins the selection instead of cutting
+        # every touched pixel down to nothing.
+        keep = (255 - incoming).astype(np.float32) / 255.0
+        out = np.clip(np.rint(current.astype(np.float32) * keep), 0, 255).astype(np.uint8)
     else:
         out = incoming
     return Image.fromarray(out, "L")
