@@ -10,9 +10,11 @@ from PyQt6.QtWidgets import QApplication
 from pixedit.composite import composite, composite_view
 from pixedit.factory import raster_layer, redaction_layer
 from pixedit.model import Document, new_document
+from pixedit.proxy import PREVIEW_MAX_EDGE
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.brush import BrushTool
+from pixedit.tools.hand import HandTool
 from pixedit.ui.canvas import CanvasView, pil_to_pixmap
 
 
@@ -156,6 +158,169 @@ def test_brush_patch_matches_full_flatten(monkeypatch):
     tool.pointer_cancel(session)
     canvas.close()
     app.processEvents()
+
+
+def test_pan_of_a_large_zoomed_out_page_reuses_one_low_res_plate(monkeypatch):
+    """Moves slide one stand-in. Release rebuilds the screen-sized view once."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _hand_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 0.2
+    canvas.offset_x = 30
+    canvas.offset_y = 30
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 40, 40)
+    assert calls["composite"] == 0
+    assert calls["view"] == 1
+    assert canvas._pan_proxy is not None
+    assert max(canvas._pan_proxy.width(), canvas._pan_proxy.height()) <= PREVIEW_MAX_EDGE
+    _pointer(canvas, "move", 70, 55)
+    canvas.repaint()
+    _pointer(canvas, "move", 100, 70)
+    canvas.repaint()
+    assert calls["composite"] == 0
+    assert calls["view"] == 1
+    assert canvas._panning
+
+    _pointer(canvas, "release", 100, 70)
+    canvas.repaint()
+    app.processEvents()
+    assert calls["composite"] == 0
+    assert calls["view"] == 2
+    assert canvas._pan_proxy is None
+    assert canvas._pixmap_mode == "view"
+    assert canvas._pixmap is not None
+    assert max(canvas._pixmap.width(), canvas._pixmap.height()) < PREVIEW_MAX_EDGE
+    canvas.close()
+    app.processEvents()
+
+
+def test_pan_at_full_zoom_keeps_the_sharp_plate(monkeypatch):
+    """A full-page cache is scaled for the drag and restored without flattening again."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    canvas = _hand_canvas(session)
+    canvas.resize(480, 360)
+    canvas.zoom = 1.0
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "full"
+    sharp = canvas._pixmap
+    calls = _spy_flatten(monkeypatch)
+
+    _pointer(canvas, "press", 40, 40)
+    _pointer(canvas, "move", 90, 70)
+    canvas.repaint()
+    _pointer(canvas, "move", 140, 100)
+    canvas.repaint()
+    assert calls["composite"] == 0
+    assert calls["view"] == 0
+    assert canvas._pixmap is sharp
+    assert canvas._pan_proxy is not None
+    assert max(canvas._pan_proxy.width(), canvas._pan_proxy.height()) <= PREVIEW_MAX_EDGE
+
+    _pointer(canvas, "release", 140, 100)
+    canvas.repaint()
+    app.processEvents()
+    assert calls["composite"] == 0
+    assert calls["view"] == 0
+    assert canvas._pixmap is sharp
+    assert canvas._pixmap_mode == "full"
+    assert canvas._pan_proxy is None
+    canvas.close()
+    app.processEvents()
+
+
+def test_pan_of_a_small_page_does_not_use_a_stand_in():
+    """A page that already fits the preview cap stays on its sharp cache."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(PREVIEW_MAX_EDGE, 600, "white"))
+    canvas = _hand_canvas(session)
+    canvas.resize(400, 300)
+    canvas.zoom = 0.5
+    canvas.offset_x = 16
+    canvas.offset_y = 16
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+    mode = canvas._pixmap_mode
+
+    _pointer(canvas, "press", 30, 30)
+    _pointer(canvas, "move", 80, 60)
+    canvas.repaint()
+    assert canvas._pan_proxy is None
+    assert canvas._panning
+    assert canvas._pixmap_mode == mode
+
+    _pointer(canvas, "release", 80, 60)
+    canvas.repaint()
+    app.processEvents()
+    assert canvas._pan_proxy is None
+    assert canvas._pixmap_mode == mode
+    canvas.close()
+    app.processEvents()
+
+
+def _hand_canvas(session) -> CanvasView:
+    return CanvasView(session, lambda: HandTool(), lambda *_args: None)
+
+
+def _spy_flatten(monkeypatch):
+    import pixedit.ui.canvas as canvas_mod
+
+    calls = {"composite": 0, "view": 0}
+    real_composite = canvas_mod.composite
+    real_view = canvas_mod.composite_view
+
+    def spy_composite(document):
+        calls["composite"] += 1
+        return real_composite(document)
+
+    def spy_view(document, box, scale):
+        calls["view"] += 1
+        return real_view(document, box, scale)
+
+    monkeypatch.setattr(canvas_mod, "composite", spy_composite)
+    monkeypatch.setattr(canvas_mod, "composite_view", spy_view)
+    return calls
+
+
+def _pointer(widget, kind: str, x: float, y: float) -> None:
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QApplication
+
+    pos = QPointF(x, y)
+    if kind == "press":
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            pos,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    elif kind == "move":
+        event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            pos,
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    else:
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonRelease,
+            pos,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+    QApplication.sendEvent(widget, event)
 
 
 def _rgba(pixmap) -> np.ndarray:

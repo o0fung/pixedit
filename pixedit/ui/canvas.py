@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from pixedit.composite import composite, composite_region, composite_view, redaction_padding, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
+from pixedit.proxy import PREVIEW_MAX_EDGE
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
 
@@ -115,6 +116,10 @@ class CanvasView(QWidget):
         self._space = False
         self._panning = False
         self._pan_last = None
+        # Low-resolution plate shown only while a large page is being panned.
+        # None means this drag is sliding the sharp cache.
+        self._pan_proxy: QPixmap | None = None
+        self._pan_selection_proxy: QPixmap | None = None
         self._selection_id = None
         self._selection_pixmap: QPixmap | None = None
         self._edge_id = None
@@ -178,10 +183,15 @@ class CanvasView(QWidget):
         self.sync_welcome()
         if not self.session.document.groups:
             self._dirty = True
+            self._clear_pan_proxy()
             self.update()
             return
         if self._note_group_view():
             bounds = None
+        # A change under an active pan stays on the low-res plate. Rebuilding
+        # the sharp page here would stall the drag the plate is meant to avoid.
+        if self._panning and self._refresh_pan_proxy():
+            return
         if bounds is not None and self._patch_preview(bounds):
             self._update_region(bounds)
             return
@@ -400,10 +410,13 @@ class CanvasView(QWidget):
         )
         painter.setClipRect(ruler, ruler, max(0, self.width() - ruler), max(0, self.height() - ruler))
         self._paint_checker(painter, target)
-        dest = self._pixmap_dest(target)
-        if self._pixmap is not None and not self._pixmap.isNull():
-            painter.drawPixmap(dest, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
-        self._paint_selection(painter, dest)
+        if self._using_pan_proxy():
+            self._paint_pan_proxy(painter, target)
+        else:
+            dest = self._pixmap_dest(target)
+            if self._pixmap is not None and not self._pixmap.isNull():
+                painter.drawPixmap(dest, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+            self._paint_selection(painter, dest)
         self._paint_ants(painter)
         self._paint_overlays(painter)
         painter.setClipping(False)
@@ -517,7 +530,11 @@ class CanvasView(QWidget):
             return
         self.on_drop(event)
 
-    def _ensure_pixmap(self) -> None:
+    def _ensure_pixmap(self, *, chrome: bool = True) -> None:
+        # The pan plate is already the picture on screen. Rebuilding the sharp
+        # cache here would follow the offset and stall every move.
+        if self._using_pan_proxy():
+            return
         if self._pixmap_is_current():
             return
         doc = self.session.document
@@ -533,7 +550,8 @@ class CanvasView(QWidget):
             self._view_box = None
             self._view_key = None
         self._dirty = False
-        self._sync_selection_chrome()
+        if chrome:
+            self._sync_selection_chrome()
 
     def _pixmap_is_current(self) -> bool:
         if self._dirty or self._pixmap is None or self._pixmap.isNull():
@@ -834,6 +852,150 @@ class CanvasView(QWidget):
             return
         self.zoom_at(event.position().x(), event.position().y(), 1.1 if delta > 0 else 1 / 1.1)
 
+    def _wants_pan_proxy(self) -> bool:
+        """A page this large is worth sliding as a blurry stand-in."""
+        doc = self.session.document
+        if doc.width < 1 or doc.height < 1:
+            return False
+        return max(doc.width, doc.height) > PREVIEW_MAX_EDGE
+
+    def _pan_proxy_size(self, width: int, height: int) -> tuple[int, int]:
+        longest = max(int(width), int(height), 1)
+        scale = PREVIEW_MAX_EDGE / float(longest)
+        return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+    def _full_plate_current(self) -> bool:
+        """The sharp cache is the whole page and matches the document."""
+        doc = self.session.document
+        pixmap = self._pixmap
+        return (
+            not self._dirty
+            and pixmap is not None
+            and not pixmap.isNull()
+            and self._pixmap_mode == "full"
+            and pixmap.width() == doc.width
+            and pixmap.height() == doc.height
+        )
+
+    def _using_pan_proxy(self) -> bool:
+        proxy = self._pan_proxy
+        return self._panning and proxy is not None and not proxy.isNull()
+
+    def _clear_pan_proxy(self) -> None:
+        self._pan_proxy = None
+        self._pan_selection_proxy = None
+
+    def _begin_pan_proxy(self) -> None:
+        """Flatten once at the start of a drag. Small pages keep the sharp plate."""
+        if not self._wants_pan_proxy():
+            return
+        self._install_pan_proxy()
+
+    def _install_pan_proxy(self) -> None:
+        """Replace the pan plate with a fresh low-resolution flatten of the page.
+
+        A full-page cache is scaled, masks included, so the sharp pixmap stays
+        put. Anything else is box-filtered straight to the stand-in size. A
+        visible mask with no full plate yet is flattened once at full size,
+        then scaled, because blur and noise cannot be cropped from a downsample.
+        """
+        self._clear_pan_proxy()
+        if not self._wants_pan_proxy():
+            return
+        doc = self.session.document
+        width, height = self._pan_proxy_size(doc.width, doc.height)
+        plate = self._pixmap if self._full_plate_current() else None
+        if plate is None and shows_redaction(doc):
+            # Skip the full-page selection tint. The drag draws a scaled one.
+            self._ensure_pixmap(chrome=False)
+            plate = self._pixmap if self._full_plate_current() else None
+        if plate is not None and not plate.isNull():
+            self._pan_proxy = plate.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+        else:
+            longest = max(doc.width, doc.height, 1)
+            image = composite_view(
+                doc,
+                (0.0, 0.0, float(doc.width), float(doc.height)),
+                PREVIEW_MAX_EDGE / float(longest),
+            )
+            self._pan_proxy = pil_to_pixmap(image)
+        self._install_pan_selection()
+
+    def _install_pan_selection(self) -> None:
+        """Tint the selection at the stand-in's size, not the page's."""
+        selection = self.session.document.selection
+        proxy = self._pan_proxy
+        if selection is None or proxy is None or proxy.isNull():
+            self._pan_selection_proxy = None
+            self._sync_ants(selection)
+            return
+        tint = _view_selection_tint(
+            selection,
+            (0.0, 0.0, float(selection.width), float(selection.height)),
+            proxy.width(),
+            proxy.height(),
+        )
+        self._pan_selection_proxy = pil_to_pixmap(tint)
+        self._sync_ants(selection)
+
+    def _refresh_pan_proxy(self) -> bool:
+        """Rebuild the stand-in after the document changes. False if this drag has none."""
+        if self._pan_proxy is None and not self._wants_pan_proxy():
+            return False
+        self._dirty = True
+        self._selection_id = None
+        self._install_pan_proxy()
+        if self._pan_proxy is None:
+            return False
+        self.update()
+        return True
+
+    def _end_pan_proxy(self) -> None:
+        """Drop the stand-in and show the sharp picture again.
+
+        A view cache's key includes the offset, so the cached rectangle is the
+        one from before the drag and has to be rebuilt. A full-page cache does
+        not, and release only repaints it unless the document changed.
+        """
+        had = self._pan_proxy is not None
+        self._clear_pan_proxy()
+        if not had:
+            return
+        if self._pixmap_mode == "view" or self._dirty:
+            self._dirty = True
+            self._selection_id = None
+        elif self._selection_id is None:
+            self._sync_selection_chrome()
+        self.update()
+
+    def _paint_pan_proxy(self, painter: QPainter, target: QRectF) -> None:
+        proxy = self._pan_proxy
+        if proxy is None or proxy.isNull():
+            return
+        # The plate is coarser than the screen. Smooth the stretch so the
+        # drag looks soft instead of blocky. Rulers are drawn after this.
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(target, proxy, QRectF(0, 0, proxy.width(), proxy.height()))
+        selection = self._pan_selection_proxy
+        if selection is not None and not selection.isNull():
+            painter.drawPixmap(
+                target,
+                selection,
+                QRectF(0, 0, selection.width(), selection.height()),
+            )
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+
+    # Panning a large page flattens once, down to PREVIEW_MAX_EDGE, and slides
+    # that whole-page plate until the button comes up. A full-page cache is
+    # scaled rather than flattened again, and release keeps it. A view cache
+    # is dropped on release because the offset is part of its key, then one
+    # screen-sized flatten takes its place. A document change during the drag
+    # rebuilds the low-res plate instead of the full page.
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         if not self._has_page():
@@ -842,6 +1004,7 @@ class CanvasView(QWidget):
         if event.button() == Qt.MouseButton.MiddleButton or self._space or self._is_hand():
             self._panning = True
             self._pan_last = pos
+            self._begin_pan_proxy()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if event.button() == Qt.MouseButton.LeftButton and self._begin_guide(pos):
@@ -865,6 +1028,7 @@ class CanvasView(QWidget):
         # The key may have gone down while another widget had the keyboard.
         self.set_alt_held(bool(event.modifiers() & Qt.KeyboardModifier.AltModifier))
         if self._panning and self._pan_last is not None:
+            # Slide the plate from press. Do not flatten again on this move.
             self.offset_x += pos.x() - self._pan_last.x()
             self.offset_y += pos.y() - self._pan_last.y()
             self._pan_last = pos
@@ -893,6 +1057,7 @@ class CanvasView(QWidget):
         if self._panning and event.button() in {Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton}:
             self._panning = False
             self._pan_last = None
+            self._end_pan_proxy()
             tool = self.tool_getter()
             if (
                 tool is not None
