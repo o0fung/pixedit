@@ -16,7 +16,7 @@ from typing import Any
 
 from PIL import Image
 
-BLEND_MODES = ("normal", "multiply", "screen", "overlay")
+BLEND_MODES = ("normal", "multiply", "screen", "overlay", "darken", "lighten", "color", "luminosity")
 LAYER_KINDS = ("raster", "text", "redaction")
 
 
@@ -395,6 +395,9 @@ class LayerGroup:
     # real selection: 255 is included, 0 is excluded. The mask is this page's
     # size, not the size of any other group.
     selection: Image.Image | None = None
+    # Pixel positions. Vertical guides are x, horizontal guides are y.
+    guides_v: tuple[int, ...] = ()
+    guides_h: tuple[int, ...] = ()
 
     def clone(self) -> LayerGroup:
         """A new group with copied layers. Mask targets point at the copies."""
@@ -410,6 +413,8 @@ class LayerGroup:
             height=self.height,
             layers=copies,
             selection=None if self.selection is None else self.selection.copy(),
+            guides_v=tuple(self.guides_v),
+            guides_h=tuple(self.guides_h),
         )
 
 
@@ -863,13 +868,42 @@ def _copy_selection(selection: Image.Image | None) -> Image.Image | None:
     return None if selection is None else selection.copy()
 
 
+class SetGuidesCommand(Command):
+    """Replace the guides on the page that is showing when the command runs."""
+
+    name = "Guides"
+
+    def __init__(self, document: Document, vertical: tuple[int, ...], horizontal: tuple[int, ...]) -> None:
+        self.document = document
+        self.new_v = tuple(int(value) for value in vertical)
+        self.new_h = tuple(int(value) for value in horizontal)
+        self.old_v: tuple[int, ...] = ()
+        self.old_h: tuple[int, ...] = ()
+        self._captured = False
+
+    def execute(self) -> None:
+        group = self.document.group
+        if not self._captured:
+            self.old_v = tuple(group.guides_v)
+            self.old_h = tuple(group.guides_h)
+            self._captured = True
+        group.guides_v = self.new_v
+        group.guides_h = self.new_h
+
+    def undo(self) -> None:
+        group = self.document.group
+        group.guides_v = self.old_v
+        group.guides_h = self.old_h
+
+
 class ReplaceDocumentContent(Command):
     """Swap the layer list, canvas size, and selection as one undo step.
 
     Used by crop, trim, canvas rotate/flip, and flatten. The replacement
     layer objects become the live layers; the previous objects are kept for
     undo and are not mutated by later commands (later edits target the new
-    objects only).
+    objects only). ``guides`` is ``(vertical, horizontal)`` when the crop or
+    turn should move the guides with the pixels. None leaves them alone.
     """
 
     def __init__(
@@ -881,6 +915,7 @@ class ReplaceDocumentContent(Command):
         selection: Image.Image | None,
         name: str = "Edit",
         dpi: float | None = None,
+        guides: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
     ) -> None:
         self.document = document
         self.new_layers = list(layers)
@@ -888,12 +923,14 @@ class ReplaceDocumentContent(Command):
         self.new_height = int(height)
         self.new_selection = _copy_selection(selection)
         self.new_dpi = None if dpi is None else float(dpi)
+        self.new_guides = None if guides is None else (tuple(int(v) for v in guides[0]), tuple(int(v) for v in guides[1]))
         self.name = name
         self.old_layers: list[Layer] | None = None
         self.old_width = 0
         self.old_height = 0
         self.old_selection: Image.Image | None = None
         self.old_dpi: float | None = None
+        self.old_guides: tuple[tuple[int, ...], tuple[int, ...]] | None = None
         self._captured = False
 
     def execute(self) -> None:
@@ -903,6 +940,9 @@ class ReplaceDocumentContent(Command):
             self.old_height = self.document.height
             self.old_selection = _copy_selection(self.document.selection)
             self.old_dpi = float(self.document.dpi)
+            if self.new_guides is not None:
+                group = self.document.group
+                self.old_guides = (tuple(group.guides_v), tuple(group.guides_h))
             self._captured = True
         self.document.layers = list(self.new_layers)
         self.document.width = self.new_width
@@ -912,6 +952,9 @@ class ReplaceDocumentContent(Command):
         # and undo puts the previous resolution back with the pixels.
         if self.new_dpi is not None:
             self.document.dpi = self.new_dpi
+        if self.new_guides is not None:
+            self.document.group.guides_v = self.new_guides[0]
+            self.document.group.guides_h = self.new_guides[1]
 
     def undo(self) -> None:
         if self.old_layers is None:
@@ -922,6 +965,9 @@ class ReplaceDocumentContent(Command):
         self.document.selection = _copy_selection(self.old_selection)
         if self.new_dpi is not None and self.old_dpi is not None:
             self.document.dpi = self.old_dpi
+        if self.old_guides is not None:
+            self.document.group.guides_v = self.old_guides[0]
+            self.document.group.guides_h = self.old_guides[1]
 
 
 class RenameGroupCommand(Command):

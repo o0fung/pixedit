@@ -8,6 +8,7 @@ from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QColorDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from pixedit import __version__
 from pixedit.adjust import blur, brightness_contrast, desaturate, hue_saturation, invert, levels, pixelate, sharpen
+from pixedit.frames import apply_layer_frame, export_animated_gif, frame_count, frame_kind
 from pixedit.io import (
     EXPORT_SUFFIXES,
     export_filter_for_suffix,
@@ -71,7 +73,7 @@ _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pd
 # Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
 _TOOL_GROUPS = (
     ("transform", "hand", "zoom", "select"),
-    ("brush", "eraser", "fill", "shape", "text"),
+    ("brush", "eraser", "fill", "shape", "gradient", "text"),
     ("color", "crop", "mask"),
 )
 
@@ -154,7 +156,15 @@ class MainWindow(QMainWindow):
         scroll.setWidget(self.options)
         left_layout.addWidget(scroll, 1)
 
-        self.canvas = CanvasView(self.session, self._current_tool, self._on_cursor)
+        self.canvas = CanvasView(self.session, self._current_tool, self._on_cursor, self._drop_event)
+        self.setAcceptDrops(True)
+        self._playing = False
+        self._play_index = 0
+        self._play_kind: str | None = None
+        self._play_saved: list | None = None
+        self._play_return: tuple | None = None
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._advance_play)
         self.layers = LayerPanel(self.session, self._rename_layer)
         right = QFrame()
         right.setObjectName("layers")
@@ -301,6 +311,7 @@ class MainWindow(QMainWindow):
             "export",
             "Export a flattened PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF",
         )
+        self._action(file_menu, "Export animated GIF…", self._export_gif)
         file_menu.addSeparator()
         self._show_folder_action = self._file_action(
             file_menu,
@@ -460,6 +471,13 @@ class MainWindow(QMainWindow):
         rulers.setCheckable(True)
         rulers.setChecked(bool(self.session.option("rulers", True)))
         self._rulers_action = rulers
+        snap = self._action(view_menu, "Snap to guides", self._toggle_snap)
+        snap.setCheckable(True)
+        snap.setChecked(bool(self.session.option("snap", True)))
+        self._snap_action = snap
+        view_menu.addSeparator()
+        self._action(view_menu, "Play frames", self._toggle_play)
+        self._action(view_menu, "Stop playback", self._stop_play)
 
         self._action(plugin_menu, "Reload plugins", self._reload_plugins)
         plugin_menu.addSeparator()
@@ -787,6 +805,9 @@ class MainWindow(QMainWindow):
         if action_id == "reset_color":
             self.session.cancel_color_adjust()
             return
+        if action_id == "gradient_end_color":
+            self._pick_gradient_end()
+            return
         method = getattr(self.session, action_id, None)
         if method is not None:
             method()
@@ -841,6 +862,7 @@ class MainWindow(QMainWindow):
     def _new(self) -> None:
         if not self._confirm_discard():
             return
+        self._stop_play()
         dialog = NewDocumentDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -860,12 +882,17 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Place image", self._file_dialog_start(), _PLACE_FILTER)
         if not path:
             return
+        self._place_path(path)
+
+    def _place_path(self, path: str) -> None:
+        """Place one file the same way File → Place does, without the chooser."""
         pdf_scale = 2.0
         if Path(path).suffix.lower() == ".pdf":
             dialog = PdfImportDialog(self)
             if dialog.exec() != dialog.DialogCode.Accepted:
                 return
             pdf_scale = dialog.scale()
+        self._stop_play()
         try:
             incoming = load_path(path, pdf_scale=pdf_scale)
         except Exception as exc:
@@ -883,6 +910,7 @@ class MainWindow(QMainWindow):
             if dialog.exec() != dialog.DialogCode.Accepted:
                 return
             pdf_scale = dialog.scale()
+        self._stop_play()
         try:
             document = load_path(path, pdf_scale=pdf_scale)
         except Exception as exc:
@@ -900,6 +928,7 @@ class MainWindow(QMainWindow):
         self._toast(f"Opened {Path(path).name}")
 
     def _save(self) -> bool:
+        self._stop_play()
         if not self.session.path:
             return self._save_as()
         try:
@@ -926,6 +955,7 @@ class MainWindow(QMainWindow):
         return self._save()
 
     def _export(self) -> None:
+        self._stop_play()
         filename, selected_filter = self._export_suggestion()
         path, selected = QFileDialog.getSaveFileName(
             self,
@@ -1033,6 +1063,165 @@ class MainWindow(QMainWindow):
             self._rulers_action.setChecked(bool(self.session.option("rulers", True)))
         self.canvas.update()
 
+    def _toggle_snap(self) -> None:
+        self.session.options["snap"] = not bool(self.session.option("snap", True))
+        if hasattr(self, "_snap_action"):
+            self._snap_action.setChecked(bool(self.session.option("snap", True)))
+        state = "on" if self.session.option("snap", True) else "off"
+        self._toast(f"Snap to guides is {state}.")
+
+    def _pick_gradient_end(self) -> None:
+        from pixedit.tools.gradient import gradient_end_color
+
+        red, green, blue, alpha = gradient_end_color(self.session)
+        chosen = QColorDialog.getColor(
+            QColor(red, green, blue, alpha),
+            self,
+            "Gradient end color",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if not chosen.isValid():
+            return
+        self.session.options["gradient_color"] = (chosen.red(), chosen.green(), chosen.blue(), chosen.alpha())
+        self._toast("Gradient end color updated.")
+
+    def dragEnterEvent(self, event) -> None:
+        if paths_from_drop(event):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        self._drop_event(event)
+
+    def _drop_event(self, event) -> None:
+        paths = paths_from_drop(event)
+        if not paths:
+            event.ignore()
+            return
+        self._drop_paths(paths)
+        event.acceptProposedAction()
+
+    def _drop_paths(self, paths: list[str]) -> None:
+        """Open a dropped project. Any other file is placed on the current page.
+
+        A ``.pix`` file is a project, so it replaces the document the way Open
+        does. Placing it would nest one project inside another.
+        """
+        self._stop_play()
+        projects = [path for path in paths if Path(path).suffix.lower() == ".pix"]
+        if projects:
+            if not self._confirm_discard():
+                return
+            self.open_path(projects[0])
+            if len(paths) > 1:
+                self._toast(f"Opened {Path(projects[0]).name}. The other dropped files were left alone.")
+            return
+        for path in paths:
+            self._place_path(path)
+
+    def _toggle_play(self) -> None:
+        if self._playing:
+            self._stop_play()
+            return
+        kind = frame_kind(self.session.document)
+        if kind is None:
+            self._toast("Nothing to play. Open a multi-page file, or a GIF whose frames are hidden layers.")
+            return
+        self._playing = True
+        self._play_kind = kind
+        self._play_index = 0
+        self._play_return = (
+            self.session.document.active_group_id,
+            self.canvas.zoom,
+            self.canvas.offset_x,
+            self.canvas.offset_y,
+        )
+        self.canvas.letterbox = kind == "pages"
+        if kind == "layers":
+            self._play_saved = [(layer, layer.visible) for layer in self.session.document.layers]
+        self._show_play_frame()
+        self._play_timer.start(max(20, int(self.session.option("frame_delay", 100))))
+
+    def _advance_play(self) -> None:
+        count = frame_count(self.session.document)
+        if not self._playing or count < 2:
+            self._stop_play()
+            return
+        self._play_index = (self._play_index + 1) % count
+        self._show_play_frame()
+
+    def _show_play_frame(self) -> None:
+        document = self.session.document
+        if self._play_kind == "pages":
+            group = document.groups[self._play_index % len(document.groups)]
+            self.session.activate_group(group.id)
+            return
+        apply_layer_frame(document, self._play_index)
+        self.session.notify("change")
+
+    def _stop_play(self) -> None:
+        was = self._playing
+        self._play_timer.stop()
+        self._playing = False
+        self._play_kind = None
+        self.canvas.letterbox = False
+        saved = self._play_saved
+        self._play_saved = None
+        if saved is not None:
+            for layer, visible in saved:
+                layer.visible = visible
+        return_to = self._play_return
+        self._play_return = None
+        if return_to is not None:
+            group_id, zoom, offset_x, offset_y = return_to
+            if (
+                self.session.document.group_by_id(group_id) is not None
+                and self.session.document.active_group_id != group_id
+            ):
+                self.session.activate_group(group_id)
+            self.canvas.zoom = zoom
+            self.canvas.offset_x = offset_x
+            self.canvas.offset_y = offset_y
+            self.session.view_zoom = zoom
+        if was:
+            self.session.notify("change")
+            self.canvas.update()
+
+    def _export_gif(self) -> None:
+        self._stop_play()
+        delay, ok = QInputDialog.getInt(
+            self,
+            "Animated GIF",
+            "Frame delay (ms)",
+            int(self.session.option("frame_delay", 100)),
+            20,
+            2000,
+            10,
+        )
+        if not ok:
+            return
+        self.session.options["frame_delay"] = int(delay)
+        path, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Export animated GIF",
+            self._file_dialog_start("animation.gif"),
+            "GIF (*.gif)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".gif"):
+            path += ".gif"
+        try:
+            notes = export_animated_gif(self.session.document, path, int(delay))
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        note = f"Exported {path}"
+        if notes:
+            note = f"{note}. Padded {', '.join(notes)} onto the largest frame."
+        self._toast(note)
+
     def _bump_brush(self, delta: int) -> None:
         size = int(self.session.option("brush_size", 24)) + delta
         size = max(1, min(400, size))
@@ -1101,6 +1290,14 @@ class _VersionLabel(QLabel):
             if opener is not None:
                 opener()
         super().mouseReleaseEvent(event)
+
+
+def paths_from_drop(event) -> list[str]:
+    """Local file paths on a drag event. Empty when the drag is not files."""
+    mime = event.mimeData()
+    if mime is None or not mime.hasUrls():
+        return []
+    return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
 
 
 def _tool_separator() -> QFrame:

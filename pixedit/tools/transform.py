@@ -12,6 +12,7 @@ from pixedit.geom import (
     scale_visual_in_box,
     size_from_anchor,
 )
+from pixedit.guides import snap_delta, snap_point
 from pixedit.model import (
     Layer,
     apply_visual,
@@ -149,11 +150,29 @@ class TransformTool(Tool):
         if self._mode == "move":
             dx = event.x - self._start_mouse[0]
             dy = event.y - self._start_mouse[1]
+            group = session.document.group
+            dx, dy = snap_delta(
+                dx,
+                dy,
+                self._start_box,
+                group.guides_v,
+                group.guides_h,
+                bool(session.option("snap", True)),
+            )
             for layer, _start, origin in rows:
                 layer.x = int(round(origin[0] + dx))
                 layer.y = int(round(origin[1] + dy))
         elif self._mode in _FIXED:
-            self._scale_group(rows, event)
+            group = session.document.group
+            sx, sy = snap_point(
+                event.x,
+                event.y,
+                group.guides_v,
+                group.guides_h,
+                bool(session.option("snap", True)),
+            )
+            snapped = PointerEvent(sx, sy, event.shift, event.alt, event.ctrl, event.button, event.zoom)
+            self._scale_group(rows, snapped)
         elif self._mode == "rot":
             self._rotate_group(rows, event)
         session.preview()

@@ -413,6 +413,7 @@ def test_file_toolbar_and_tool_groups():
         "Eraser (E)",
         "Fill (G)",
         "Shape (U)",
+        "Gradient",
         "Text (T)",
         "|",
         "Image & Eyedrop (I)",
