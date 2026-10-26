@@ -486,6 +486,74 @@ def test_delete_group_keeps_the_last_page_and_reorder_sets_page_order():
     assert [group.name for group in session.document.groups] == ["Page 1", "Page 2"]
 
 
+def test_place_group_block_keeps_the_selected_pages_together():
+    from pixedit.ui.layers_panel import place_group_block
+
+    model = ["A", "B", "C", "D"]
+    # Only C moved to the end. B was also selected, so B travels with C.
+    assert place_group_block(model, ["A", "B", "D", "C"], ["B", "C"], "C") == ["A", "D", "B", "C"]
+    # The tree moved the whole block. The same pages still land together.
+    assert place_group_block(model, ["A", "D", "B", "C"], ["B", "C"], "C") == ["A", "D", "B", "C"]
+    assert place_group_block(model, ["D", "A", "B", "C"], ["B", "D"], "D") == ["B", "D", "A", "C"]
+
+
+def test_folded_pages_stay_folded_and_drag_as_a_block():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    names = ["A", "B", "C", "D"]
+    session.rename_group(session.document.groups[0].id, names[0])
+    for name in names[1:]:
+        session.add_group()
+        session.rename_group(session.document.active_group_id, name)
+    panel = LayerPanel(session, lambda: None)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    for index in range(panel.list.topLevelItemCount()):
+        header = panel.list.topLevelItem(index)
+        header.setExpanded(False)
+        panel._on_group_folded(header)
+    panel.refresh()
+    assert all(not panel.list.topLevelItem(index).isExpanded() for index in range(4))
+
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(panel.list.topLevelItem(2))
+    panel.list.topLevelItem(1).setSelected(True)
+    panel.list.topLevelItem(2).setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    panel.refresh()
+    selected = [
+        panel.list.topLevelItem(index).text(0).split()[0]
+        for index in range(4)
+        if panel.list.topLevelItem(index).isSelected()
+    ]
+    assert selected == ["B", "C"]
+
+    taken = panel.list.takeTopLevelItem(2)
+    panel.list.addTopLevelItem(taken)
+    panel._drag_groups = [session.document.groups[1].id, session.document.groups[2].id]
+    panel._drag_current = session.document.groups[2].id
+    panel._apply_pending_drop()
+    assert [group.name for group in session.document.groups] == ["A", "D", "B", "C"]
+    assert all(not panel.list.topLevelItem(index).isExpanded() for index in range(4))
+    selected = [
+        panel.list.topLevelItem(index).text(0).split()[0]
+        for index in range(4)
+        if panel.list.topLevelItem(index).isSelected()
+    ]
+    assert selected == ["B", "C"]
+    session.undo()
+    assert [group.name for group in session.document.groups] == ["A", "B", "C", "D"]
+    panel.close()
+    app.processEvents()
+
+
 def test_clicking_a_group_layer_shows_that_page():
     from PyQt6.QtWidgets import QApplication
 
