@@ -61,8 +61,9 @@ from pixedit.ui.dialogs import (
     TextDialog,
 )
 from pixedit.ui.icons import icon_for_tool, icon_named
+from pixedit.ui.layers_panel import LayerPanel
 from pixedit.ui.palette import ColorPalette
-from pixedit.ui.panels import LayerPanel, ToolOptions
+from pixedit.ui.tool_options import ToolOptions
 
 _OPEN_FILTER = "Images and projects (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf *.pix);;All files (*)"
 _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf);;All files (*)"

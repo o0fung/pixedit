@@ -34,7 +34,8 @@ from pixedit.geom import (
 from pixedit.model import Document, TextInfo, new_document, visual_state
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.builtins import CropTool, TransformTool
+from pixedit.tools.crop import CropTool
+from pixedit.tools.transform import TransformTool
 
 
 def test_scaled_top_left_keeps_center():

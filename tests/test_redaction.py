@@ -10,7 +10,7 @@ from pixedit.factory import raster_layer, redaction_layer
 from pixedit.model import Document
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.builtins import MaskTool
+from pixedit.tools.mask import MaskTool
 
 
 def _half_image(size=32):

@@ -94,20 +94,19 @@ class Tool:
 
 
 def builtin_tools() -> list[Tool]:
-    from pixedit.tools.builtins import (
-        BrushTool,
-        ColorTool,
-        CropTool,
-        EraserTool,
-        FillTool,
-        HandTool,
-        MaskTool,
-        SelectTool,
-        ShapeTool,
-        TextTool,
-        TransformTool,
-        ZoomTool,
-    )
+    # Imported here so tool modules can import Tool from this file without a cycle.
+    from pixedit.tools.brush import BrushTool
+    from pixedit.tools.color import ColorTool
+    from pixedit.tools.crop import CropTool
+    from pixedit.tools.eraser import EraserTool
+    from pixedit.tools.fill import FillTool
+    from pixedit.tools.hand import HandTool
+    from pixedit.tools.mask import MaskTool
+    from pixedit.tools.select import SelectTool
+    from pixedit.tools.shape import ShapeTool
+    from pixedit.tools.text import TextTool
+    from pixedit.tools.transform import TransformTool
+    from pixedit.tools.zoom import ZoomTool
 
     return [
         TransformTool(),

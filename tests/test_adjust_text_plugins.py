@@ -14,7 +14,8 @@ from pixedit.plugins.loader import load_plugins, reset_plugins
 from pixedit.session import Session
 from pixedit.textutil import render_text
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.builtins import TextTool, TransformTool
+from pixedit.tools.text import TextTool
+from pixedit.tools.transform import TransformTool
 
 
 def test_adjustments_are_predictable():
@@ -329,7 +330,7 @@ def test_highlight_and_shade_move_opposite_ends():
 
 
 def test_color_preview_commits_inside_the_selection_and_cancels():
-    from pixedit.tools.builtins import ColorTool
+    from pixedit.tools.color import ColorTool
 
     session = Session()
     session.new_canvas(8, 4, "white")

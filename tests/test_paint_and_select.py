@@ -9,7 +9,12 @@ from pixedit.model import new_document
 from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing, wand_mask
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.builtins import BrushTool, ColorTool, EraserTool, FillTool, SelectTool, ShapeTool
+from pixedit.tools.brush import BrushTool
+from pixedit.tools.color import ColorTool
+from pixedit.tools.eraser import EraserTool
+from pixedit.tools.fill import FillTool
+from pixedit.tools.select import SelectTool
+from pixedit.tools.shape import ShapeTool
 import numpy as np
 
 

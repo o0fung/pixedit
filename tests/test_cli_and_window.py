@@ -209,7 +209,7 @@ def test_delete_clears_selection_pixels():
     from PyQt6.QtWidgets import QApplication
 
     from pixedit.tools.base import PointerEvent
-    from pixedit.tools.builtins import SelectTool
+    from pixedit.tools.select import SelectTool
     from pixedit.ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])
@@ -869,7 +869,7 @@ def test_palette_text_select_and_zoom_panels():
 
     from pixedit.model import TextInfo
     from pixedit.tools.base import PointerEvent
-    from pixedit.tools.builtins import ColorTool
+    from pixedit.tools.color import ColorTool
     from pixedit.ui.dialogs import TextDialog
     from pixedit.ui.main_window import MainWindow
 
@@ -1358,7 +1358,7 @@ def test_choice_icons_share_a_row_beside_their_label():
 
 
 def _assert_options_inside(widgets, left) -> None:
-    from pixedit.ui.panels import IconChoice
+    from pixedit.ui.tool_options import IconChoice
 
     widths = []
     for key, widget in widgets.items():

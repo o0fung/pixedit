@@ -8,7 +8,7 @@ from pixedit.composite import composite
 from pixedit.factory import raster_layer
 from pixedit.model import new_document
 from pixedit.session import Session
-from pixedit.ui.panels import stack_move
+from pixedit.ui.layers_panel import stack_move
 
 
 def test_stack_ops_and_undo():
@@ -81,7 +81,7 @@ def test_merge_down_bakes_upper_layer():
 def test_layer_list_drop_reorders_the_document():
     from PyQt6.QtWidgets import QApplication, QToolButton
 
-    from pixedit.ui.panels import LayerPanel
+    from pixedit.ui.layers_panel import LayerPanel
 
     app = QApplication.instance() or QApplication([])
     session = Session(new_document(4, 4, "white"))
@@ -186,7 +186,7 @@ def test_layer_rows_show_thumbs_and_text_heads():
 
     from pixedit.factory import redaction_layer, text_layer
     from pixedit.model import TextInfo
-    from pixedit.ui.panels import LayerPanel
+    from pixedit.ui.layers_panel import LayerPanel
     from pixedit.ui.thumbs import MASK_TINT
 
     app = QApplication.instance() or QApplication([])
@@ -282,7 +282,7 @@ def test_visibility_button_toggles_the_selection_and_refreshes_the_checks():
     from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication, QToolButton
 
-    from pixedit.ui.panels import LayerPanel
+    from pixedit.ui.layers_panel import LayerPanel
 
     app = QApplication.instance() or QApplication([])
     session = Session(new_document(8, 8, "white"))
@@ -343,7 +343,7 @@ def test_layer_list_selects_several_rows_and_keeps_the_active_one():
     from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
 
-    from pixedit.ui.panels import LayerPanel
+    from pixedit.ui.layers_panel import LayerPanel
 
     app = QApplication.instance() or QApplication([])
     session = Session(new_document(8, 8, "white"))
@@ -389,7 +389,7 @@ def test_layer_list_selects_several_rows_and_keeps_the_active_one():
 
 def test_brush_edits_only_the_active_layer_of_a_selection():
     from pixedit.tools.base import PointerEvent
-    from pixedit.tools.builtins import BrushTool
+    from pixedit.tools.brush import BrushTool
 
     session = Session(new_document(48, 48, "white"))
     other = raster_layer("Other", Image.new("RGBA", (8, 8), (0, 0, 255, 255)), 30, 30)
@@ -489,7 +489,7 @@ def test_delete_group_keeps_the_last_page_and_reorder_sets_page_order():
 def test_clicking_a_group_layer_shows_that_page():
     from PyQt6.QtWidgets import QApplication
 
-    from pixedit.ui.panels import LayerPanel
+    from pixedit.ui.layers_panel import LayerPanel
 
     app = QApplication.instance() or QApplication([])
     session = Session(new_document(8, 8, "white"))
