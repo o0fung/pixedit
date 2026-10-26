@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 from pixedit.model import Document, Layer, new_id
+from pixedit.proxy import resize_for_preview, rotate_for_preview
 
 
 def alpha_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
@@ -626,7 +627,14 @@ def linked_dpi(
     )
 
 
-def scale_visual(state: dict[str, Any], new_w: int, new_h: int) -> dict[str, Any]:
+def scale_visual(
+    state: dict[str, Any],
+    new_w: int,
+    new_h: int,
+    *,
+    zoom: float = 1.0,
+    final: bool = True,
+) -> dict[str, Any]:
     """Scale a visual snapshot around its center.
 
     Text stays editable: the font size tracks the width ratio and the glyphs
@@ -654,7 +662,7 @@ def scale_visual(state: dict[str, Any], new_w: int, new_h: int) -> dict[str, Any
             state["x"], state["y"], state["image"].width, state["image"].height, image.width, image.height
         )
         return out
-    image = state["image"].resize((new_w, new_h), Image.Resampling.LANCZOS)
+    image = resize_for_preview(state["image"], (new_w, new_h), zoom, final=final)
     out["image"] = image
     out["x"], out["y"] = scaled_top_left(
         state["x"], state["y"], state["image"].width, state["image"].height, new_w, new_h
@@ -664,7 +672,13 @@ def scale_visual(state: dict[str, Any], new_w: int, new_h: int) -> dict[str, Any
     return out
 
 
-def rotate_visual(state: dict[str, Any], degrees_clockwise: float) -> dict[str, Any]:
+def rotate_visual(
+    state: dict[str, Any],
+    degrees_clockwise: float,
+    *,
+    zoom: float = 1.0,
+    final: bool = True,
+) -> dict[str, Any]:
     """Rotate a visual snapshot around its center. Positive degrees are clockwise.
 
     Text stores rotation in its metadata and is rendered again, so it stays
@@ -694,7 +708,7 @@ def rotate_visual(state: dict[str, Any], degrees_clockwise: float) -> dict[str, 
         )
         return out
     image = state["image"]
-    rotated = image.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+    rotated = rotate_for_preview(image, angle, zoom, final=final)
     out["image"] = rotated
     out["x"], out["y"] = scaled_top_left(
         state["x"], state["y"], image.width, image.height, rotated.width, rotated.height
@@ -774,6 +788,9 @@ def scale_visual_in_box(
     anchor_name: str,
     scale_x: float,
     scale_y: float,
+    *,
+    zoom: float = 1.0,
+    final: bool = True,
 ) -> dict[str, Any]:
     """Scale one snapshot as part of a shared box.
 
@@ -811,7 +828,7 @@ def scale_visual_in_box(
         out["kind"] = "text"
         out["x"], out["y"] = _place_from_corner(anchor_name, mapped, image.width, image.height)
         return out
-    image = state["image"].resize((target_w, target_h), Image.Resampling.LANCZOS)
+    image = resize_for_preview(state["image"], (target_w, target_h), zoom, final=final)
     out["image"] = image
     out["kind"] = "raster"
     out["text"] = None
@@ -837,6 +854,9 @@ def rotate_visual_around(
     state: dict[str, Any],
     degrees_clockwise: float,
     center: tuple[float, float],
+    *,
+    zoom: float = 1.0,
+    final: bool = True,
 ) -> dict[str, Any]:
     """Turn a snapshot around ``center`` and turn its pixels by the same angle.
 
@@ -847,7 +867,7 @@ def rotate_visual_around(
     width, height = _visual_size(state)
     old_cx = float(state["x"]) + width / 2.0
     old_cy = float(state["y"]) + height / 2.0
-    turned = rotate_visual(state, degrees_clockwise)
+    turned = rotate_visual(state, degrees_clockwise, zoom=zoom, final=final)
     new_w, new_h = _visual_size(turned)
     nx, ny = _orbit_point(old_cx, old_cy, center[0], center[1], degrees_clockwise)
     turned["x"] = int(round(nx - new_w / 2.0))
@@ -914,6 +934,32 @@ def image_has_opaque(image: Image.Image) -> bool:
     if image.mode == "L":
         return bool(int(np.asarray(image).max()) > 0)
     return bool(int(np.asarray(image.convert("RGBA"))[..., 3].max()) > 0)
+
+
+def union_boxes(
+    first: tuple[int, int, int, int] | None,
+    second: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    """The half-open box covering both, or whichever one is present."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
+    )
+
+
+def placed_box(layer: Layer, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """The layer bitmap clipped to the document."""
+    return clip_box(
+        (layer.x, layer.y, layer.x + layer.image.width, layer.y + layer.image.height),
+        width,
+        height,
+    )
 
 
 def clip_box(

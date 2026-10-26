@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PIL import Image
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -39,8 +40,10 @@ from pixedit.geom import (
     linked_percent,
     linked_pixels,
     percent_from_pixels,
+    placed_box,
     selection_for_layer,
 )
+from pixedit.proxy import downscale, preview_scale, set_preview_source
 from pixedit.model import MutateLayerCommand, TextInfo, apply_visual, visual_state
 from pixedit.presets import (
     PAPER_DPI,
@@ -227,7 +230,8 @@ class PdfImportDialog(QDialog):
         self.dpi.addItem("72 DPI  (screen)", 1.0)
         self.dpi.addItem("144 DPI  (sharp)", 2.0)
         self.dpi.addItem("216 DPI  (print)", 3.0)
-        self.dpi.setCurrentIndex(1)
+        # 72 DPI is the default. 144 and 216 keep more pixels, and the file is larger.
+        self.dpi.setCurrentIndex(0)
         form.addRow("Render", self.dpi)
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -237,6 +241,36 @@ class PdfImportDialog(QDialog):
 
     def scale(self) -> float:
         return float(self.dpi.currentData())
+
+
+class RasterSizeDialog(QDialog):
+    """Choose how many pixels to keep when the file is larger than the screen."""
+
+    def __init__(self, parent, width: int, height: int) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Open image")
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                f"This image is {width} × {height} px. "
+                "A shorter edge uses less memory. Full size keeps every pixel."
+            )
+        )
+        self.choice = QComboBox()
+        self.choice.addItem("Full size", None)
+        longest = max(int(width), int(height))
+        for edge in (4096, 2048, 1024):
+            if edge < longest:
+                self.choice.addItem(f"Longest edge {edge} px", edge)
+        layout.addWidget(self.choice)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def max_edge(self) -> int | None:
+        value = self.choice.currentData()
+        return None if value is None else int(value)
 
 
 class TextDialog(QDialog):
@@ -740,7 +774,7 @@ class LiveFilterDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self._preview()
+        self._preview(final=False)
 
     def _caption(self, spec: dict, value: int) -> str:
         scale = spec.get("scale")
@@ -751,7 +785,7 @@ class LiveFilterDialog(QDialog):
 
     def _on_slide(self, spec, label, value: int) -> None:
         label.setText(self._caption(spec, value))
-        self._preview()
+        self._preview(final=False)
 
     def values(self) -> dict:
         data = {}
@@ -761,16 +795,28 @@ class LiveFilterDialog(QDialog):
             data[key] = value
         return data
 
-    def _preview(self) -> None:
-        edited = self.apply_fn(self.before["image"], self.values())
-        masked = apply_masked(self.before["image"], edited, selection_for_layer(self.session.document, self.layer))
-        self.layer.image = masked
+    def _preview(self, *, final: bool) -> None:
+        source = self.before["image"]
+        selection = selection_for_layer(self.session.document, self.layer)
+        zoom = float(getattr(self.session, "view_zoom", 1.0) or 1.0)
+        scale = 1.0 if final else preview_scale(source.width, source.height, zoom)
+        if scale >= 1.0:
+            set_preview_source(self.layer, None)
+            edited = self.apply_fn(source, self.values())
+            self.layer.image = apply_masked(source, edited, selection)
+        else:
+            small = downscale(source, scale)
+            small_selection = None if selection is None else selection.resize(small.size, Image.Resampling.NEAREST)
+            edited = self.apply_fn(small, self.values())
+            self.layer.image = source
+            set_preview_source(self.layer, apply_masked(small, edited, small_selection))
         self.layer.kind = "raster"
         self.layer.text = None
-        self.session.preview()
+        doc = self.session.document
+        self.session.preview(placed_box(self.layer, doc.width, doc.height))
 
     def accept(self) -> None:
-        self._preview()
+        self._preview(final=True)
         new_state = visual_state(self.layer)
         new_state["kind"] = "raster"
         new_state["text"] = None
@@ -779,6 +825,7 @@ class LiveFilterDialog(QDialog):
         super().accept()
 
     def reject(self) -> None:
+        set_preview_source(self.layer, None)
         apply_visual(self.layer, self.before)
         self.session.preview()
         super().reject()

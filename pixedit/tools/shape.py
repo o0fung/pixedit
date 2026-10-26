@@ -10,6 +10,7 @@ from pixedit.geom import (
     clip_box,
     grow_layer_to_cover,
     selection_for_layer,
+    union_boxes,
 )
 from pixedit.guides import snap_point
 from pixedit.model import Layer
@@ -36,6 +37,7 @@ class ShapeTool(Tool):
         self._created = False
         self._snap_image: Image.Image | None = None
         self._snap_xy = (0, 0)
+        self._last_box: tuple[int, int, int, int] | None = None
 
     def option_schema(self):
         return [
@@ -117,12 +119,34 @@ class ShapeTool(Tool):
         # redraws, so dragging does not stack copies of the shape.
         self._snap_image = layer.image.copy()
         self._snap_xy = (layer.x, layer.y)
+        # Own the bitmap once. Later moves restore only the previous shape's
+        # rectangle from this snapshot instead of copying the whole layer.
+        layer.image = self._snap_image.copy()
+        self._last_box = None
 
-    def _restore_snap(self) -> None:
-        if self._layer is None or self._snap_image is None:
+    def _restore_box(self, box: tuple[int, int, int, int]) -> None:
+        """Put the snapshot's pixels back inside ``box`` and clear the rest of it."""
+        layer = self._layer
+        snap = self._snap_image
+        if layer is None or snap is None:
             return
-        self._layer.image = self._snap_image.copy()
-        self._layer.x, self._layer.y = self._snap_xy
+        x0, y0, x1, y1 = box
+        lx0 = max(0, x0 - layer.x)
+        ly0 = max(0, y0 - layer.y)
+        lx1 = min(layer.image.width, x1 - layer.x)
+        ly1 = min(layer.image.height, y1 - layer.y)
+        if lx1 <= lx0 or ly1 <= ly0:
+            return
+        patch = Image.new("RGBA", (lx1 - lx0, ly1 - ly0), (0, 0, 0, 0))
+        sx0, sy0 = self._snap_xy
+        dx0 = max(x0, sx0, layer.x)
+        dy0 = max(y0, sy0, layer.y)
+        dx1 = min(x1, sx0 + snap.width, layer.x + layer.image.width)
+        dy1 = min(y1, sy0 + snap.height, layer.y + layer.image.height)
+        if dx1 > dx0 and dy1 > dy0:
+            crop = snap.crop((dx0 - sx0, dy0 - sy0, dx1 - sx0, dy1 - sy0))
+            patch.paste(crop, (dx0 - (layer.x + lx0), dy0 - (layer.y + ly0)))
+        layer.image.paste(patch, (lx0, ly0))
 
     def _paint(self, session, box: tuple[int, int, int, int]) -> None:
         layer = self._layer
@@ -131,29 +155,45 @@ class ShapeTool(Tool):
         # Grow to the stroke's canvas box first so a small layer can hold it.
         # finish_raster_edit then crops back to the opaque pixels.
         grow_layer_to_cover(layer, box)
-        kind = str(session.option("shape_kind", "rect"))
+        lx0 = max(0, box[0] - layer.x)
+        ly0 = max(0, box[1] - layer.y)
+        lx1 = min(layer.image.width, box[2] - layer.x)
+        ly1 = min(layer.image.height, box[3] - layer.y)
+        if lx1 <= lx0 or ly1 <= ly0:
+            return
+        crop = layer.image.crop((lx0, ly0, lx1, ly1))
+        ox = float(layer.x + lx0)
+        oy = float(layer.y + ly0)
         selection = selection_for_layer(session.document, layer)
-        ox, oy = float(layer.x), float(layer.y)
-        layer.image = draw_shape(
-            layer.image,
+        local_selection = None if selection is None else selection.crop((lx0, ly0, lx1, ly1))
+        kind = str(session.option("shape_kind", "rect"))
+        painted = draw_shape(
+            crop,
             kind,
             (self._start[0] - ox, self._start[1] - oy, self._end[0] - ox, self._end[1] - oy),
             session.foreground,
             int(session.option("stroke_width", 4)),
             bool(session.option("shape_filled", False)),
-            selection,
+            local_selection,
             line=((self._start[0] - ox, self._start[1] - oy), (self._end[0] - ox, self._end[1] - oy)),
         )
+        layer.image.paste(painted, (lx0, ly0))
 
     def _show_preview(self, session) -> None:
         self._ensure_edit(session)
-        self._restore_snap()
         box = self._canvas_box(session)
         if box is None:
+            if self._last_box is not None:
+                self._restore_box(self._last_box)
+                self._last_box = None
             session.preview()
             return
+        if self._last_box is not None:
+            self._restore_box(self._last_box)
         self._paint(session, box)
-        session.preview()
+        dirty = union_boxes(self._last_box, box)
+        self._last_box = box
+        session.preview(dirty)
 
     def _take_edit(self) -> tuple[Layer | None, dict | None, bool]:
         layer, before, created = self._layer, self._before, self._created
@@ -161,6 +201,7 @@ class ShapeTool(Tool):
         self._before = None
         self._created = False
         self._snap_image = None
+        self._last_box = None
         return layer, before, created
 
     def _cancel_edit(self, session) -> None:

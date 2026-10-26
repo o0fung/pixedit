@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PIL import Image
 from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
@@ -66,6 +67,7 @@ from pixedit.ui.dialogs import (
     LiveFilterDialog,
     NewDocumentDialog,
     PdfImportDialog,
+    RasterSizeDialog,
     RotateDialog,
     ScaleDialog,
     ShortcutsDialog,
@@ -943,17 +945,42 @@ class MainWindow(QMainWindow):
             return
         self._place_path(path)
 
-    def _place_path(self, path: str) -> None:
-        """Place one file the same way File → Place does, without the chooser."""
-        pdf_scale = 2.0
-        if Path(path).suffix.lower() == ".pdf":
+    def _import_settings(self, path: str) -> tuple[float, int | None] | None:
+        """PDF scale and an optional longest-edge cap. None when the user cancels.
+
+        A picture at or under 2048 px on its long side opens at full size with
+        no extra question. Larger files ask, because the cap changes the pixels
+        that are stored. PDFs ask for a render scale and default to 72 DPI.
+        """
+        suffix = Path(path).suffix.lower()
+        if suffix == ".pix":
+            return 1.0, None
+        if suffix == ".pdf":
             dialog = PdfImportDialog(self)
             if dialog.exec() != dialog.DialogCode.Accepted:
-                return
-            pdf_scale = dialog.scale()
+                return None
+            return dialog.scale(), None
+        try:
+            with Image.open(path) as source:
+                width, height = source.size
+        except Exception:
+            return 1.0, None
+        if max(width, height) <= 2048:
+            return 1.0, None
+        dialog = RasterSizeDialog(self, width, height)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return 1.0, dialog.max_edge()
+
+    def _place_path(self, path: str) -> None:
+        """Place one file the same way File → Place does, without the chooser."""
+        settings = self._import_settings(path)
+        if settings is None:
+            return
+        pdf_scale, max_edge = settings
         self._stop_play()
         try:
-            incoming = load_path(path, pdf_scale=pdf_scale)
+            incoming = load_path(path, pdf_scale=pdf_scale, max_edge=max_edge)
         except Exception as exc:
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
@@ -963,15 +990,13 @@ class MainWindow(QMainWindow):
             self.session.place_layers(incoming.layers)
 
     def open_path(self, path: str) -> None:
-        pdf_scale = 2.0
-        if Path(path).suffix.lower() == ".pdf":
-            dialog = PdfImportDialog(self)
-            if dialog.exec() != dialog.DialogCode.Accepted:
-                return
-            pdf_scale = dialog.scale()
+        settings = self._import_settings(path)
+        if settings is None:
+            return
+        pdf_scale, max_edge = settings
         self._stop_play()
         try:
-            document = load_path(path, pdf_scale=pdf_scale)
+            document = load_path(path, pdf_scale=pdf_scale, max_edge=max_edge)
         except Exception as exc:
             QMessageBox.warning(self, "Open failed", f"Could not open {path}\n\n{exc}")
             return

@@ -349,6 +349,31 @@ def test_freehand_select_keeps_sampled_bends():
     assert selection.getpixel(inside) == 0
 
 
+def test_rect_and_ellipse_drags_redraw_the_outline_only():
+    """A selection drag is chrome. The photo is flattened when the selection is stored."""
+    session = Session(new_document(30, 30, "white"))
+    notes: list[str] = []
+    session.add_listener(notes.append)
+    tool = SelectTool()
+    session.options["select_mode"] = "rect"
+    tool.pointer_down(session, PointerEvent(2, 2))
+    tool.pointer_move(session, PointerEvent(14, 12))
+    tool.pointer_cancel(session)
+    assert notes == ["overlay", "overlay"]
+    assert session.document.selection is None
+
+    session.options["select_mode"] = "ellipse"
+    tool.pointer_down(session, PointerEvent(2, 2))
+    tool.pointer_move(session, PointerEvent(16, 14))
+    assert notes[-1] == "overlay"
+    assert "preview" not in notes
+    tool.pointer_up(session, PointerEvent(16, 14))
+    selection = session.document.selection
+    assert selection is not None
+    assert selection.getpixel((8, 8)) == 255
+    assert "change" in notes
+
+
 def test_inverted_drag_still_fills_rect_and_ellipse():
     """A drag up and to the left used to abort: Pillow requires x1 >= x0."""
     session = Session(new_document(30, 30, "white"))

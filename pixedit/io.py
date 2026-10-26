@@ -85,11 +85,30 @@ def image_dpi(image: Image.Image) -> float:
     return DEFAULT_DPI
 
 
-def load_raster(path: str) -> Document:
+def limit_longest_edge(image: Image.Image, max_edge: int | None) -> Image.Image:
+    """Shrink ``image`` so its longer side is at most ``max_edge``.
+
+    ``None`` and a picture that already fits are returned unchanged. The
+    resample is Lanczos, which is the same filter Image size uses.
+    """
+    if max_edge is None:
+        return image
+    limit = max(1, int(max_edge))
+    longest = max(image.size)
+    if longest <= limit:
+        return image
+    scale = limit / float(longest)
+    width = max(1, int(round(image.width * scale)))
+    height = max(1, int(round(image.height * scale)))
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def load_raster(path: str, max_edge: int | None = None) -> Document:
     """Load a still image, or each frame of a GIF/TIFF, as layers.
 
     Extra frames are hidden so a multi-page file opens on its first page
-    instead of stacking every frame on top of the others.
+    instead of stacking every frame on top of the others. ``max_edge``
+    limits the longer side when the open dialog asks for a smaller copy.
     """
     with Image.open(path) as source:
         dpi = image_dpi(source)
@@ -97,7 +116,7 @@ def load_raster(path: str) -> Document:
         count = getattr(source, "n_frames", 1) or 1
         for index in range(count):
             source.seek(index)
-            frames.append(source.convert("RGBA").copy())
+            frames.append(limit_longest_edge(source.convert("RGBA"), max_edge).copy())
     width = max(frame.width for frame in frames)
     height = max(frame.height for frame in frames)
     stem = Path(path).stem
@@ -111,7 +130,7 @@ def load_raster(path: str) -> Document:
     return Document(width=width, height=height, layers=layers, dpi=dpi)
 
 
-def load_pdf(path: str, scale: float = 2.0) -> Document:
+def load_pdf(path: str, scale: float = 1.0) -> Document:
     """Render each PDF page as its own group.
 
     ``scale`` is the PDFium zoom. 1.0 is about 72 DPI and 2.0 is about 144 DPI.
@@ -444,17 +463,17 @@ def load_project(path: str) -> Document:
         )
 
 
-def load_path(path: str, pdf_scale: float = 2.0) -> Document:
+def load_path(path: str, pdf_scale: float = 1.0, max_edge: int | None = None) -> Document:
     suffix = Path(path).suffix.lower()
     if suffix == PROJECT_SUFFIX:
         return load_project(path)
     if suffix == ".pdf":
         return load_pdf(path, scale=pdf_scale)
     if suffix in RASTER_SUFFIXES or suffix == "":
-        return load_raster(path)
+        return load_raster(path, max_edge=max_edge)
     # Try Pillow first, then PDFium, so odd extensions still open when they can.
     try:
-        return load_raster(path)
+        return load_raster(path, max_edge=max_edge)
     except Exception:
         return load_pdf(path, scale=pdf_scale)
 

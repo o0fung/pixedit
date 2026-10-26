@@ -106,7 +106,8 @@ class MaskTool(Tool):
         if not self._dragging:
             return
         self._points.append((event.x, event.y))
-        session.preview()
+        # The outline is chrome until release. A live effect would flatten the photo.
+        session.notify("overlay")
 
     def pointer_up(self, session, event: PointerEvent) -> None:
         if not self._dragging:
@@ -116,7 +117,7 @@ class MaskTool(Tool):
         kind = str(session.option("mask_shape", "rect"))
         if kind != "freehand" and math.hypot(event.x - self._start[0], event.y - self._start[1]) < 2:
             self._points = []
-            session.preview()
+            session.notify("overlay")
             return
         layer, created = session.ensure_redaction_layer()
         self._layer = layer
@@ -147,11 +148,16 @@ class MaskTool(Tool):
 
     def pointer_cancel(self, session) -> bool:
         active = self._dragging or self._layer is not None
+        # The mask bitmap is only written on release. A cancel during the drag
+        # drops the outline. A cancel after the bitmap changed has to redraw it.
+        mutated = self._layer is not None
         self._dragging = False
         self._points = []
         self._layer = None
-        if active:
+        if mutated:
             session.preview()
+        elif active:
+            session.notify("overlay")
         return active
 
     def _preview(self, session, event: PointerEvent) -> None:

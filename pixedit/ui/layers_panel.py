@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from pixedit.geom import placed_box
 from pixedit.model import BLEND_MODES, layers_leaving, mask_target
 from pixedit.ui.canvas import pil_to_pixmap
 from pixedit.ui.icons import icon_named
@@ -808,7 +809,8 @@ class LayerPanel(QWidget):
             return
         layer.opacity = value / 100.0
         self.opacity_label.setText(f"Opacity  {value}%")
-        self.session.preview()
+        doc = self.session.document
+        self.session.preview(placed_box(layer, doc.width, doc.height))
 
     def _opacity_released(self) -> None:
         layer = self.session.active_layer()
