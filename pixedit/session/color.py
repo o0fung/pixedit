@@ -148,6 +148,8 @@ class ColorMixin:
 
     def run_filter(self, name: str, function: Callable[[Image.Image], Image.Image]) -> None:
         """Apply a pixel function to the active raster or text layer, honoring the selection."""
+        if not self.require_page():
+            return
         self._discard_color_preview()
         layer = self.active_layer()
         if layer is None or layer.kind == "redaction":

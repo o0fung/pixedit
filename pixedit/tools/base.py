@@ -100,7 +100,6 @@ def builtin_tools() -> list[Tool]:
     from pixedit.tools.crop import CropTool
     from pixedit.tools.eraser import EraserTool
     from pixedit.tools.fill import FillTool
-    from pixedit.tools.gradient import GradientTool
     from pixedit.tools.hand import HandTool
     from pixedit.tools.mask import MaskTool
     from pixedit.tools.select import SelectTool
@@ -120,7 +119,6 @@ def builtin_tools() -> list[Tool]:
         FillTool(),
         ColorTool(),
         ShapeTool(),
-        GradientTool(),
         HandTool(),
         ZoomTool(),
     ]

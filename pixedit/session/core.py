@@ -13,6 +13,9 @@ from pixedit.textutil import default_font_path
 
 Listener = Callable[[str], None]
 
+# Status line, and the reply when an edit runs before any page exists.
+START_HINT = "New… or Open… to start"
+
 
 def default_options() -> dict[str, Any]:
     return {
@@ -36,8 +39,6 @@ def default_options() -> dict[str, Any]:
         "marker_size": 12,
         "rulers": True,
         "snap": True,
-        "gradient_kind": "linear",
-        "gradient_color": (255, 255, 255, 255),
         "frame_delay": 100,
         "text_font": default_font_path(),
         "text_font_family": "DejaVu Sans",
@@ -143,6 +144,13 @@ class CoreMixin:
         if self._message_handler is not None:
             self._message_handler(text)
 
+    def require_page(self) -> bool:
+        """True when a page is open. Otherwise say how to start one."""
+        if self.document.groups:
+            return True
+        self.show_message(START_HINT)
+        return False
+
     def prompt_text(self, initial: TextInfo | None) -> TextInfo | None:
         if self._text_prompter is None:
             return None
@@ -196,6 +204,11 @@ class CoreMixin:
         self.clamp_index()
 
     def commit(self, command: Any) -> None:
+        # An edit belongs to a page. With none open, say how to start instead
+        # of writing into a document that has no group.
+        if not self.document.groups:
+            self.require_page()
+            return
         # An unapplied color grade is not part of the next undo step. The
         # notify below reloads the sliders after the options are zeroed.
         self._discard_color_preview()

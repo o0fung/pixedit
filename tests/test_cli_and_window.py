@@ -186,6 +186,8 @@ def test_canvas_mouse_move_reports_cursor():
     window.resize(800, 600)
     window.show()
     app.processEvents()
+    window.session.new_canvas(1280, 800, "white")
+    app.processEvents()
     local = QPointF(120, 90)
     move = QMouseEvent(
         QEvent.Type.MouseMove,
@@ -327,14 +329,7 @@ def test_file_toolbar_and_tool_groups():
     assert _shortcut_text(window._place_action, native=False) == "Ctrl+Shift+O"
     assert _shortcut_text(window._export_action, native=False) == "Ctrl+E"
     assert window.file_toolbar.isVisible()
-    buttons = []
-    for action in window.file_toolbar.actions():
-        if action.isSeparator():
-            continue
-        buttons.extend(
-            widget for widget in action.associatedObjects() if isinstance(widget, QToolButton) and widget.text()
-        )
-    assert {button.text() for button in buttons} == {
+    expected_buttons = {
         "New",
         "Open",
         "Close",
@@ -347,6 +342,24 @@ def test_file_toolbar_and_tool_groups():
         "Show folder",
         "About",
     }
+
+    def toolbar_labels() -> set[str]:
+        found = []
+        for action in window.file_toolbar.actions():
+            if action.isSeparator():
+                continue
+            found.extend(
+                widget for widget in action.associatedObjects() if isinstance(widget, QToolButton) and widget.text()
+            )
+        return {button.text() for button in found}
+
+    # The strip creates its buttons while the window is shown. One event pass
+    # can still be missing a button when earlier tests have loaded fonts.
+    for _ in range(30):
+        app.processEvents()
+        if toolbar_labels() == expected_buttons:
+            break
+    assert toolbar_labels() == expected_buttons
     assert not window.undo_action.icon().isNull()
     assert not window.redo_action.icon().isNull()
     assert window.undo_action.iconText() == "Undo"
@@ -359,6 +372,7 @@ def test_file_toolbar_and_tool_groups():
     assert edit_by_text["Undo"] is window.undo_action
     assert edit_by_text["Redo"] is window.redo_action
     # The menu names the step. The button stays the short word.
+    window.session.new_canvas(1280, 800, "white")
     window.session.set_opacity(window.session.active_layer(), 0.4)
     app.processEvents()
     assert window.undo_action.text() == "Undo Layer opacity"
@@ -413,7 +427,6 @@ def test_file_toolbar_and_tool_groups():
         "Eraser (E)",
         "Fill (G)",
         "Shape (U)",
-        "Gradient",
         "Text (T)",
         "|",
         "Image & Eyedrop (I)",
@@ -819,6 +832,8 @@ def test_space_pans_from_the_layer_list_without_hiding_layers():
     window.resize(1100, 800)
     window.show()
     app.processEvents()
+    window.session.new_canvas(1280, 800, "white")
+    app.processEvents()
     layer = window.session.active_layer()
     assert layer.visible is True
     for button in window.layers.findChildren(QAbstractButton):
@@ -878,6 +893,8 @@ def test_palette_text_select_and_zoom_panels():
     window = MainWindow()
     window.resize(1100, 800)
     window.show()
+    app.processEvents()
+    window.session.new_canvas(1280, 800, "white")
     app.processEvents()
 
     ColorTool().pointer_down(window.session, PointerEvent(4, 4))
@@ -1032,6 +1049,8 @@ def test_transform_color_and_mask_panels():
     window = MainWindow()
     window.resize(1100, 800)
     window.show()
+    app.processEvents()
+    window.session.new_canvas(1280, 800, "white")
     app.processEvents()
 
     window.set_tool(window.tool_by_id["transform"])
@@ -1736,13 +1755,14 @@ def _checker_pixels(canvas, light) -> tuple[list[tuple[int, int]], int]:
 
 
 def test_layer_list_draws_background_and_opened_project(tmp_path):
-    """The default Background row is drawn, and every layer of an opened project is too."""
+    """Launch has no page. A new canvas draws Background, and an opened project draws every layer."""
     from PIL import Image
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QLabel
 
     from pixedit.factory import raster_layer, redaction_layer, text_layer
     from pixedit.io import save_project
     from pixedit.model import Document, TextInfo
+    from pixedit.session.core import START_HINT
     from pixedit.ui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])
@@ -1751,6 +1771,19 @@ def test_layer_list_draws_background_and_opened_project(tmp_path):
     window.show()
     app.processEvents()
     layers = window.layers.list
+    assert window.session.document.groups == []
+    assert window.windowTitle() == "PixEdit"
+    assert window._status_label.text() == START_HINT
+    title = window.canvas.findChild(QLabel, "welcomeTitle")
+    hint = window.canvas.findChild(QLabel, "welcomeHint")
+    assert title is not None and title.isVisible() and title.text() == "PixEdit"
+    assert hint is not None and hint.isVisible()
+    assert "New…" in hint.text() and "Open…" in hint.text() and "drop a file" in hint.text()
+    assert layers.topLevelItemCount() == 0
+
+    window.session.new_canvas(1280, 800, "white")
+    app.processEvents()
+    assert not title.isVisible()
     assert layers.topLevelItemCount() == 1
     background = layers.topLevelItem(0).child(0)
     assert background.text(0).startswith("Background")

@@ -6,6 +6,8 @@ filter. Every change goes through ``commit`` so it is one undo step.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
 from PIL import Image
@@ -36,11 +38,50 @@ from pixedit.model import (
     slot_above_block,
 )
 
+# A page that was never renamed. "Group 1" counts; "Cover" and "Page 1" do not.
+_AUTOMATIC_GROUP_NAME = re.compile(r"^Group \d+$")
+
+
+def apply_pix_group_names(groups: list[LayerGroup], path: str) -> None:
+    """Name automatic pages from a ``.pix`` file. A typed name stays.
+
+    One automatic page takes the file stem, so holiday.pix shows holiday.
+    Several take holiday 1, holiday 2, in page order. A text that is already
+    used moves to the next free number.
+    """
+    stem = Path(path).stem.strip()
+    if not stem:
+        return
+    targets = [group for group in groups if _AUTOMATIC_GROUP_NAME.match(group.name)]
+    if not targets:
+        return
+    taken = {group.name for group in groups if group not in targets}
+    # One page is the bare file name. More than one page is numbered from 1
+    # so the names stay distinct and follow the page order.
+    labels = [stem] if len(targets) == 1 else [f"{stem} {index}" for index in range(1, len(targets) + 1)]
+    for group, label in zip(targets, labels):
+        group.name = _free_group_name(label, taken)
+        taken.add(group.name)
+
+
+def _free_group_name(label: str, taken: set[str]) -> str:
+    """``label``, or the same words with a higher trailing number."""
+    if label not in taken:
+        return label
+    match = re.match(r"^(.*?)(?: (\d+))?$", label)
+    base = match.group(1) if match else label
+    number = int(match.group(2)) + 1 if match and match.group(2) else 2
+    while f"{base} {number}" in taken:
+        number += 1
+    return f"{base} {number}"
+
 
 class LayersMixin:
     """Add, delete, reorder, merge, and move layers between pages."""
 
     def add_layer(self, layer: Layer, index: int | None = None, name: str = "Add layer") -> None:
+        if not self.require_page():
+            return
         if index is None:
             index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
             # A new picture lands above a mask run, not between a picture and its masks.
@@ -51,11 +92,15 @@ class LayersMixin:
 
     def add_blank_layer(self) -> None:
         """Add an empty content-sized layer. The first stroke grows its bitmap."""
+        if not self.require_page():
+            return
         number = len(self.document.layers) + 1
         layer = empty_raster_layer(f"Layer {number}")
         self.add_layer(layer, name="New layer")
 
     def duplicate_active(self) -> None:
+        if not self.require_page():
+            return
         if self.layer_index < 0:
             return
         command = DuplicateLayerCommand(self.document, self.layer_index)
@@ -73,6 +118,8 @@ class LayersMixin:
         Deleting a mask leaves the picture. Undo puts every removed layer
         back in its old slot.
         """
+        if not self.require_page():
+            return
         if self.layer_index < 0 or not self.document.layers:
             return
         layer = self.document.layers[self.layer_index]
@@ -94,6 +141,8 @@ class LayersMixin:
 
     def move_active(self, delta: int) -> None:
         """``delta`` +1 moves the active layer up the stack (toward the front)."""
+        if not self.require_page():
+            return
         if self.layer_index < 0:
             return
         self.move_layer(self.layer_index, self.layer_index + delta)
@@ -118,6 +167,10 @@ class LayersMixin:
         self.layer_index = landed
 
     def _next_group_name(self) -> str:
+        """The next ``Group N``. N starts at the count of pages plus one.
+
+        A number whose name is already used is skipped, so two pages never share it.
+        """
         names = {group.name for group in self.document.groups}
         number = len(self.document.groups) + 1
         while f"Group {number}" in names:
@@ -156,6 +209,8 @@ class LayersMixin:
 
     def add_group(self) -> None:
         """Add a blank page the same pixel size as the one on screen and show it."""
+        if not self.require_page():
+            return
         current = self.document.group
         image = Image.new("RGBA", (current.width, current.height), (255, 255, 255, 255))
         group = LayerGroup(
@@ -170,10 +225,40 @@ class LayersMixin:
 
     def delete_active_group(self) -> None:
         """Remove the page on screen. The last page stays."""
+        if not self.require_page():
+            return
         if len(self.document.groups) <= 1:
             self.show_message("The last group stays. A document always has one page.")
             return
         self.commit(DeleteGroupCommand(self.document, self.document.active_group_id))
+
+    def delete_groups(self, group_ids: list[str]) -> None:
+        """Remove these pages. The last page stays.
+
+        Ids that are not pages are ignored. The rest are removed in the order
+        they appear in the document, so undo puts each page back in its old
+        slot. One undo step. Removing every page is refused: a document
+        always keeps one.
+        """
+        if not self.require_page():
+            return
+        wanted = set(group_ids)
+        # Document order, not the order the rows were clicked. A later page
+        # is still there when an earlier page's slot is recorded.
+        ordered = [group.id for group in self.document.groups if group.id in wanted]
+        if not ordered:
+            return
+        if len(self.document.groups) - len(ordered) < 1:
+            self.show_message("The last group stays. A document always has one page.")
+            return
+        # document_level so undo is not pinned to whatever page is showing.
+        # Each inner command names its page and restores the page that was up.
+        command = CompoundCommand(
+            [DeleteGroupCommand(self.document, group_id) for group_id in ordered],
+            "Delete group" if len(ordered) == 1 else "Delete groups",
+        )
+        command.document_level = True
+        self.commit(command)
 
     def rename_group(self, group_id: str, name: str) -> None:
         group = self.document.group_by_id(group_id)
@@ -233,9 +318,11 @@ class LayersMixin:
         """Bake the active layer downward, as one undo step.
 
         A mask bakes into the picture it belongs to and leaves that picture
-        in the stack. A picture bakes every mask that filters it, then merges
+        in the stack.         A picture bakes every mask that filters it, then merges
         that result into the layer below.
         """
+        if not self.require_page():
+            return
         layer = self.active_layer()
         if layer is None:
             self.show_message("Nothing below this layer to merge into.")
@@ -254,6 +341,8 @@ class LayersMixin:
         Masks of the same picture that sit above the active one stay live.
         Text becomes a normal raster layer. One undo step.
         """
+        if not self.require_page():
+            return
         layer = self.active_layer()
         if layer is None or layer.kind != "redaction":
             self.show_message("Choose a mask layer to apply.")
@@ -341,6 +430,8 @@ class LayersMixin:
         self._commit_stack(layers, "Merge down", merged.id)
 
     def flatten(self) -> None:
+        if not self.require_page():
+            return
         image = composite(self.document)
         layer = blank_layer("Flattened", self.document.width, self.document.height)
         layer.image = image
@@ -374,6 +465,8 @@ class LayersMixin:
         click restores that mix. Layers outside the selection stay put.
         The row checkbox still changes only the layer that was clicked.
         """
+        if not self.require_page():
+            return
         layers = self.selected_layers()
         if not layers:
             return
@@ -405,6 +498,8 @@ class LayersMixin:
         padding in a PNG does not become a full-canvas plate. Undo removes
         every layer this call added.
         """
+        if not self.require_page():
+            return
         copies = [layer.clone() for layer in layers if layer.kind != "redaction"]
         if not copies:
             self.show_message("That file has no image layers to place.")
@@ -430,6 +525,8 @@ class LayersMixin:
         Used when placing a PDF. The new pages are added in the order given,
         and the first of them is shown. Undo removes every page this call added.
         """
+        if not self.require_page():
+            return
         copies = [group.clone() for group in groups]
         if not copies:
             self.show_message("That file has no pages to place.")

@@ -1,4 +1,4 @@
-"""Guides, gradients, blend-free frame export, and dropping a file."""
+"""Guides, blend-free frame export, and dropping a file."""
 
 from __future__ import annotations
 
@@ -16,10 +16,8 @@ from pixedit.frames import (
 from pixedit.guides import SNAP_DISTANCE, rotate_guides_cw, snap_delta, snap_point
 from pixedit.io import load_project, save_project
 from pixedit.model import Document, LayerGroup, new_document, new_id
-from pixedit.paint import draw_gradient
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
-from pixedit.tools.gradient import GradientTool
 from pixedit.tools.shape import ShapeTool
 
 
@@ -51,34 +49,6 @@ def test_crop_shifts_guides_and_undo_puts_them_back():
     session.undo()
     assert session.document.group.guides_v == (10, 30)
     assert session.document.group.guides_h == (5,)
-
-
-def test_gradient_runs_from_the_foreground_to_the_end_color():
-    image = Image.new("RGBA", (5, 1), (0, 0, 0, 0))
-    painted = draw_gradient(
-        image,
-        "linear",
-        (0, 0),
-        (4, 0),
-        (0, 0, 0, 255),
-        (255, 255, 255, 255),
-    )
-    assert painted.getpixel((0, 0))[0] < 5
-    assert abs(painted.getpixel((2, 0))[0] - 128) <= 2
-    assert painted.getpixel((4, 0))[0] > 250
-
-    session = Session(new_document(12, 12, "transparent"))
-    session.foreground = (255, 0, 0, 255)
-    session.options["gradient_color"] = (0, 0, 255, 255)
-    session.options["gradient_kind"] = "linear"
-    tool = GradientTool()
-    tool.pointer_down(session, PointerEvent(1, 6))
-    tool.pointer_up(session, PointerEvent(10, 6))
-    layer = session.active_layer()
-    assert layer.image.getpixel((1, 6))[0] > 200
-    assert layer.image.getpixel((10, 6))[2] > 200
-    session.undo()
-    assert session.active_layer().image.getpixel((6, 6))[3] == 0
 
 
 def test_shape_snaps_to_a_guide_until_snap_is_off():
@@ -234,7 +204,7 @@ def test_hidden_layers_are_gif_frames_and_a_drop_places_or_opens(tmp_path: Path)
     assert "Export animated GIF…" in labels
     assert "Play frames" in labels
     assert "Snap to guides" in labels
-    assert "gradient" in window.tool_by_id
+    assert "gradient" not in window.tool_by_id
     window.session.dirty = False
     window.close()
     app.processEvents()

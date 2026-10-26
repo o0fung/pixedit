@@ -48,6 +48,8 @@ class TransformMixin:
         top = int(top)
         if width < 1 or height < 1:
             return
+        if not self.require_page():
+            return
         width = max(1, min(MAX_EDGE, int(width)))
         height = max(1, min(MAX_EDGE, int(height)))
         if left == 0 and top == 0 and width == self.document.width and height == self.document.height:
@@ -64,6 +66,8 @@ class TransformMixin:
         fill: tuple[int, ...] | None = None,
     ) -> None:
         """Change the frame without resampling. ``fill`` colors a new margin."""
+        if not self.require_page():
+            return
         width = max(1, min(MAX_EDGE, int(width)))
         height = max(1, min(MAX_EDGE, int(height)))
         if width == self.document.width and height == self.document.height:
@@ -92,6 +96,8 @@ class TransformMixin:
         dpi the caller passes. Resample off leaves the pixels alone and stores
         the dpi, which changes the printed size and nothing else.
         """
+        if not self.require_page():
+            return
         width = max(1, min(MAX_EDGE, int(width)))
         height = max(1, min(MAX_EDGE, int(height)))
         dpi = float(dpi)
@@ -138,6 +144,8 @@ class TransformMixin:
         The Image menu and the Select panel share this path. An empty
         selection explains itself and leaves the canvas alone.
         """
+        if not self.require_page():
+            return
         selection = self.document.selection
         if selection is None:
             self.show_message("Draw a selection first.")
@@ -150,6 +158,8 @@ class TransformMixin:
         self.crop_to(left, top, right - left, bottom - top)
 
     def trim(self) -> None:
+        if not self.require_page():
+            return
         rect = trim_rect(self.document)
         if rect is None:
             self.show_message("Nothing opaque to trim to.")
@@ -161,6 +171,8 @@ class TransformMixin:
         self.crop_to(left, top, width, height)
 
     def transform_canvas(self, kind: str) -> None:
+        if not self.require_page():
+            return
         if kind == "rotate-cw":
             layers, width, height, selection = canvas_rotate_cw(self.document)
             name = "Rotate canvas"
@@ -188,6 +200,8 @@ class TransformMixin:
 
     def set_guides(self, vertical: tuple[int, ...] | list[int], horizontal: tuple[int, ...] | list[int]) -> None:
         """Replace the guides on the page on screen. One undo step."""
+        if not self.require_page():
+            return
         new_v = tuple(sorted({int(round(value)) for value in vertical}))
         new_h = tuple(sorted({int(round(value)) for value in horizontal}))
         group = self.document.group
@@ -214,6 +228,8 @@ class TransformMixin:
         turn of that layer alone, including the undo name. The Scale and
         Rotate dialogs stay on the active layer via ``transform_active``.
         """
+        if not self.require_page():
+            return
         self._discard_color_preview()
         layers = self.selected_layers()
         if not layers:

@@ -55,6 +55,22 @@ QLabel#aboutVersion {
     padding-bottom: 8px;
 }
 
+QWidget#welcome {
+    background: transparent;
+}
+
+QLabel#welcomeTitle {
+    font-size: 42px;
+    color: #f4fbff;
+    background: transparent;
+}
+
+QLabel#welcomeHint {
+    color: #9aabba;
+    background: transparent;
+    font-size: 15px;
+}
+
 QTextBrowser#aboutBody {
     background: #16191e;
     color: #e7edf2;

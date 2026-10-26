@@ -88,7 +88,7 @@ def test_layer_list_drop_reorders_the_document():
     session.document.layers[0].name = "Back"
     session.add_layer(raster_layer("Mid", Image.new("RGBA", (4, 4), (0, 255, 0, 255))))
     session.add_layer(raster_layer("Front", Image.new("RGBA", (4, 4), (255, 0, 0, 255))))
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.refresh()
     icons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
     assert {"New", "Copy", "Delete", "Up", "Down", "Visibility", "Group", "Merge down"} <= set(icons)
@@ -96,6 +96,9 @@ def test_layer_list_drop_reorders_the_document():
         assert not button.icon().isNull(), name
         if name == "Visibility":
             assert "selected layer" in button.toolTip()
+        elif name == "Delete":
+            assert "selected layer" in button.toolTip()
+            assert "group" in button.toolTip()
         elif name == "Group":
             assert "own canvas" in button.toolTip()
         elif name == "Merge down":
@@ -198,7 +201,7 @@ def test_layer_rows_show_thumbs_and_text_heads():
     mask = Image.new("L", (16, 8), 0)
     mask.paste(255, (0, 2, 16, 6))
     session.add_layer(redaction_layer("Blur", mask, "blur", 8))
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.resize(280, 420)
     panel.show()
     panel.refresh()
@@ -291,7 +294,7 @@ def test_visibility_button_toggles_the_selection_and_refreshes_the_checks():
     front = raster_layer("Front", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
     session.add_layer(mid)
     session.add_layer(front)
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.resize(240, 420)
     panel.show()
     panel.refresh()
@@ -354,7 +357,7 @@ def test_layer_list_selects_several_rows_and_keeps_the_active_one():
     front.opacity = 0.9
     session.add_layer(mid)
     session.add_layer(front)
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.refresh()
     # Visual order is Front, Mid, Back. Mid becomes the active layer.
     group = panel.list.topLevelItem(0)
@@ -467,6 +470,57 @@ def test_move_layer_to_another_group_and_refuse_a_lone_mask():
     assert any(layer.name == "Photo" for layer in session.document.layers)
 
 
+def test_delete_groups_removes_selected_pages_in_one_undo():
+    session = Session(new_document(4, 4, "white"))
+    session.rename_group(session.document.groups[0].id, "Page 1")
+    session.add_group()
+    session.rename_group(session.document.active_group_id, "Page 2")
+    session.add_group()
+    session.rename_group(session.document.active_group_id, "Page 3")
+    pages = session.document.groups
+    first, second, third = pages[0].id, pages[1].id, pages[2].id
+    session.activate_group(second)
+    session.document.layers[0].name = "On page 2"
+    # A missing id is skipped. Pages are removed in document order.
+    depth = len(session.history.undo_stack)
+    session.delete_groups(["missing", third, second])
+    assert [group.name for group in session.document.groups] == ["Page 1"]
+    assert session.document.active_group_id == first
+    assert len(session.history.undo_stack) == depth + 1
+    assert session.history.undo_stack[-1].name == "Delete groups"
+    session.undo()
+    assert [group.name for group in session.document.groups] == ["Page 1", "Page 2", "Page 3"]
+    assert session.document.active_group_id == second
+    assert session.document.layers[0].name == "On page 2"
+    session.redo()
+    assert [group.name for group in session.document.groups] == ["Page 1"]
+    session.undo()
+    session.delete_groups([])
+    session.delete_groups([first])
+    assert [group.name for group in session.document.groups] == ["Page 2", "Page 3"]
+    assert session.history.undo_stack[-1].name == "Delete group"
+    session.undo()
+
+
+def test_delete_groups_refuses_to_remove_the_last_page():
+    session = Session(new_document(4, 4, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    only = session.document.groups[0].id
+    session.delete_groups([only])
+    assert len(session.document.groups) == 1
+    assert messages == ["The last group stays. A document always has one page."]
+    assert session.history.undo_stack == []
+    session.add_group()
+    session.add_group()
+    messages.clear()
+    depth = len(session.history.undo_stack)
+    session.delete_groups([group.id for group in session.document.groups])
+    assert len(session.document.groups) == 3
+    assert len(session.history.undo_stack) == depth
+    assert messages == ["The last group stays. A document always has one page."]
+
+
 def test_delete_group_keeps_the_last_page_and_reorder_sets_page_order():
     session = Session(new_document(4, 4, "white"))
     session.delete_active_group()
@@ -509,7 +563,7 @@ def test_folded_pages_stay_folded_and_drag_as_a_block():
     for name in names[1:]:
         session.add_group()
         session.rename_group(session.document.active_group_id, name)
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.show()
     app.processEvents()
     panel.refresh()
@@ -554,6 +608,71 @@ def test_folded_pages_stay_folded_and_drag_as_a_block():
     app.processEvents()
 
 
+def test_delete_icon_removes_a_selected_open_group():
+    from PyQt6.QtWidgets import QApplication, QToolButton
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(8, 8, "white"))
+    session.rename_group(session.document.groups[0].id, "One")
+    first = session.document.groups[0].id
+    session.add_group()
+    session.rename_group(session.document.active_group_id, "Two")
+    second = session.document.groups[1].id
+    session.activate_group(first)
+    session.add_blank_layer()
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    # An open group name stays selected. The layer under it does not.
+    panel.list.setCurrentItem(panel.list.topLevelItem(0))
+    app.processEvents()
+    header = panel.list.topLevelItem(0)
+    assert header is not None
+    assert header.isSelected()
+    assert header.child(0) is not None and not header.child(0).isSelected()
+    assert panel._selected_groups == [first]
+    assert session.document.active_group_id == first
+
+    panel.list.setCurrentItem(panel.list.topLevelItem(1))
+    app.processEvents()
+    other = panel.list.topLevelItem(1)
+    assert other is not None and other.isSelected()
+    assert other.child(0) is not None and not other.child(0).isSelected()
+    assert panel._selected_groups == [second]
+    assert session.document.active_group_id == second
+
+    button = next(item for item in panel.findChildren(QToolButton) if item.accessibleName() == "Delete")
+    button.click()
+    app.processEvents()
+    assert [group.name for group in session.document.groups] == ["One"]
+    session.undo()
+    assert [group.name for group in session.document.groups] == ["One", "Two"]
+    assert session.document.active_group_id == second
+
+    # A layer row still deletes that layer and leaves both pages.
+    panel.refresh()
+    page = panel.list.topLevelItem(0)
+    assert page is not None
+    layer_row = page.child(0)
+    assert layer_row is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(layer_row)
+    layer_row.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    assert panel._selected_groups == []
+    layer_count = len(session.document.groups[0].layers)
+    button.click()
+    assert len(session.document.groups) == 2
+    assert len(session.document.groups[0].layers) == layer_count - 1
+    panel.close()
+    app.processEvents()
+
+
 def test_clicking_a_group_layer_shows_that_page():
     from PyQt6.QtWidgets import QApplication
 
@@ -565,12 +684,151 @@ def test_clicking_a_group_layer_shows_that_page():
     first = session.document.groups[0]
     second = session.document.groups[1]
     session.activate_group(first.id)
-    panel = LayerPanel(session, lambda: None)
+    panel = LayerPanel(session)
     panel.refresh()
     row = panel.list.topLevelItem(1).child(0)
     panel.list.setCurrentItem(row)
     panel._on_selection()
     assert session.document.active_group_id == second.id
+    panel.close()
+    app.processEvents()
+
+
+def test_pix_filename_names_automatic_groups_and_keeps_a_typed_name():
+    from pixedit.model import LayerGroup
+    from pixedit.session.layers import apply_pix_group_names
+
+    one = LayerGroup(id="a", name="Group 1", width=1, height=1)
+    apply_pix_group_names([one], "/tmp/holiday.pix")
+    assert one.name == "holiday"
+
+    pages = [
+        LayerGroup(id="a", name="Group 1", width=1, height=1),
+        LayerGroup(id="b", name="Group 2", width=1, height=1),
+        LayerGroup(id="c", name="Cover", width=1, height=1),
+    ]
+    apply_pix_group_names(pages, "album.pix")
+    assert [group.name for group in pages] == ["album 1", "album 2", "Cover"]
+
+    taken = [
+        LayerGroup(id="a", name="Group 1", width=1, height=1),
+        LayerGroup(id="b", name="holiday", width=1, height=1),
+    ]
+    apply_pix_group_names(taken, "holiday.pix")
+    assert [group.name for group in taken] == ["holiday 2", "holiday"]
+
+    bumped = [
+        LayerGroup(id="a", name="Group 1", width=1, height=1),
+        LayerGroup(id="b", name="Group 3", width=1, height=1),
+        LayerGroup(id="c", name="notes 1", width=1, height=1),
+    ]
+    apply_pix_group_names(bumped, "notes.pix")
+    assert [group.name for group in bumped] == ["notes 2", "notes 3", "notes 1"]
+
+
+def test_open_pix_names_an_automatic_group_from_the_filename(tmp_path):
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.io import save_project
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    source = Session(new_document(4, 4, "white"))
+    holiday = tmp_path / "holiday.pix"
+    save_project(source.document, str(holiday))
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    window.open_path(str(holiday))
+    app.processEvents()
+    assert window.session.document.group.name == "holiday"
+    window.session.add_group()
+    assert window.session.document.group.name == "Group 2"
+
+    source.document.groups[0].name = "Cover"
+    cover = tmp_path / "cover.pix"
+    save_project(source.document, str(cover))
+    window.open_path(str(cover))
+    app.processEvents()
+    assert window.session.document.group.name == "Cover"
+
+    extra = Session(new_document(4, 4, "white"))
+    extra.add_group()
+    notes = tmp_path / "notes.pix"
+    save_project(extra.document, str(notes))
+    window.open_path(str(holiday))
+    app.processEvents()
+    window._place_project(str(notes))
+    app.processEvents()
+    assert [group.name for group in window.session.document.groups] == ["holiday", "notes 1", "notes 2"]
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
+def test_rename_dialog_edits_the_selected_group_or_layer(monkeypatch):
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(8, 8, "white"))
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    assert panel.list.expandsOnDoubleClick() is False
+
+    header = panel.list.topLevelItem(0)
+    assert header is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(header)
+    header.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    seen: dict[str, str] = {}
+
+    def group_name(*_args, **kwargs):
+        seen["title"] = kwargs.get("title", _args[1] if len(_args) > 1 else "")
+        seen["text"] = kwargs.get("text", "")
+        return "Cover", True
+
+    monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", group_name)
+    panel.rename_selection()
+    assert seen["title"] == "Rename group"
+    assert seen["text"] == "Group 1"
+    assert session.document.group.name == "Cover"
+
+    monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", lambda *_a, **_k: ("  ", True))
+    panel.rename_selection()
+    assert session.document.group.name == "Cover"
+    monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", lambda *_a, **_k: ("Nope", False))
+    panel.rename_selection()
+    assert session.document.group.name == "Cover"
+
+    panel.refresh()
+    page = panel.list.topLevelItem(0)
+    assert page is not None
+    layer_row = page.child(0)
+    assert layer_row is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(layer_row)
+    layer_row.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    assert panel._selected_groups == []
+
+    def layer_name(*_args, **kwargs):
+        seen["title"] = kwargs.get("title", _args[1] if len(_args) > 1 else "")
+        return "Sketch", True
+
+    monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", layer_name)
+    panel.rename_selection()
+    assert seen["title"] == "Rename layer"
+    assert session.active_layer().name == "Sketch"
+    assert session.document.group.name == "Cover"
     panel.close()
     app.processEvents()
 

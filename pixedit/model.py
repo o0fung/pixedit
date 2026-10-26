@@ -425,6 +425,10 @@ class Document:
     active group. Existing edits keep using those names and only touch the
     page on screen. ``dpi`` belongs to the whole file: one PDF import is one
     render scale, so changing it changes every page's printed size.
+
+    An explicit empty ``groups`` list is the start state: no page is on
+    screen. ``layers`` and ``selection`` then read as empty. ``group``,
+    ``width``, and ``height`` still require a page.
     """
 
     def __init__(
@@ -442,8 +446,6 @@ class Document:
             stored = 72.0
         self.dpi = stored
         if groups is not None:
-            if not groups:
-                raise ValueError("A document needs at least one group")
             self.groups = list(groups)
         else:
             self.groups = [
@@ -456,6 +458,10 @@ class Document:
                     selection=selection,
                 )
             ]
+        # No pages yet. Leave the active id blank so nothing is treated as Group 1.
+        if not self.groups:
+            self.active_group_id = ""
+            return
         self.active_group_id = active_group_id or self.groups[0].id
         if self.group_by_id(self.active_group_id) is None:
             self.active_group_id = self.groups[0].id
@@ -501,7 +507,12 @@ class Document:
 
     @property
     def layers(self) -> list[Layer]:
-        """The active page's stack. In-place edits mutate that page only."""
+        """The active page's stack. In-place edits mutate that page only.
+
+        With no pages this is an empty list. The setter still needs a page.
+        """
+        if not self.groups:
+            return []
         return self.group.layers
 
     @layers.setter
@@ -510,6 +521,8 @@ class Document:
 
     @property
     def selection(self) -> Image.Image | None:
+        if not self.groups:
+            return None
         return self.group.selection
 
     @selection.setter
@@ -549,6 +562,14 @@ def new_document(width: int, height: int, background: str = "white", dpi: float 
     if stored <= 0:
         stored = 72.0
     return Document(width=width, height=height, layers=[layer], dpi=stored)
+
+
+def empty_document(dpi: float = 72.0) -> Document:
+    """A document with no pages. The window uses this until New or Open."""
+    stored = float(dpi)
+    if stored <= 0:
+        stored = 72.0
+    return Document(width=1, height=1, groups=[], dpi=stored)
 
 
 class Command:

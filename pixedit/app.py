@@ -56,7 +56,10 @@ def check() -> int:
     window = MainWindow()
     window.show()
     app.processEvents()
-    if window.session.document.width < 1 or not window.tool_by_id:
+    if not window.tool_by_id:
+        return 1
+    # A launch with no page is a successful start. A page, if one exists, has a size.
+    if window.session.document.groups and window.session.document.width < 1:
         return 1
     window.close()
     app.processEvents()

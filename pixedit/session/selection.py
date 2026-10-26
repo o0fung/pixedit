@@ -45,6 +45,8 @@ class SelectionMixin:
         Smaller layers are cropped back to whatever opaque pixels remain.
         Redaction masks are left alone.
         """
+        if not self.require_page():
+            return
         if self.document.selection is None:
             self.show_message("No selection. Draw one with Select (S), then Delete clears its pixels.")
             return
@@ -82,10 +84,14 @@ class SelectionMixin:
         self.commit(MutateLayerCommand(layer, new_state, name="Clear selection"))
 
     def select_all(self) -> None:
+        if not self.require_page():
+            return
         mask = Image.new("L", (self.document.width, self.document.height), 255)
         self.set_selection(mask, name="Select all")
 
     def deselect(self) -> None:
+        if not self.require_page():
+            return
         if self.document.selection is None:
             self.show_message("No selection. Draw one with Select (S). Esc or Ctrl+D deselects.")
             return
@@ -104,6 +110,8 @@ class SelectionMixin:
         # One undo step either duplicates the selected pixels or moves them.
         # Cut rasterizes text, the same way Delete does, because the source
         # bitmap changes. Copy leaves a text layer editable.
+        if not self.require_page():
+            return
         if self.document.selection is None:
             self.show_message("Draw a selection first. Select (S), then Ctrl+C copies it to a new layer.")
             return
@@ -169,6 +177,8 @@ class SelectionMixin:
         self.show_message(f"{verb} the selection to a new layer. Esc or Ctrl+D deselects.")
 
     def invert_selection(self) -> None:
+        if not self.require_page():
+            return
         if self.document.selection is None:
             self.set_selection(Image.new("L", (self.document.width, self.document.height), 0), name="Invert selection")
             return

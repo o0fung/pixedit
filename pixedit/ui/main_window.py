@@ -8,7 +8,6 @@ from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QColorDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -38,6 +37,8 @@ from pixedit.io import (
     load_path,
     save_project,
 )
+from pixedit.model import empty_document
+from pixedit.session.layers import apply_pix_group_names
 from pixedit.output_folder import (
     dialog_start,
     ensure_output_folder,
@@ -48,6 +49,7 @@ from pixedit.output_folder import (
 from pixedit.plugins.api import get_api
 from pixedit.plugins.loader import load_plugins
 from pixedit.session import Session
+from pixedit.session.core import START_HINT
 from pixedit.tools.base import Tool, builtin_tools
 from pixedit.ui.canvas import CanvasView, _is_clear_shortcut
 from pixedit.ui.dialogs import (
@@ -73,7 +75,7 @@ _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pd
 # Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
 _TOOL_GROUPS = (
     ("transform", "hand", "zoom", "select"),
-    ("brush", "eraser", "fill", "shape", "gradient", "text"),
+    ("brush", "eraser", "fill", "shape", "text"),
     ("color", "crop", "mask"),
 )
 
@@ -82,7 +84,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         load_plugins()
-        self.session = Session()
+        self.session = Session(empty_document())
         self.session.add_listener(self._on_session)
         self.session.set_message_handler(self._toast)
         self.session.set_text_prompter(self._prompt_text)
@@ -165,7 +167,7 @@ class MainWindow(QMainWindow):
         self._play_return: tuple | None = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._advance_play)
-        self.layers = LayerPanel(self.session, self._rename_layer)
+        self.layers = LayerPanel(self.session)
         right = QFrame()
         right.setObjectName("layers")
         right.setMinimumWidth(240)
@@ -710,7 +712,11 @@ class MainWindow(QMainWindow):
 
     def _update_title(self) -> None:
         # A saved .pix project wins. Otherwise show the opened image or PDF
-        # name. A new canvas has neither and stays Untitled.
+        # name. A new canvas has neither and stays Untitled. With no page yet
+        # the title is only the app name.
+        if not self.session.document.groups:
+            self.setWindowTitle("PixEdit")
+            return
         if self.session.path:
             name = Path(self.session.path).name
         elif self.session.source_name:
@@ -805,9 +811,6 @@ class MainWindow(QMainWindow):
         if action_id == "reset_color":
             self.session.cancel_color_adjust()
             return
-        if action_id == "gradient_end_color":
-            self._pick_gradient_end()
-            return
         method = getattr(self.session, action_id, None)
         if method is not None:
             method()
@@ -818,6 +821,9 @@ class MainWindow(QMainWindow):
 
     def _update_status(self) -> None:
         doc = self.session.document
+        if not doc.groups:
+            self._status_label.setText(START_HINT)
+            return
         x, y = self._cursor
         tool = self.current.label if self.current else ""
         zoom = int(round(self.canvas.zoom * 100))
@@ -879,6 +885,8 @@ class MainWindow(QMainWindow):
 
     def _place(self) -> None:
         """Add an image as new layers. The open document stays in place."""
+        if not self.session.require_page():
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Place image", self._file_dialog_start(), _PLACE_FILTER)
         if not path:
             return
@@ -919,6 +927,8 @@ class MainWindow(QMainWindow):
         # A .pix file is the save path. An image or PDF only lends its filename,
         # so Save still asks for a project and does not overwrite the source.
         project = Path(path).suffix.lower() == ".pix"
+        if project:
+            apply_pix_group_names(document.groups, path)
         self.session.replace_document(
             document,
             path if project else None,
@@ -928,6 +938,8 @@ class MainWindow(QMainWindow):
         self._toast(f"Opened {Path(path).name}")
 
     def _save(self) -> bool:
+        if not self.session.require_page():
+            return False
         self._stop_play()
         if not self.session.path:
             return self._save_as()
@@ -941,6 +953,8 @@ class MainWindow(QMainWindow):
         return True
 
     def _save_as(self) -> bool:
+        if not self.session.require_page():
+            return False
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save project",
@@ -955,6 +969,8 @@ class MainWindow(QMainWindow):
         return self._save()
 
     def _export(self) -> None:
+        if not self.session.require_page():
+            return
         self._stop_play()
         filename, selected_filter = self._export_suggestion()
         path, selected = QFileDialog.getSaveFileName(
@@ -985,14 +1001,11 @@ class MainWindow(QMainWindow):
         self._toast(note)
 
     def _rename_layer(self) -> None:
-        layer = self.session.active_layer()
-        if layer is None:
-            return
-        name, ok = QInputDialog.getText(self, "Rename layer", "Name", text=layer.name)
-        if ok:
-            self.session.rename_active(name)
+        self.layers.rename_selection()
 
     def _scale_layer(self) -> None:
+        if not self.session.require_page():
+            return
         layer = self.session.active_layer()
         if layer is None:
             return
@@ -1004,6 +1017,8 @@ class MainWindow(QMainWindow):
         self.session.transform_active("scale", width=width, height=height)
 
     def _rotate_layer(self) -> None:
+        if not self.session.require_page():
+            return
         if self.session.active_layer() is None:
             return
         dialog = RotateDialog(self)
@@ -1015,6 +1030,8 @@ class MainWindow(QMainWindow):
         self.session.crop_to_selection()
 
     def _canvas_size(self) -> None:
+        if not self.session.require_page():
+            return
         document = self.session.document
         dialog = CanvasSizeDialog(document.width, document.height, tuple(self.session.foreground), self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -1023,6 +1040,8 @@ class MainWindow(QMainWindow):
         self.session.resize_canvas(width, height, anchor, fill)
 
     def _image_size(self) -> None:
+        if not self.session.require_page():
+            return
         document = self.session.document
         dialog = ImageSizeDialog(document.width, document.height, document.dpi, self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -1037,6 +1056,8 @@ class MainWindow(QMainWindow):
             self.set_tool(tool)
 
     def _filter(self, title: str, specs: list[dict], apply_fn) -> None:
+        if not self.session.require_page():
+            return
         self.session.cancel_color_adjust()
         layer = self.session.active_layer()
         if layer is None or layer.kind == "redaction":
@@ -1045,6 +1066,8 @@ class MainWindow(QMainWindow):
         LiveFilterDialog(self, self.session, title, specs, apply_fn).exec()
 
     def _run_plugin(self, callback) -> None:
+        if not self.session.require_page():
+            return
         try:
             callback(self.session)
         except Exception as exc:
@@ -1070,21 +1093,6 @@ class MainWindow(QMainWindow):
         state = "on" if self.session.option("snap", True) else "off"
         self._toast(f"Snap to guides is {state}.")
 
-    def _pick_gradient_end(self) -> None:
-        from pixedit.tools.gradient import gradient_end_color
-
-        red, green, blue, alpha = gradient_end_color(self.session)
-        chosen = QColorDialog.getColor(
-            QColor(red, green, blue, alpha),
-            self,
-            "Gradient end color",
-            QColorDialog.ColorDialogOption.ShowAlphaChannel,
-        )
-        if not chosen.isValid():
-            return
-        self.session.options["gradient_color"] = (chosen.red(), chosen.green(), chosen.blue(), chosen.alpha())
-        self._toast("Gradient end color updated.")
-
     def dragEnterEvent(self, event) -> None:
         if paths_from_drop(event):
             event.acceptProposedAction()
@@ -1107,10 +1115,18 @@ class MainWindow(QMainWindow):
 
         An image or PDF lands on the page on screen. A ``.pix`` project is
         appended as new groups at the end. The document already open stays
-        open, including its save path.
+        open, including its save path. With no page yet, the first file
+        opens a document and any further files in that drop are placed on it.
         """
         self._stop_play()
-        for path in paths:
+        pending = list(paths)
+        # Nothing is open, so the first file becomes the document.
+        if pending and not self.session.document.groups:
+            first = pending.pop(0)
+            self.open_path(first)
+            if not self.session.document.groups:
+                return
+        for path in pending:
             if Path(path).suffix.lower() == ".pix":
                 self._place_project(path)
             else:
@@ -1123,11 +1139,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
+        apply_pix_group_names(incoming.groups, path)
         self.session.place_groups(incoming.groups)
 
     def _toggle_play(self) -> None:
         if self._playing:
             self._stop_play()
+            return
+        if not self.session.require_page():
             return
         kind = frame_kind(self.session.document)
         if kind is None:
@@ -1194,6 +1213,8 @@ class MainWindow(QMainWindow):
             self.canvas.update()
 
     def _export_gif(self) -> None:
+        if not self.session.require_page():
+            return
         self._stop_play()
         delay, ok = QInputDialog.getInt(
             self,

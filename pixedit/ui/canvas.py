@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, QRectF, QTimer
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygon, QPolygonF
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from pixedit.composite import composite, composite_region, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
@@ -147,8 +147,31 @@ class CanvasView(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
+        self._welcome = QWidget(self)
+        self._welcome.setObjectName("welcome")
+        # The hint sits on the canvas. Clicks and drops pass through to the view.
+        self._welcome.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        welcome_layout = QVBoxLayout(self._welcome)
+        welcome_layout.setContentsMargins(24, 0, 24, 0)
+        welcome_layout.setSpacing(14)
+        self.welcome_title = QLabel("PixEdit")
+        self.welcome_title.setObjectName("welcomeTitle")
+        self.welcome_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.welcome_hint = QLabel(
+            "New… starts a blank canvas\nOpen… edits a picture or a project\nOr drop a file here"
+        )
+        self.welcome_hint.setObjectName("welcomeHint")
+        self.welcome_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(self.welcome_title)
+        welcome_layout.addWidget(self.welcome_hint)
+        self.sync_welcome()
 
     def invalidate(self, bounds: tuple[int, int, int, int] | None = None) -> None:
+        self.sync_welcome()
+        if not self.session.document.groups:
+            self._dirty = True
+            self.update()
+            return
         if self._note_group_view():
             bounds = None
         if bounds is not None and self._patch_preview(bounds):
@@ -190,6 +213,8 @@ class CanvasView(QWidget):
         return True
 
     def ruler(self) -> int:
+        if not self.session.document.groups:
+            return 0
         return 22 if self.session.option("rulers", True) else 0
 
     def refresh_tool_cursor(self) -> None:
@@ -293,6 +318,8 @@ class CanvasView(QWidget):
         self.refresh_tool_cursor()
 
     def fit(self) -> None:
+        if not self.session.document.groups:
+            return
         doc = self.session.document
         ruler = self.ruler()
         avail_w = max(1.0, self.width() - ruler - 36)
@@ -321,7 +348,34 @@ class CanvasView(QWidget):
         self.offset_y = offset_y
         self.session.view_zoom = self.zoom
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_welcome()
+
+    def sync_welcome(self) -> None:
+        """Show the name and the start hint only while no page is open."""
+        empty = not self.session.document.groups
+        self._welcome.setVisible(empty)
+        if empty:
+            self._place_welcome()
+
+    def _place_welcome(self) -> None:
+        self._welcome.adjustSize()
+        size = self._welcome.sizeHint()
+        width = max(size.width(), 280)
+        height = size.height()
+        self._welcome.resize(width, height)
+        self._welcome.move(max(0, (self.width() - width) // 2), max(0, (self.height() - height) // 2))
+
+    def _has_page(self) -> bool:
+        return bool(self.session.document.groups)
+
     def paintEvent(self, event) -> None:
+        # No page yet. The welcome labels are child widgets on this fill.
+        if not self.session.document.groups:
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor("#101318"))
+            return
         self._note_group_view()
         if self.letterbox:
             self._apply_letterbox()
@@ -659,6 +713,8 @@ class CanvasView(QWidget):
             y += step
 
     def wheelEvent(self, event) -> None:
+        if not self._has_page():
+            return
         delta = event.angleDelta().y()
         if delta == 0:
             return
@@ -666,6 +722,8 @@ class CanvasView(QWidget):
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
+        if not self._has_page():
+            return
         pos = event.position()
         if event.button() == Qt.MouseButton.MiddleButton or self._space or self._is_hand():
             self._panning = True
@@ -686,6 +744,8 @@ class CanvasView(QWidget):
             self._sync_hover_cursor(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if not self._has_page():
+            return
         pos = event.position()
         self._report_status(pos.x(), pos.y())
         # The key may have gone down while another widget had the keyboard.
@@ -711,6 +771,8 @@ class CanvasView(QWidget):
                 tool.pointer_move(self.session, self._pointer(event))
 
     def mouseReleaseEvent(self, event) -> None:
+        if not self._has_page():
+            return
         if self._guide is not None and event.button() == Qt.MouseButton.LeftButton:
             self._finish_guide(event.position())
             return

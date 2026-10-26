@@ -206,10 +206,9 @@ class LayerTree(QTreeWidget):
 
 
 class LayerPanel(QWidget):
-    def __init__(self, session, on_rename) -> None:
+    def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        self.on_rename = on_rename
         self._building = False
         # True from the drop until the document matches the list, so a
         # selection change during the drag does not pick the wrong layer.
@@ -238,8 +237,12 @@ class LayerPanel(QWidget):
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.setRootIsDecorated(True)
         self.list.setItemsExpandable(True)
+        # Double-click renames the row, the same way a layer does. The arrow
+        # still folds a page on a single click.
+        self.list.setExpandsOnDoubleClick(False)
         self.list.setToolTip(
             "Click a group, or a layer in it, to show that page. "
+            "Double-click a group or a layer to rename it. "
             "The arrow folds a page. Shift-click or Command-click folded pages, "
             "then drag them to change the page order. "
             "Drag a layer to restack it, or onto another group to move it. "
@@ -257,32 +260,38 @@ class LayerPanel(QWidget):
         layout.addWidget(self.list, 1)
 
         buttons = QHBoxLayout()
-        self._add_button(buttons, "New", self.session.add_blank_layer, icon="layer-new")
-        self._add_button(buttons, "Copy", self.session.duplicate_active, icon="layer-copy")
-        self._add_button(buttons, "Delete", self.session.delete_active, icon="layer-delete")
+        self._add_button(buttons, "New", self._page_action(self.session.add_blank_layer), icon="layer-new")
+        self._add_button(buttons, "Copy", self._page_action(self.session.duplicate_active), icon="layer-copy")
+        self._add_button(
+            buttons,
+            "Delete",
+            self._page_action(self._delete_selection),
+            "Delete the selected layer. If group rows are selected, delete those groups.",
+            icon="layer-delete",
+        )
         self._add_button(
             buttons,
             "Visibility",
-            self.session.toggle_selected_visibility,
+            self._page_action(self.session.toggle_selected_visibility),
             "Toggle visibility of every selected layer. Click again to put them back.",
             icon="layer-visibility",
         )
         buttons.addStretch(1)
         layout.addLayout(buttons)
         buttons2 = QHBoxLayout()
-        self._add_button(buttons2, "Up", lambda: self.session.move_active(1), icon="layer-up")
-        self._add_button(buttons2, "Down", lambda: self.session.move_active(-1), icon="layer-down")
+        self._add_button(buttons2, "Up", self._page_action(lambda: self.session.move_active(1)), icon="layer-up")
+        self._add_button(buttons2, "Down", self._page_action(lambda: self.session.move_active(-1)), icon="layer-down")
         self._add_button(
             buttons2,
             "Group",
-            self.session.add_group,
+            self._page_action(self.session.add_group),
             "New group. It has its own canvas and does not mix with the other groups.",
             icon="folder",
         )
         self._add_button(
             buttons2,
             "Merge down",
-            self.session.merge_down_active,
+            self._page_action(self.session.merge_down_active),
             "Bake this layer into the one below it. A mask bakes into the layer it belongs to. "
             "Flatten image, in the Layer menu, collapses the group you are viewing (Ctrl+Shift+E).",
             icon="layer-merge-down",
@@ -305,6 +314,16 @@ class LayerPanel(QWidget):
         self.blend.currentIndexChanged.connect(self._blend_changed)
         layout.addWidget(QLabel("Blend"))
         layout.addWidget(self.blend)
+
+    def _page_action(self, callback):
+        """Run a layer command only when a page is open."""
+
+        def run(*_args, **_kwargs):
+            if not self.session.require_page():
+                return
+            callback()
+
+        return run
 
     def _add_button(self, layout: QHBoxLayout, text: str, callback, tip: str = "", icon: str = "") -> None:
         if icon:
@@ -617,17 +636,68 @@ class LayerPanel(QWidget):
             # labels stay in sync when no window listener refreshes us.
             self.refresh()
 
+    def _delete_selection(self) -> None:
+        """Delete the highlighted pages, or the active layer when layers are highlighted."""
+        if self._selected_groups:
+            self.session.delete_groups(self._selected_groups)
+            return
+        self.session.delete_active()
+
+    def rename_selection(self) -> None:
+        """Edit the highlighted group, or the active layer when a layer is highlighted.
+
+        Empty text keeps the old name. Cancel leaves the name alone. Undo
+        restores either change.
+        """
+        if not self.session.require_page():
+            return
+        if self._selected_groups:
+            self._rename_group(self._selected_group_id())
+            return
+        self._rename_active_layer()
+
+    def _selected_group_id(self) -> str | None:
+        current = self.list.currentItem()
+        if current is not None and current.data(0, _ITEM_KIND) == "group":
+            group_id = current.data(0, _ITEM_ID)
+            if isinstance(group_id, str) and group_id in self._selected_groups:
+                return group_id
+        if self._selected_groups:
+            return self._selected_groups[-1]
+        return None
+
+    def _rename_group(self, group_id: str | None) -> None:
+        if not isinstance(group_id, str):
+            return
+        group = self.session.document.group_by_id(group_id)
+        if group is None:
+            return
+        name = self._prompt_name("Rename group", group.name)
+        if name is None:
+            return
+        self.session.rename_group(group.id, name)
+
+    def _rename_active_layer(self) -> None:
+        layer = self.session.active_layer()
+        if layer is None:
+            return
+        name = self._prompt_name("Rename layer", layer.name)
+        if name is None:
+            return
+        self.session.rename_active(name)
+
+    def _prompt_name(self, title: str, current: str) -> str | None:
+        name, ok = QInputDialog.getText(self, title, "Name", text=current)
+        if not ok:
+            return None
+        return name
+
     def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
         if item.data(0, _ITEM_KIND) == "group":
             group_id = item.data(0, _ITEM_ID)
-            group = self.session.document.group_by_id(group_id) if isinstance(group_id, str) else None
-            if group is None:
-                return
-            name, ok = QInputDialog.getText(self, "Rename group", "Name", text=group.name)
-            if ok:
-                self.session.rename_group(group.id, name)
+            self._rename_group(group_id if isinstance(group_id, str) else None)
             return
-        self.on_rename()
+        self._rename_active_layer()
 
     def _on_selection(self) -> None:
         if self._building or self._reordering:
@@ -643,18 +713,13 @@ class LayerPanel(QWidget):
         if current is None or not current.isSelected():
             current = items[-1]
         if all(item.data(0, _ITEM_KIND) == "group" for item in items):
-            # Page rows, not layers. One open page still shows that page and
-            # then highlights its layer. Folded pages, or more than one page,
-            # stay highlighted so they can be dragged together.
-            folded = all(not item.isExpanded() for item in items)
-            if len(items) == 1 and not folded:
-                self._selected_groups = []
-                group_id = current.data(0, _ITEM_ID)
-                if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
-                    self.session.activate_group(group_id)
-                else:
-                    self.refresh()
-                return
+            # The click is on page rows, not layers.
+            # 1. Remember those pages, in list order, so Delete removes them
+            #    and a drag moves them together.
+            # 2. Show the page under the pointer when it is not already showing.
+            #    The layer that page was using stays the paint target.
+            # 3. Keep the page rows highlighted. An open page used to hand the
+            #    highlight to its layer, which made Delete remove that layer.
             self._selected_groups = [
                 group_id
                 for index in range(self.list.topLevelItemCount())
@@ -666,7 +731,7 @@ class LayerPanel(QWidget):
             if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
                 self.session.activate_group(group_id)
             else:
-                self._sync_controls()
+                self.refresh()
             return
         self._selected_groups = []
         parent = current.parent()
