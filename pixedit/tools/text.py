@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pixedit.geom import hit_layer
+from pixedit.geom import top_layer_at
 from pixedit.model import Layer
 from pixedit.tools.base import (
     PointerEvent,
@@ -73,17 +73,13 @@ class TextTool(Tool):
         if target is None:
             session.add_text(edited, int(round(event.x)), int(round(event.y)))
         else:
-            session.layer_index = session.document.index_of(target.id)
+            session.focus_layer(target)
             session.update_text(target, edited)
 
     def _text_target(self, session, event: PointerEvent) -> Layer | None:
-        # The topmost box wins, so a picture stacked above a text layer is not
-        # edited by a click on the picture. A gap in the text box still hits
-        # the text, because that layer sits above the background.
-        hit = hit_layer(session.document, event.x, event.y)
-        if hit is None:
-            return None
-        layer = session.document.layers[hit]
-        if layer.kind != "text":
+        # The topmost box wins, including a shared header. A picture stacked
+        # above a text layer is not edited by a click on the picture.
+        layer = top_layer_at(session.document, event.x, event.y)
+        if layer is None or layer.kind != "text":
             return None
         return layer

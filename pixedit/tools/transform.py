@@ -10,6 +10,7 @@ from pixedit.geom import (
     _place_from_corner,
     clip_box,
     hit_layer,
+    top_layer_at,
     layer_union_bounds,
     placed_box,
     rotate_visual_around,
@@ -100,9 +101,13 @@ class TransformTool(Tool):
                 self._begin(session, handle, event)
                 return
         if event.ctrl or event.shift:
-            hit = hit_layer(session.document, event.x, event.y)
-            if hit is not None:
-                self._apply_click_selection(session, hit, event)
+            top = top_layer_at(session.document, event.x, event.y)
+            if top is not None and not any(item is top for item in session.document.layers):
+                session.focus_layer(top)
+            else:
+                hit = hit_layer(session.document, event.x, event.y)
+                if hit is not None:
+                    self._apply_click_selection(session, hit, event)
         if not session.selected_layers():
             self._mode = None
             return
@@ -154,7 +159,7 @@ class TransformTool(Tool):
                 math.atan2(event.y - (y + height / 2.0), event.x - (x + width / 2.0))
             )
         # One screen-sized flatten. Move and scale draw it; release resamples.
-        self._stand_in = flatten_for_drag(layers, session.document.layers, self._start_box, event.zoom)
+        self._stand_in = flatten_for_drag(layers, session._stack(), self._start_box, event.zoom)
         self._live_box = self._start_box
         self._proxy_active = False
 

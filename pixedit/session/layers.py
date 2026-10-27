@@ -1,6 +1,7 @@
-"""Layer stack, pages, merge, and placing files.
+"""Layer stack, pages, groups, merge, and placing files.
 
-Mixed into ``Session``. A page is a group. Masks stay with the picture they
+Mixed into ``Session``. A page is one canvas. A group is a tag whose layers
+are drawn on every page that lists it. Masks stay with the picture they
 filter. Every change goes through ``commit`` so it is one undo step.
 """
 
@@ -19,17 +20,23 @@ from pixedit.model import (
     CompoundCommand,
     DeleteGroupCommand,
     DeleteLayersCommand,
+    DeleteSharedGroupCommand,
     DuplicateLayerCommand,
     InsertGroupCommand,
     InsertLayerCommand,
+    InsertSharedGroupCommand,
     Layer,
     LayerGroup,
     MoveLayersToGroupCommand,
     RenameGroupCommand,
     ReorderGroupsCommand,
+    ReorderSharedGroupsCommand,
     ReorderStackCommand,
     ReplaceDocumentContent,
     SetLayerAttrCommand,
+    SetPageTagsCommand,
+    SharedGroup,
+    TransferLayersCommand,
     layers_leaving,
     mask_target,
     masks_for,
@@ -38,8 +45,8 @@ from pixedit.model import (
     slot_above_block,
 )
 
-# A page that was never renamed. "Group 1" counts; "Cover" and "Page 1" do not.
-_AUTOMATIC_GROUP_NAME = re.compile(r"^Group \d+$")
+# A page that was never renamed. "Page 1" and the older "Group 1" count.
+_AUTOMATIC_GROUP_NAME = re.compile(r"^(?:Page|Group) \d+$")
 
 
 def apply_pix_group_names(groups: list[LayerGroup], path: str) -> None:
@@ -82,19 +89,21 @@ class LayersMixin:
     def add_layer(self, layer: Layer, index: int | None = None, name: str = "Add layer") -> None:
         if not self.require_page():
             return
+        shared_id = self._editing_shared_id()
+        stack = self._stack()
         if index is None:
-            index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
+            index = len(stack) if self.layer_index < 0 else self.layer_index + 1
             # A new picture lands above a mask run, not between a picture and its masks.
-            index = slot_above_block(self.document.layers, index)
-        self.commit(InsertLayerCommand(self.document, layer, index, name=name))
-        self.layer_index = max(0, min(index, len(self.document.layers) - 1))
+            index = slot_above_block(stack, index)
+        self.commit(InsertLayerCommand(self.document, layer, index, name=name, shared_id=shared_id))
+        self.layer_index = max(0, min(index, len(self._stack()) - 1))
         self.notify("change")
 
     def add_blank_layer(self) -> None:
         """Add an empty content-sized layer. The first stroke grows its bitmap."""
         if not self.require_page():
             return
-        number = len(self.document.layers) + 1
+        number = len(self._stack()) + 1
         layer = empty_raster_layer(f"Layer {number}")
         self.add_layer(layer, name="New layer")
 
@@ -103,11 +112,11 @@ class LayersMixin:
             return
         if self.layer_index < 0:
             return
-        command = DuplicateLayerCommand(self.document, self.layer_index)
+        command = DuplicateLayerCommand(self.document, self.layer_index, shared_id=self._editing_shared_id())
         self.commit(command)
         if command.copy is None:
             return
-        for index, layer in enumerate(self.document.layers):
+        for index, layer in enumerate(self._stack()):
             if layer is command.copy:
                 self.layer_index = index
                 return
@@ -120,14 +129,15 @@ class LayersMixin:
         """
         if not self.require_page():
             return
-        if self.layer_index < 0 or not self.document.layers:
+        stack = self._stack()
+        if self.layer_index < 0 or not stack:
             return
-        layer = self.document.layers[self.layer_index]
+        layer = stack[self.layer_index]
         if layer.kind in ("raster", "text"):
-            victims = [layer, *masks_for(self.document.layers, layer)]
+            victims = [layer, *masks_for(stack, layer)]
         else:
             victims = [layer]
-        self.commit(DeleteLayersCommand(self.document, victims))
+        self.commit(DeleteLayersCommand(self.document, victims, shared_id=self._editing_shared_id()))
         self.clamp_index()
 
     def rename_active(self, name: str) -> None:
@@ -155,24 +165,33 @@ class LayersMixin:
         unless the drag only reorders those masks. One undo step. The moved
         layer stays selected.
         """
-        count = len(self.document.layers)
+        stack = self._stack()
+        count = len(stack)
         if not (0 <= old_index < count and 0 <= new_index < count):
             return
         if old_index == new_index:
             return
-        reordered, landed = move_stack(self.document.layers, old_index, new_index)
-        if [layer.id for layer in reordered] == [layer.id for layer in self.document.layers]:
+        reordered, landed = move_stack(stack, old_index, new_index)
+        if [layer.id for layer in reordered] == [layer.id for layer in stack]:
             return
-        self.commit(ReorderStackCommand(self.document, reordered))
+        self.commit(ReorderStackCommand(self.document, reordered, shared_id=self._editing_shared_id()))
         self.layer_index = landed
 
     def _next_group_name(self) -> str:
-        """The next ``Group N``. N starts at the count of pages plus one.
+        """The next ``Page N``. N starts at the count of pages plus one.
 
         A number whose name is already used is skipped, so two pages never share it.
         """
         names = {group.name for group in self.document.groups}
         number = len(self.document.groups) + 1
+        while f"Page {number}" in names:
+            number += 1
+        return f"Page {number}"
+
+    def _next_shared_name(self) -> str:
+        """The next ``Group N`` that is not already a group's name."""
+        names = {group.name for group in self.document.shared_groups}
+        number = len(self.document.shared_groups) + 1
         while f"Group {number}" in names:
             number += 1
         return f"Group {number}"
@@ -190,6 +209,7 @@ class LayersMixin:
         """
         if self.document.group_by_id(group_id) is None:
             return
+        self._shared_id = None
         same = group_id == self.document.active_group_id
         if same:
             if layer_ids or active_id:
@@ -211,6 +231,8 @@ class LayersMixin:
         """Add a blank page the same pixel size as the one on screen and show it."""
         if not self.require_page():
             return
+        # The new page is what you edit next, not the group that was selected.
+        self._shared_id = None
         current = self.document.group
         image = Image.new("RGBA", (current.width, current.height), (255, 255, 255, 255))
         group = LayerGroup(
@@ -219,6 +241,7 @@ class LayersMixin:
             width=current.width,
             height=current.height,
             layers=[raster_layer("Background", image)],
+            shared_ids=list(current.shared_ids),
         )
         index = self.document.group_index(current.id) + 1
         self.commit(InsertGroupCommand(self.document, group, index))
@@ -228,7 +251,7 @@ class LayersMixin:
         if not self.require_page():
             return
         if len(self.document.groups) <= 1:
-            self.show_message("The last group stays. A document always has one page.")
+            self.show_message("The last page stays. A document always has one page.")
             return
         self.commit(DeleteGroupCommand(self.document, self.document.active_group_id))
 
@@ -249,13 +272,13 @@ class LayersMixin:
         if not ordered:
             return
         if len(self.document.groups) - len(ordered) < 1:
-            self.show_message("The last group stays. A document always has one page.")
+            self.show_message("The last page stays. A document always has one page.")
             return
         # document_level so undo is not pinned to whatever page is showing.
         # Each inner command names its page and restores the page that was up.
         command = CompoundCommand(
             [DeleteGroupCommand(self.document, group_id) for group_id in ordered],
-            "Delete group" if len(ordered) == 1 else "Delete groups",
+            "Delete page" if len(ordered) == 1 else "Delete pages",
         )
         command.document_level = True
         self.commit(command)
@@ -267,7 +290,9 @@ class LayersMixin:
         cleaned = name.strip() or group.name
         if cleaned == group.name:
             return
-        self.commit(RenameGroupCommand(group, cleaned))
+        command = RenameGroupCommand(group, cleaned)
+        command.name = "Rename page"
+        self.commit(command)
 
     def reorder_groups(self, ordered_ids: list[str]) -> None:
         """Put the pages in this order. That order is the PDF page order."""
@@ -277,6 +302,126 @@ class LayersMixin:
         if set(ordered_ids) != set(current) or len(ordered_ids) != len(current):
             return
         self.commit(ReorderGroupsCommand(self.document, ordered_ids))
+
+    def add_shared_group(self) -> None:
+        """Add an empty group and tag the page on screen with it."""
+        if not self.require_page():
+            return
+        group = SharedGroup(id=new_id(), name=self._next_shared_name(), layers=[])
+        index = len(self.document.shared_groups)
+        self.commit(InsertSharedGroupCommand(self.document, group, index, self.document.active_group_id))
+        self.focus_shared(group.id)
+        self.notify("change")
+
+    def delete_shared_groups(self, group_ids: list[str]) -> None:
+        """Remove these groups and their tags. Pages stay.
+
+        Unknown ids are ignored. One undo step.
+        """
+        if not self.require_page():
+            return
+        wanted = set(group_ids)
+        ordered = [group.id for group in self.document.shared_groups if group.id in wanted]
+        if not ordered:
+            return
+        command = CompoundCommand(
+            [DeleteSharedGroupCommand(self.document, group_id) for group_id in ordered],
+            "Delete group" if len(ordered) == 1 else "Delete groups",
+        )
+        command.document_level = True
+        if self._shared_id in wanted:
+            self._shared_id = None
+        self.commit(command)
+
+    def rename_shared_group(self, group_id: str, name: str) -> None:
+        group = self.document.shared_by_id(group_id)
+        if group is None:
+            return
+        cleaned = name.strip() or group.name
+        if cleaned == group.name:
+            return
+        command = RenameGroupCommand(group, cleaned)
+        command.name = "Rename group"
+        self.commit(command)
+
+    def reorder_shared_groups(self, ordered_ids: list[str]) -> None:
+        """Put the groups in this catalog order. Paint order is per page."""
+        current = [group.id for group in self.document.shared_groups]
+        if ordered_ids == current:
+            return
+        if set(ordered_ids) != set(current) or len(ordered_ids) != len(current):
+            return
+        self.commit(ReorderSharedGroupsCommand(self.document, ordered_ids))
+
+    def toggle_page_tags(self, shared_id: str, page_ids: list[str]) -> None:
+        """Add this group to each page, or remove it when every page already has it.
+
+        A mixed selection gains the tag. Tag order stays put except for a new
+        tag, which is painted on top. One undo step.
+        """
+        if self.document.shared_by_id(shared_id) is None:
+            return
+        pages = []
+        for page_id in page_ids:
+            page = self.document.group_by_id(page_id)
+            if page is not None and page not in pages:
+                pages.append(page)
+        if not pages:
+            return
+        remove = all(shared_id in page.shared_ids for page in pages)
+        updates = []
+        for page in pages:
+            if remove:
+                tags = [tag for tag in page.shared_ids if tag != shared_id]
+            elif shared_id in page.shared_ids:
+                continue
+            else:
+                tags = [*page.shared_ids, shared_id]
+            updates.append((page.id, tags))
+        if not updates:
+            return
+        self.commit(SetPageTagsCommand(self.document, updates))
+
+    def transfer_layers(
+        self,
+        layer_ids: list[str],
+        source_kind: str,
+        source_id: str,
+        dest_kind: str,
+        dest_id: str,
+        dest_index: int,
+    ) -> bool:
+        """Move pictures between a page and a group. A mask follows its picture."""
+        source = self.document.group_by_id(source_id) if source_kind == "page" else self.document.shared_by_id(source_id)
+        dest = self.document.group_by_id(dest_id) if dest_kind == "page" else self.document.shared_by_id(dest_id)
+        if source is None or dest is None or source is dest or not layer_ids:
+            return False
+        leaving = layers_leaving(source.layers, layer_ids)
+        if not leaving or not set(layer_ids) <= {layer.id for layer in leaving}:
+            return False
+        self.commit(
+            TransferLayersCommand(
+                self.document,
+                source_kind,
+                source_id,
+                dest_kind,
+                dest_id,
+                [layer.id for layer in leaving],
+                dest_index,
+            )
+        )
+        if dest_kind == "shared":
+            anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
+            self.focus_shared(dest_id, [anchor.id], anchor.id)
+        else:
+            self._shared_id = None
+            anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
+            try:
+                self.layer_index = self.document.index_of(anchor.id)
+            except KeyError:
+                self.clamp_index()
+        self.notify("change")
+        return True
 
     def move_layers_to_group(self, layer_ids: list[str], dest_group_id: str, dest_index: int) -> bool:
         """Move pictures onto another page. A mask follows its picture.
@@ -330,7 +475,13 @@ class LayersMixin:
         if layer.kind == "redaction":
             self._bake_masks_through(layer, "Merge down")
             return
-        if self.document.index_of(layer.id) <= 0:
+        stack = self._stack()
+        try:
+            index = next(i for i, item in enumerate(stack) if item.id == layer.id)
+        except StopIteration:
+            self.show_message("Nothing below this layer to merge into.")
+            return
+        if index <= 0:
             self.show_message("Nothing below this layer to merge into.")
             return
         self._merge_content_down(layer)
@@ -366,7 +517,7 @@ class LayersMixin:
         baked.text = None
         skip = {id(mask) for mask in masks}
         result: list[Layer] = []
-        for layer in self.document.layers:
+        for layer in self._stack():
             if layer is target:
                 result.append(baked)
             elif id(layer) in skip:
@@ -376,6 +527,13 @@ class LayersMixin:
         return result
 
     def _commit_stack(self, layers: list[Layer], name: str, select_id: str) -> None:
+        shared_id = self._editing_shared_id()
+        if shared_id:
+            command = ReorderStackCommand(self.document, layers, shared_id=shared_id)
+            command.name = name
+            self.commit(command)
+            self.layer_index = self._index_in_stack(select_id)
+            return
         self.commit(
             ReplaceDocumentContent(
                 self.document,
@@ -395,15 +553,16 @@ class LayersMixin:
         those lower masks have to be baked too. Leaving them would run the
         same effect again on the baked pixels.
         """
-        target = mask_target(self.document.layers, mask)
+        stack = self._stack()
+        target = mask_target(stack, mask)
         if target is None:
             self.show_message("This mask has no layer to apply to.")
             return
-        mask_index = self.document.index_of(mask.id)
+        mask_index = next(index for index, item in enumerate(stack) if item.id == mask.id)
         through = [
             item
-            for item in masks_for(self.document.layers, target)
-            if self.document.index_of(item.id) <= mask_index
+            for item in masks_for(stack, target)
+            if next(index for index, candidate in enumerate(stack) if candidate.id == item.id) <= mask_index
         ]
         if not through:
             return
@@ -411,8 +570,9 @@ class LayersMixin:
 
     def _merge_content_down(self, layer: Layer) -> None:
         """Bake ``layer``'s masks, then merge that picture into the layer below."""
-        masks = masks_for(self.document.layers, layer)
-        working = self._stack_with_bake(layer, masks) if masks else list(self.document.layers)
+        stack = self._stack()
+        masks = masks_for(stack, layer)
+        working = self._stack_with_bake(layer, masks) if masks else list(stack)
         try:
             index = next(i for i, item in enumerate(working) if item.id == layer.id)
         except StopIteration:
@@ -435,6 +595,7 @@ class LayersMixin:
         image = composite(self.document)
         layer = blank_layer("Flattened", self.document.width, self.document.height)
         layer.image = image
+        self._shared_id = None
         self.commit(
             ReplaceDocumentContent(
                 self.document,
@@ -443,6 +604,7 @@ class LayersMixin:
                 self.document.height,
                 None,
                 name="Flatten",
+                shared_ids=[],
             )
         )
         self.layer_index = 0
@@ -500,6 +662,8 @@ class LayersMixin:
         """
         if not self.require_page():
             return
+        # Place lands on the page, even when a shared layer was selected.
+        self._shared_id = None
         copies = [layer.clone() for layer in layers if layer.kind != "redaction"]
         if not copies:
             self.show_message("That file has no image layers to place.")
@@ -519,11 +683,12 @@ class LayersMixin:
         noun = "layer" if count == 1 else "layers"
         self.show_message(f"Placed {count} {noun}. The current document was kept.")
 
-    def place_groups(self, groups: list[LayerGroup]) -> None:
-        """Append each page as its own group. The pages already open stay put.
+    def place_groups(self, groups: list[LayerGroup], shared_groups: list[SharedGroup] | None = None) -> None:
+        """Append each page. Shared groups those pages use are copied too.
 
-        Used when placing a PDF. The new pages are added in the order given,
-        and the first of them is shown. Undo removes every page this call added.
+        Used when placing a PDF or a project. The new pages are added in the
+        order given, and the first of them is shown. Undo removes every page
+        and group this call added.
         """
         if not self.require_page():
             return
@@ -531,10 +696,22 @@ class LayersMixin:
         if not copies:
             self.show_message("That file has no pages to place.")
             return
+        id_map: dict[str, str] = {}
+        brought: list[SharedGroup] = []
+        for shared in shared_groups or []:
+            if any(shared.id in page.shared_ids for page in copies):
+                cloned = shared.clone()
+                id_map[shared.id] = cloned.id
+                brought.append(cloned)
+        for page in copies:
+            page.shared_ids = [id_map[tag] for tag in page.shared_ids if tag in id_map]
         start = len(self.document.groups)
         commands: list[Any] = [
             InsertGroupCommand(self.document, group, start + offset) for offset, group in enumerate(copies)
         ]
+        shared_start = len(self.document.shared_groups)
+        for offset, shared in enumerate(brought):
+            commands.append(InsertSharedGroupCommand(self.document, shared, shared_start + offset, None))
         command = CompoundCommand(commands, "Place pages")
         command.document_level = True
         self.commit(command)
@@ -543,7 +720,7 @@ class LayersMixin:
             self.activate_group(first.id)
         count = len(copies)
         noun = "page" if count == 1 else "pages"
-        self.show_message(f"Placed {count} {noun}. Each one is its own group.")
+        self.show_message(f"Placed {count} {noun}.")
 
     def paste_image(self, image: Image.Image) -> None:
         """Add ``image`` as a new layer on the page on screen, centered.
@@ -555,6 +732,7 @@ class LayersMixin:
         """
         if not self.require_page():
             return
+        self._shared_id = None
         # Copy so later edits to the caller's image cannot change the layer.
         rgba = image.convert("RGBA").copy()
         if alpha_bbox(rgba) is None:

@@ -737,7 +737,8 @@ class CanvasView(QWidget):
             return
         self._drag_plate_mode = "view" if use_view else "full"
         self._drag_view_box = view_box if use_view else None
-        below, above = _split_around_selection(doc.layers, set(proxy.layer_ids))
+        stack = doc.composited_layers()
+        below, above = _split_around_selection(stack, set(proxy.layer_ids))
         self._drag_below = self._plate_pixmap(below, use_view, view_box)
         self._drag_above = self._plate_pixmap(above, use_view, view_box)
         self._drag_sprite = pil_to_pixmap(proxy.image)
@@ -746,7 +747,7 @@ class CanvasView(QWidget):
 
     def _plate_pixmap(self, layers: list, use_view: bool, view_box) -> QPixmap | None:
         doc = self.session.document
-        members = _plate_members(doc.layers, layers)
+        members = _plate_members(doc.composited_layers(), layers)
         if not any(layer.visible and layer.opacity > 0 and layer.kind != "redaction" for layer in members):
             return None
         temp = Document(doc.width, doc.height, members)

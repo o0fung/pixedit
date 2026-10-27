@@ -45,9 +45,13 @@ def test_roundtrip_common_rasters_and_gif_frames(tmp_path: Path):
     gif = tmp_path / "anim.gif"
     frames[0].save(gif, save_all=True, append_images=frames[1:], duration=80, disposal=2)
     animated = load_raster(str(gif))
-    assert len(animated.layers) == 2
+    assert len(animated.groups) == 2
+    assert len(animated.shared_groups) == 1
+    assert animated.groups[0].shared_ids == [animated.shared_groups[0].id]
+    assert animated.groups[1].shared_ids == [animated.shared_groups[0].id]
+    assert len(animated.layers) == 1
     assert animated.layers[0].visible is True
-    assert animated.layers[1].visible is False
+    assert animated.groups[1].layers[0].visible is True
 
 
 def test_project_roundtrip_keeps_text_redaction_and_selection(tmp_path: Path):
@@ -269,7 +273,7 @@ def test_v1_project_opens_as_one_group_and_saves_as_v2(tmp_path: Path):
         archive.writestr("selection.png", mask_payload.getvalue())
     loaded = load_project(str(legacy))
     assert len(loaded.groups) == 1
-    assert loaded.groups[0].name == "Group 1"
+    assert loaded.groups[0].name == "Page 1"
     assert loaded.width == 4 and loaded.height == 4
     assert loaded.dpi == 144
     assert loaded.layers[0].name == "Photo"
@@ -281,9 +285,10 @@ def test_v1_project_opens_as_one_group_and_saves_as_v2(tmp_path: Path):
     save_project(loaded, str(saved))
     with zipfile.ZipFile(saved) as archive:
         written = json.loads(archive.read("manifest.json"))
-    assert written["version"] == 2
-    assert written["groups"][0]["name"] == "Group 1"
-    assert written["groups"][0]["layers"][0]["name"] == "Photo"
+    assert written["version"] == 3
+    assert written["pages"][0]["name"] == "Page 1"
+    assert written["pages"][0]["layers"][0]["name"] == "Photo"
+    assert written["shared_groups"] == []
     again = load_project(str(saved))
     assert again.layers[0].image.getpixel((1, 1)) == (3, 4, 5, 255)
     assert again.selection is not None and again.selection.getpixel((2, 2)) == 255

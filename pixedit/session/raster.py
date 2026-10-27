@@ -47,10 +47,11 @@ class RasterMixin:
         if layer is not None and layer.kind == "redaction" and paint_redaction:
             return layer, visual_state(layer), False
         if layer is None or layer.kind == "redaction":
-            created = empty_raster_layer(f"Layer {len(self.document.layers) + 1}")
-            index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
-            index = slot_above_block(self.document.layers, index)
-            self.document.layers.insert(index, created)
+            stack = self._stack()
+            created = empty_raster_layer(f"Layer {len(stack) + 1}")
+            index = len(stack) if self.layer_index < 0 else self.layer_index + 1
+            index = slot_above_block(stack, index)
+            stack.insert(index, created)
             self.layer_index = index
             return created, None, True
         before = visual_state(layer)
@@ -90,12 +91,13 @@ class RasterMixin:
     ) -> None:
         self._fit_content_unless_full_canvas(layer, before)
         if created:
+            stack = self._stack()
             try:
-                index = self.document.layers.index(layer)
+                index = stack.index(layer)
             except ValueError:
-                index = len(self.document.layers)
+                index = len(stack)
             else:
-                self.document.layers.pop(index)
+                stack.pop(index)
             self.add_layer(layer, index=index, name=name)
             return
         if before is None:
@@ -106,7 +108,7 @@ class RasterMixin:
 
     def cancel_raster_edit(self, layer: Layer, before: dict[str, Any] | None, created: bool) -> None:
         if created:
-            self.document.layers = [item for item in self.document.layers if item is not layer]
+            self._replace_stack([item for item in self._stack() if item is not layer])
             self.clamp_index()
             self.preview()
             return
@@ -128,8 +130,9 @@ class RasterMixin:
         if layer is not None and layer.kind == "redaction":
             return layer, False
         target = layer if layer is not None and layer.kind in ("raster", "text") else None
+        stack = self._stack()
         if target is None:
-            for candidate in reversed(self.document.layers):
+            for candidate in reversed(stack):
                 if candidate.kind in ("raster", "text"):
                     target = candidate
                     break
@@ -145,12 +148,12 @@ class RasterMixin:
             target_id=None if target is None else target.id,
         )
         if target is None:
-            index = len(self.document.layers)
+            index = len(stack)
             self.show_message("Add a picture layer before drawing a mask.")
         else:
-            span = contiguous_mask_span(self.document.layers, target)
-            index = len(self.document.layers) if span is None else span[1] + 1
-        self.document.layers.insert(index, created)
+            span = contiguous_mask_span(stack, target)
+            index = len(stack) if span is None else span[1] + 1
+        stack.insert(index, created)
         self.layer_index = index
         return created, True
 

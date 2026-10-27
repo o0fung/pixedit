@@ -307,14 +307,14 @@ class LayerTree(QTreeWidget):
         index = 0
         while index < self.topLevelItemCount():
             group = self.topLevelItem(index)
-            if group is None or group.data(0, _ITEM_KIND) != "group":
+            if group is None or group.data(0, _ITEM_KIND) not in ("group", "shared"):
                 index += 1
                 continue
             child_index = 0
             inserted = 0
             while child_index < group.childCount():
                 child = group.child(child_index)
-                if child.data(0, _ITEM_KIND) == "group":
+                if child.data(0, _ITEM_KIND) in ("group", "shared"):
                     group.takeChild(child_index)
                     self.insertTopLevelItem(index + 1 + inserted, child)
                     inserted += 1
@@ -353,9 +353,14 @@ class LayerPanel(QWidget):
         # Group ids the user folded. Refresh rebuilds the rows, so the arrow
         # state has to be put back or every page opens again.
         self._collapsed: set[str] = set()
-        # Group ids highlighted as pages. Empty means the highlight is layers.
+        # Page ids highlighted as pages. Empty means the highlight is layers.
         self._selected_groups: list[str] = []
+        # Shared group ids highlighted as groups.
+        self._selected_shared: list[str] = []
+        # The group Tag uses when the click is on pages.
+        self._tag_group_id: str | None = None
         self._drag_groups: list[str] = []
+        self._drag_shared: list[str] = []
         self._drag_current: str | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -377,12 +382,13 @@ class LayerPanel(QWidget):
         # still folds a page on a single click.
         self.list.setExpandsOnDoubleClick(False)
         self.list.setToolTip(
-            "Click a group, or a layer in it, to show that page. "
-            "Double-click a group or a layer to rename it. "
-            "The arrow folds a page. Shift-click or Command-click folded pages, "
+            "Click a page, or a layer in it, to show that page. "
+            "Groups sit under the pages. A group's layers are drawn on every page tagged with it. "
+            "Double-click a page, a group, or a layer to rename it. "
+            "The arrow folds a row. Shift-click or Command-click folded pages, "
             "then drag them to change the page order. "
-            "Drag a layer to restack it, or onto another group to move it. "
-            "Shift-click selects a range inside one group."
+            "Drag a layer to restack it, onto another page, or into a group. "
+            "Shift-click selects a range inside one page or one group."
         )
         self.list.itemCollapsed.connect(self._on_group_folded)
         self.list.itemExpanded.connect(self._on_group_folded)
@@ -402,7 +408,8 @@ class LayerPanel(QWidget):
             buttons,
             "Delete",
             self._page_action(self._delete_selection),
-            "Delete the selected layer. If group rows are selected, delete those groups.",
+            "Delete the selected layer. If page rows are selected, delete those pages. "
+            "If group rows are selected, delete those groups.",
             icon="layer-delete",
         )
         self._add_button(
@@ -419,10 +426,24 @@ class LayerPanel(QWidget):
         self._add_button(buttons2, "Down", self._page_action(lambda: self.session.move_active(-1)), icon="layer-down")
         self._add_button(
             buttons2,
-            "Group",
+            "Page",
             self._page_action(self.session.add_group),
-            "New group. It has its own canvas and does not mix with the other groups.",
+            "New page. It has its own canvas and does not mix with the other pages.",
+            icon="new",
+        )
+        self._add_button(
+            buttons2,
+            "Group",
+            self._page_action(self._add_shared_group),
+            "New group, tagged on the page you are viewing. Its layers are drawn on every tagged page.",
             icon="folder",
+        )
+        self._add_button(
+            buttons2,
+            "Tag",
+            self._page_action(self.tag_selection),
+            "Tag the selected pages with the selected group. The last tag paints on top. Tag again to remove it.",
+            icon="tag",
         )
         self._add_button(
             buttons2,
@@ -487,13 +508,13 @@ class LayerPanel(QWidget):
         self.list.clear()
         document = self.session.document
         active_group_id = document.active_group_id
-        active_layer_id = None
-        active_layers = document.layers
-        if 0 <= self.session.layer_index < len(active_layers):
-            active_layer_id = active_layers[self.session.layer_index].id
+        active_shared_id = self.session._shared_id
+        active = self.session.active_layer()
+        active_layer_id = None if active is None else active.id
         chosen = set(self.session.selected_ids())
         current_item = None
         rows: list[tuple[QTreeWidgetItem, str, str]] = []
+        shared_rows: list[tuple[QTreeWidgetItem, str, str]] = []
         # Pages run top to bottom in export order. Inside a page the front
         # layer is the first row, matching the old flat list.
         for group in document.groups:
@@ -535,13 +556,61 @@ class LayerPanel(QWidget):
                     item.setToolTip(0, layer.text.text)
                 header.addChild(item)
                 rows.append((item, layer.id, group.id))
-                if group.id == active_group_id and layer.id == active_layer_id:
+                if active_shared_id is None and group.id == active_group_id and layer.id == active_layer_id:
                     current_item = item
             header.setExpanded(group.id not in self._collapsed)
+        for shared in document.shared_groups:
+            tagged = sum(1 for page in document.groups if shared.id in page.shared_ids)
+            if tagged == 0:
+                shared_meta = "no pages"
+            elif tagged == 1:
+                shared_meta = "1 page"
+            else:
+                shared_meta = f"{tagged} pages"
+            shared_name = shared.name.replace("\r", " ").replace("\n", " ").strip()
+            header = QTreeWidgetItem([f"{shared_name}    {shared_meta}"])
+            header.setData(0, _ITEM_ID, shared.id)
+            header.setData(0, _ITEM_KIND, "shared")
+            header.setData(0, _ITEM_NAME, shared_name)
+            header.setData(0, _ITEM_META, shared_meta)
+            header.setFlags(
+                Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
+            self.list.addTopLevelItem(header)
+            for layer in reversed(shared.layers):
+                layer_name, detail = self._label(layer, shared.layers)
+                item = QTreeWidgetItem([f"{layer_name}\n{detail}"])
+                item.setData(0, _ITEM_ID, layer.id)
+                item.setData(0, _ITEM_KIND, "layer")
+                item.setData(0, _ITEM_NAME, layer_name)
+                item.setData(0, _ITEM_META, detail)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                    | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
+                item.setIcon(0, self._thumb_icon(layer))
+                if layer.kind == "text" and layer.text is not None and layer.text.text.strip():
+                    item.setToolTip(0, layer.text.text)
+                header.addChild(item)
+                shared_rows.append((item, layer.id, shared.id))
+                if shared.id == active_shared_id and layer.id == active_layer_id:
+                    current_item = item
+            header.setExpanded(shared.id not in self._collapsed)
         # setCurrentItem clears every other row. The selection flags are
         # applied after that, or a multi-selection would collapse to one layer.
         page_ids = [group_id for group_id in self._selected_groups if document.group_by_id(group_id) is not None]
         self._selected_groups = page_ids
+        shared_ids = [group_id for group_id in self._selected_shared if document.shared_by_id(group_id) is not None]
+        self._selected_shared = shared_ids
+        if self._tag_group_id and document.shared_by_id(self._tag_group_id) is None:
+            self._tag_group_id = None
         if page_ids:
             current_group = active_group_id if active_group_id in page_ids else page_ids[-1]
             chosen_header = None
@@ -556,12 +625,31 @@ class LayerPanel(QWidget):
             if chosen_header is not None:
                 self.list.setCurrentItem(chosen_header)
             for header in headers:
-                header.setSelected(header.data(0, _ITEM_ID) in page_ids)
+                header.setSelected(header.data(0, _ITEM_KIND) == "group" and header.data(0, _ITEM_ID) in page_ids)
+        elif shared_ids:
+            chosen_header = None
+            headers = []
+            current_shared = shared_ids[-1]
+            for index in range(self.list.topLevelItemCount()):
+                header = self.list.topLevelItem(index)
+                if header is None or header.data(0, _ITEM_KIND) != "shared":
+                    continue
+                headers.append(header)
+                if header.data(0, _ITEM_ID) == current_shared:
+                    chosen_header = header
+            if chosen_header is not None:
+                self.list.setCurrentItem(chosen_header)
+            for header in headers:
+                header.setSelected(header.data(0, _ITEM_ID) in shared_ids)
         else:
             if current_item is not None:
                 self.list.setCurrentItem(current_item)
-            for item, layer_id, group_id in rows:
-                item.setSelected(group_id == active_group_id and layer_id in chosen)
+            if active_shared_id:
+                for item, layer_id, group_id in shared_rows:
+                    item.setSelected(group_id == active_shared_id and layer_id in chosen)
+            else:
+                for item, layer_id, group_id in rows:
+                    item.setSelected(group_id == active_group_id and layer_id in chosen)
         # Selecting a layer scrolls its row into view and opens the page.
         # Put the arrows back so a folded page stays folded.
         for index in range(self.list.topLevelItemCount()):
@@ -575,7 +663,15 @@ class LayerPanel(QWidget):
     def _group_label(self, group) -> tuple[str, str]:
         """The page name, and its pixel size, kept apart so they can paint differently."""
         name = group.name.replace("\r", " ").replace("\n", " ").strip()
-        return name, f"{group.width} × {group.height}"
+        meta = f"{group.width} × {group.height}"
+        tags = []
+        for shared_id in group.shared_ids:
+            shared = self.session.document.shared_by_id(shared_id)
+            if shared is not None:
+                tags.append(shared.name.replace("\r", " ").replace("\n", " ").strip())
+        if tags:
+            meta = f"{meta}  ·  {', '.join(tags)}"
+        return name, meta
 
     def _label(self, layer, layers) -> tuple[str, str]:
         """The layer name, and the caption under it.
@@ -615,7 +711,7 @@ class LayerPanel(QWidget):
         return QIcon(pixmap)
 
     def _on_group_folded(self, item: QTreeWidgetItem) -> None:
-        if self._building or item.data(0, _ITEM_KIND) != "group":
+        if self._building or item.data(0, _ITEM_KIND) not in ("group", "shared"):
             return
         group_id = item.data(0, _ITEM_ID)
         if not isinstance(group_id, str):
@@ -628,11 +724,29 @@ class LayerPanel(QWidget):
     def _on_drag_started(self) -> None:
         self._reordering = True
         self._drag_groups = []
+        self._drag_shared = []
         self._drag_current = None
         selected = self.list.selectedItems()
         # Folded pages are the rows. Several of them move as one block.
         # A layer multi-selection still drags only the current row, because
         # restack records one layer move.
+        if selected and all(item.data(0, _ITEM_KIND) == "shared" for item in selected):
+            chosen = {
+                item.data(0, _ITEM_ID)
+                for item in selected
+                if isinstance(item.data(0, _ITEM_ID), str)
+            }
+            self._drag_shared = [
+                item.data(0, _ITEM_ID)
+                for index in range(self.list.topLevelItemCount())
+                if (item := self.list.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
+            ]
+            current = self.list.currentItem()
+            if current is not None and current.data(0, _ITEM_ID) in chosen:
+                self._drag_current = current.data(0, _ITEM_ID)
+            elif self._drag_shared:
+                self._drag_current = self._drag_shared[-1]
+            return
         if selected and all(item.data(0, _ITEM_KIND) == "group" for item in selected):
             chosen = {
                 item.data(0, _ITEM_ID)
@@ -668,19 +782,30 @@ class LayerPanel(QWidget):
         self._reordering = True
         self._apply_pending_drop()
 
-    def _read_visual(self) -> list[tuple[str, list[str]]] | None:
-        """(group id, layer ids front-first) or None when the drop nested badly."""
-        seen_groups: list[str] = []
+    def _read_visual(self) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]]] | None:
+        """Page rows and group rows, each ``(id, layer ids front-first)``.
+
+        None when a row is nested badly or an id is repeated.
+        """
+        seen_pages: list[str] = []
+        seen_shared: list[str] = []
         seen_layers: list[str] = []
-        visual: list[tuple[str, list[str]]] = []
+        pages: list[tuple[str, list[str]]] = []
+        shared: list[tuple[str, list[str]]] = []
         for index in range(self.list.topLevelItemCount()):
             item = self.list.topLevelItem(index)
-            if item is None or item.data(0, _ITEM_KIND) != "group":
+            if item is None:
                 return None
-            group_id = item.data(0, _ITEM_ID)
-            if not isinstance(group_id, str) or group_id in seen_groups:
+            kind = item.data(0, _ITEM_KIND)
+            if kind not in ("group", "shared"):
                 return None
-            seen_groups.append(group_id)
+            row_id = item.data(0, _ITEM_ID)
+            if not isinstance(row_id, str):
+                return None
+            seen = seen_pages if kind == "group" else seen_shared
+            if row_id in seen:
+                return None
+            seen.append(row_id)
             layer_ids: list[str] = []
             for child_index in range(item.childCount()):
                 child = item.child(child_index)
@@ -691,88 +816,148 @@ class LayerPanel(QWidget):
                     return None
                 seen_layers.append(layer_id)
                 layer_ids.append(layer_id)
-            visual.append((group_id, layer_ids))
-        return visual
+            (pages if kind == "group" else shared).append((row_id, layer_ids))
+        return pages, shared
 
     def _apply_pending_drop(self) -> None:
         # One drag does one thing, then the tree is rebuilt from the document.
-        # 1. Group headers reordered, layers unmoved: that becomes the page order.
-        # 2. One layer moved inside its page: restack, masks staying with their picture.
-        # 3. A picture dropped on another page: move it and its masks, then show that page.
-        # A mask dropped without its picture, or a group nested inside a group, snaps back.
+        # 1. Page headers reordered, layers unmoved: that becomes the page order.
+        # 2. Group headers reordered: catalog order only. Paint order stays on each page.
+        # 3. One layer moved inside its page or its group: restack.
+        # 4. A picture dropped on another page, or between a page and a group.
+        # A mask dropped without its picture snaps back.
         try:
             visual = self._read_visual()
             document = self.session.document
             if visual is None:
                 return
-            model = [(group.id, [layer.id for layer in reversed(group.layers)]) for group in document.groups]
-            if visual == model:
-                return
-            visual_ids = [group_id for group_id, _layer_ids in visual]
-            model_ids = [group_id for group_id, _layer_ids in model]
-            if set(visual_ids) != set(model_ids) or len(visual_ids) != len(model_ids):
-                return
-            model_layers = {group_id: layer_ids for group_id, layer_ids in model}
-            membership = {
-                layer_id: group_id for group_id, layer_ids in model for layer_id in layer_ids
-            }
-            moved = [
-                layer_id
-                for group_id, layer_ids in visual
-                for layer_id in layer_ids
-                if membership.get(layer_id) != group_id
+            visual_pages, visual_shared = visual
+            model_pages = [(group.id, [layer.id for layer in reversed(group.layers)]) for group in document.groups]
+            model_shared = [
+                (group.id, [layer.id for layer in reversed(group.layers)]) for group in document.shared_groups
             ]
-            if not moved and visual_ids != model_ids:
-                if not all(layer_ids == model_layers[group_id] for group_id, layer_ids in visual):
-                    return
-                if len(self._drag_groups) > 1 and self._drag_current is not None:
-                    ordered = place_group_block(model_ids, visual_ids, self._drag_groups, self._drag_current)
-                    if ordered is None:
+            if visual_pages == model_pages and visual_shared == model_shared:
+                return
+            page_visual = [row_id for row_id, _layer_ids in visual_pages]
+            page_model = [row_id for row_id, _layer_ids in model_pages]
+            shared_visual = [row_id for row_id, _layer_ids in visual_shared]
+            shared_model = [row_id for row_id, _layer_ids in model_shared]
+            if set(page_visual) != set(page_model) or len(page_visual) != len(page_model):
+                return
+            if set(shared_visual) != set(shared_model) or len(shared_visual) != len(shared_model):
+                return
+
+            def owners(rows: list[tuple[str, list[str]]], kind: str) -> dict[str, tuple[str, str]]:
+                return {layer_id: (kind, row_id) for row_id, layer_ids in rows for layer_id in layer_ids}
+
+            model_owner = owners(model_pages, "page")
+            model_owner.update(owners(model_shared, "shared"))
+            visual_owner = owners(visual_pages, "page")
+            visual_owner.update(owners(visual_shared, "shared"))
+            if set(model_owner) != set(visual_owner):
+                return
+            moved = [layer_id for layer_id, owner in visual_owner.items() if model_owner.get(layer_id) != owner]
+            page_layers = {row_id: layer_ids for row_id, layer_ids in model_pages}
+            shared_layers = {row_id: layer_ids for row_id, layer_ids in model_shared}
+            page_layer_changes = [
+                (row_id, layer_ids)
+                for row_id, layer_ids in visual_pages
+                if layer_ids != page_layers[row_id]
+            ]
+            shared_layer_changes = [
+                (row_id, layer_ids)
+                for row_id, layer_ids in visual_shared
+                if layer_ids != shared_layers[row_id]
+            ]
+            pages_reordered = page_visual != page_model
+            shared_reordered = shared_visual != shared_model
+            if not moved:
+                if pages_reordered and not shared_reordered and not page_layer_changes and not shared_layer_changes:
+                    if len(self._drag_groups) > 1 and self._drag_current is not None:
+                        ordered = place_group_block(page_model, page_visual, self._drag_groups, self._drag_current)
+                        if ordered is None:
+                            return
+                        self._selected_groups = list(self._drag_groups)
+                        self.session.reorder_groups(ordered)
                         return
-                    self._selected_groups = list(self._drag_groups)
-                    self.session.reorder_groups(ordered)
+                    self.session.reorder_groups(page_visual)
                     return
-                self.session.reorder_groups(visual_ids)
-                return
-            if not moved and visual_ids == model_ids:
-                changes = [
-                    (group_id, layer_ids)
-                    for group_id, layer_ids in visual
-                    if layer_ids != model_layers[group_id]
-                ]
-                if len(changes) != 1:
+                if shared_reordered and not pages_reordered and not page_layer_changes and not shared_layer_changes:
+                    if len(self._drag_shared) > 1 and self._drag_current is not None:
+                        ordered = place_group_block(
+                            shared_model, shared_visual, self._drag_shared, self._drag_current
+                        )
+                        if ordered is None:
+                            return
+                        self._selected_shared = list(self._drag_shared)
+                        self.session.reorder_shared_groups(ordered)
+                        return
+                    self.session.reorder_shared_groups(shared_visual)
                     return
-                group_id, visual_front = changes[0]
-                if document.active_group_id != group_id:
+                if (
+                    len(page_layer_changes) == 1
+                    and not shared_layer_changes
+                    and not pages_reordered
+                    and not shared_reordered
+                ):
+                    group_id, visual_front = page_layer_changes[0]
                     self.session.activate_group(group_id)
-                group = document.group_by_id(group_id)
-                if group is None:
+                    group = document.group_by_id(group_id)
+                    if group is None:
+                        return
+                    move = stack_move([layer.id for layer in group.layers], visual_front)
+                    if move is not None:
+                        old_index, new_index = move
+                        self.session.move_layer(old_index, new_index)
                     return
-                move = stack_move([layer.id for layer in group.layers], visual_front)
-                if move is not None:
-                    old_index, new_index = move
-                    self.session.move_layer(old_index, new_index)
+                if (
+                    len(shared_layer_changes) == 1
+                    and not page_layer_changes
+                    and not pages_reordered
+                    and not shared_reordered
+                ):
+                    group_id, visual_front = shared_layer_changes[0]
+                    group = document.shared_by_id(group_id)
+                    if group is None:
+                        return
+                    self.session.focus_shared(group_id)
+                    move = stack_move([layer.id for layer in group.layers], visual_front)
+                    if move is not None:
+                        old_index, new_index = move
+                        self.session.move_layer(old_index, new_index)
+                    return
                 return
-            if moved and visual_ids == model_ids:
-                sources = {membership[layer_id] for layer_id in moved if layer_id in membership}
-                dests = {group_id for group_id, layer_ids in visual for layer_id in layer_ids if layer_id in moved}
-                if len(sources) != 1 or len(dests) != 1:
-                    return
-                source_id = next(iter(sources))
-                dest_id = next(iter(dests))
-                source = document.group_by_id(source_id)
-                if source is None:
-                    return
-                leaving = layers_leaving(source.layers, moved)
-                leaving_ids = {layer.id for layer in leaving}
-                # A lone mask is not in the leaving set. Reject it so the mask
-                # cannot be separated from the picture it filters.
-                if not leaving or not set(moved) <= leaving_ids:
-                    return
-                dest_visual = next(layer_ids for group_id, layer_ids in visual if group_id == dest_id)
-                self.session.move_layers_to_group(moved, dest_id, _drop_index(dest_visual, set(moved)))
+            if pages_reordered or shared_reordered or len(page_layer_changes) + len(shared_layer_changes) == 0:
+                return
+            sources = {model_owner[layer_id] for layer_id in moved}
+            dests = {visual_owner[layer_id] for layer_id in moved}
+            if len(sources) != 1 or len(dests) != 1:
+                return
+            source_kind, source_id = next(iter(sources))
+            dest_kind, dest_id = next(iter(dests))
+            if (source_kind, source_id) == (dest_kind, dest_id):
+                return
+            if source_kind == "page":
+                source_bucket = document.group_by_id(source_id)
+            else:
+                source_bucket = document.shared_by_id(source_id)
+            if source_bucket is None:
+                return
+            source_layers = source_bucket.layers
+            leaving = layers_leaving(source_layers, moved)
+            leaving_ids = {layer.id for layer in leaving}
+            if not leaving or not set(moved) <= leaving_ids:
+                return
+            dest_rows = visual_pages if dest_kind == "page" else visual_shared
+            dest_visual = next(layer_ids for row_id, layer_ids in dest_rows if row_id == dest_id)
+            index = _drop_index(dest_visual, set(moved))
+            if source_kind == "page" and dest_kind == "page":
+                self.session.move_layers_to_group(moved, dest_id, index)
+                return
+            self.session.transfer_layers(moved, source_kind, source_id, dest_kind, dest_id, index)
         finally:
             self._drag_groups = []
+            self._drag_shared = []
             self._drag_current = None
             self._reordering = False
             # Rebuild from the document so a rejected drop snaps back, and
@@ -780,19 +965,62 @@ class LayerPanel(QWidget):
             self.refresh()
 
     def _delete_selection(self) -> None:
-        """Delete the highlighted pages, or the active layer when layers are highlighted."""
-        if self._selected_groups:
+        """Delete the highlighted pages or groups, or the active layer."""
+        if self._selected_groups and not self._selected_shared:
             self.session.delete_groups(self._selected_groups)
+            return
+        if self._selected_shared and not self._selected_groups:
+            self.session.delete_shared_groups(self._selected_shared)
+            return
+        if self._selected_groups and self._selected_shared:
+            current = self.list.currentItem()
+            if current is not None and current.data(0, _ITEM_KIND) == "shared":
+                self.session.delete_shared_groups(self._selected_shared)
+            else:
+                self.session.delete_groups(self._selected_groups)
             return
         self.session.delete_active()
 
+    def _add_shared_group(self) -> None:
+        """Add a group, tag the page on screen, and leave that group selected."""
+        before = {group.id for group in self.session.document.shared_groups}
+        self.session.add_shared_group()
+        added = [group.id for group in self.session.document.shared_groups if group.id not in before]
+        if not added:
+            return
+        self._selected_groups = []
+        self._selected_shared = added[:1]
+        self._tag_group_id = added[0]
+        self.refresh()
+
+    def tag_selection(self) -> None:
+        """Tag the selected pages with the selected group, or remove that tag."""
+        shared_id = None
+        if self._selected_shared:
+            shared_id = self._selected_shared[-1]
+        elif self._tag_group_id:
+            shared_id = self._tag_group_id
+        elif self.session._shared_id:
+            shared_id = self.session._shared_id
+        if not isinstance(shared_id, str) or self.session.document.shared_by_id(shared_id) is None:
+            self.session.show_message("Select a group, then tag the pages.")
+            return
+        page_ids = list(self._selected_groups)
+        if not page_ids and self.session.document.groups:
+            page_ids = [self.session.document.active_group_id]
+        self._tag_group_id = shared_id
+        self.session.toggle_page_tags(shared_id, page_ids)
+
     def rename_selection(self) -> None:
-        """Edit the highlighted group, or the active layer when a layer is highlighted.
+        """Edit the highlighted page or group, or the active layer.
 
         Empty text keeps the old name. Cancel leaves the name alone. Undo
         restores either change.
         """
         if not self.session.require_page():
+            return
+        if self._selected_shared and not self._selected_groups:
+            self._rename_shared(self._selected_shared_id())
             return
         if self._selected_groups:
             self._rename_group(self._selected_group_id())
@@ -815,10 +1043,31 @@ class LayerPanel(QWidget):
         group = self.session.document.group_by_id(group_id)
         if group is None:
             return
-        name = self._prompt_name("Rename group", group.name)
+        name = self._prompt_name("Rename page", group.name)
         if name is None:
             return
         self.session.rename_group(group.id, name)
+
+    def _selected_shared_id(self) -> str | None:
+        current = self.list.currentItem()
+        if current is not None and current.data(0, _ITEM_KIND) == "shared":
+            group_id = current.data(0, _ITEM_ID)
+            if isinstance(group_id, str) and group_id in self._selected_shared:
+                return group_id
+        if self._selected_shared:
+            return self._selected_shared[-1]
+        return None
+
+    def _rename_shared(self, group_id: str | None) -> None:
+        if not isinstance(group_id, str):
+            return
+        group = self.session.document.shared_by_id(group_id)
+        if group is None:
+            return
+        name = self._prompt_name("Rename group", group.name)
+        if name is None:
+            return
+        self.session.rename_shared_group(group.id, name)
 
     def _rename_active_layer(self) -> None:
         layer = self.session.active_layer()
@@ -836,9 +1085,14 @@ class LayerPanel(QWidget):
         return name
 
     def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
-        if item.data(0, _ITEM_KIND) == "group":
+        kind = item.data(0, _ITEM_KIND)
+        if kind == "group":
             group_id = item.data(0, _ITEM_ID)
             self._rename_group(group_id if isinstance(group_id, str) else None)
+            return
+        if kind == "shared":
+            group_id = item.data(0, _ITEM_ID)
+            self._rename_shared(group_id if isinstance(group_id, str) else None)
             return
         self._rename_active_layer()
 
@@ -850,11 +1104,29 @@ class LayerPanel(QWidget):
             # The active layer always stays selected. Rebuild from the session
             # so a toggle of the last row does not leave the list empty.
             self._selected_groups = []
+            self._selected_shared = []
             self.refresh()
             return
         current = self.list.currentItem()
         if current is None or not current.isSelected():
             current = items[-1]
+        if all(item.data(0, _ITEM_KIND) == "shared" for item in items):
+            self._selected_groups = []
+            self._selected_shared = [
+                group_id
+                for index in range(self.list.topLevelItemCount())
+                if (item := self.list.topLevelItem(index)) is not None
+                and item.data(0, _ITEM_KIND) == "shared"
+                and item.isSelected()
+                and isinstance(group_id := item.data(0, _ITEM_ID), str)
+            ]
+            group_id = current.data(0, _ITEM_ID)
+            if isinstance(group_id, str):
+                self._tag_group_id = group_id
+                self.session.focus_shared(group_id)
+                self.session.preview()
+            self.refresh()
+            return
         if all(item.data(0, _ITEM_KIND) == "group" for item in items):
             # The click is on page rows, not layers.
             # 1. Remember those pages, in list order, so Delete removes them
@@ -863,10 +1135,12 @@ class LayerPanel(QWidget):
             #    The layer that page was using stays the paint target.
             # 3. Keep the page rows highlighted. An open page used to hand the
             #    highlight to its layer, which made Delete remove that layer.
+            self._selected_shared = []
             self._selected_groups = [
                 group_id
                 for index in range(self.list.topLevelItemCount())
                 if (item := self.list.topLevelItem(index)) is not None
+                and item.data(0, _ITEM_KIND) == "group"
                 and item.isSelected()
                 and isinstance(group_id := item.data(0, _ITEM_ID), str)
             ]
@@ -877,10 +1151,12 @@ class LayerPanel(QWidget):
                 self.refresh()
             return
         self._selected_groups = []
+        self._selected_shared = []
         parent = current.parent()
         if parent is None:
             return
         group_id = parent.data(0, _ITEM_ID)
+        parent_kind = parent.data(0, _ITEM_KIND)
         if not isinstance(group_id, str):
             return
         layer_ids = []
@@ -893,6 +1169,12 @@ class LayerPanel(QWidget):
         active_id = current.data(0, _ITEM_ID)
         if not isinstance(active_id, str):
             active_id = None
+        if parent_kind == "shared":
+            self._tag_group_id = group_id
+            self.session.focus_shared(group_id, layer_ids=layer_ids, active_id=active_id)
+            self._sync_controls()
+            self.session.preview()
+            return
         if group_id != self.session.document.active_group_id:
             self.session.activate_group(group_id, layer_ids=layer_ids, active_id=active_id)
             return
@@ -909,8 +1191,10 @@ class LayerPanel(QWidget):
         if not isinstance(layer_id, str):
             return
         layer = None
-        for group in self.session.document.groups:
-            for candidate in group.layers:
+        stacks = [group.layers for group in self.session.document.groups]
+        stacks.extend(group.layers for group in self.session.document.shared_groups)
+        for layers in stacks:
+            for candidate in layers:
                 if candidate.id == layer_id:
                     layer = candidate
                     break
