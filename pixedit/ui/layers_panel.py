@@ -6,16 +6,19 @@ through the session so they stay one undo step.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QPushButton,
     QSlider,
+    QStyle,
+    QStyleOptionViewItem,
     QStyledItemDelegate,
     QTreeWidget,
     QTreeWidgetItem,
@@ -68,12 +71,115 @@ def _text_mark_pixmap(pixels: int) -> QPixmap:
     return pixmap
 
 
+# Name stays near-white. Captions use the status-bar gray, lighter on a selection.
+_NAME_COLOR = QColor("#f4fbff")
+_CAPTION_COLOR = QColor("#9aabba")
+_CAPTION_SELECTED = QColor("#d5e4ee")
+
+_ITEM_ID = Qt.ItemDataRole.UserRole
+_ITEM_KIND = Qt.ItemDataRole.UserRole + 1
+_ITEM_NAME = Qt.ItemDataRole.UserRole + 2
+_ITEM_META = Qt.ItemDataRole.UserRole + 3
+
+
+def _name_font(base: QFont) -> QFont:
+    """Semibold for a name. The open page is already bold, and stays bold."""
+    font = QFont(base)
+    if not font.bold():
+        font.setWeight(QFont.Weight.DemiBold)
+    return font
+
+
+def _caption_font(base: QFont) -> QFont:
+    font = QFont(base)
+    font.setBold(False)
+    font.setWeight(QFont.Weight.Normal)
+    return font
+
+
+def _draw_fitted(painter: QPainter, rect: QRect, text: str, font: QFont, color: QColor) -> None:
+    if not text or rect.width() <= 0 or rect.height() <= 0:
+        return
+    painter.setFont(font)
+    painter.setPen(color)
+    metrics = QFontMetrics(font)
+    # elidedText can drop the last glyph when the width equals the advance.
+    if metrics.horizontalAdvance(text) <= rect.width():
+        shown = text
+    else:
+        shown = metrics.elidedText(text, Qt.TextElideMode.ElideRight, rect.width())
+    painter.drawText(rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, shown)
+
+
+def _paint_inline(
+    painter: QPainter,
+    rect: QRect,
+    name: str,
+    meta: str,
+    name_font: QFont,
+    meta_font: QFont,
+    name_color: QColor,
+    meta_color: QColor,
+) -> None:
+    """Page row: the name, then the size. A narrow column ellipsizes the name."""
+    if not meta:
+        _draw_fitted(painter, rect, name, name_font, name_color)
+        return
+    gap = QFontMetrics(name_font).horizontalAdvance("    ")
+    meta_width = QFontMetrics(meta_font).horizontalAdvance(meta)
+    # Keep the size whole. The name takes what is left and is the part that ellipsizes.
+    room = rect.width() - meta_width - gap
+    if room <= 0:
+        _draw_fitted(painter, rect, meta, meta_font, meta_color)
+        return
+    name_width = min(QFontMetrics(name_font).horizontalAdvance(name), room)
+    _draw_fitted(
+        painter,
+        QRect(rect.left(), rect.top(), max(1, name_width), rect.height()),
+        name,
+        name_font,
+        name_color,
+    )
+    meta_left = rect.left() + name_width + gap
+    # A couple of spare pixels so the last glyph of the size is not clipped.
+    meta_span = min(meta_width + 2, rect.left() + rect.width() - meta_left)
+    _draw_fitted(painter, QRect(meta_left, rect.top(), meta_span, rect.height()), meta, meta_font, meta_color)
+
+
+def _paint_stacked(
+    painter: QPainter,
+    rect: QRect,
+    name: str,
+    meta: str,
+    name_font: QFont,
+    meta_font: QFont,
+    name_color: QColor,
+    meta_color: QColor,
+) -> None:
+    """Layer row: the name, then the caption under it."""
+    name_height = QFontMetrics(name_font).height()
+    meta_height = QFontMetrics(meta_font).height() if meta else 0
+    top = rect.top() + max(0, (rect.height() - name_height - meta_height) // 2)
+    _draw_fitted(painter, QRect(rect.left(), top, rect.width(), name_height), name, name_font, name_color)
+    if meta:
+        _draw_fitted(
+            painter,
+            QRect(rect.left(), top + name_height, rect.width(), meta_height),
+            meta,
+            meta_font,
+            meta_color,
+        )
+
+
 class LayerRowDelegate(QStyledItemDelegate):
     """Rows stay as wide as the list, so a long name or caption ellipsizes.
 
     The default item width is the full text, which opens a sideways scrollbar
     in this narrow column. Matching the viewport width lets ElideRight cut the
     line that does not fit.
+
+    The name and the caption are painted apart: the name is bright and
+    semibold, and the caption is the muted gray used in the status bar.
     """
 
     def sizeHint(self, option, index):
@@ -85,9 +191,38 @@ class LayerRowDelegate(QStyledItemDelegate):
                 hint.setWidth(width)
         return hint
 
-
-_ITEM_ID = Qt.ItemDataRole.UserRole
-_ITEM_KIND = Qt.ItemDataRole.UserRole + 1
+    def paint(self, painter: QPainter, option, index) -> None:
+        # The style draws the checkbox, the icon, and the highlight.
+        # 1. Clear the display string so that chrome is not also drawn in one color.
+        # 2. Paint the name and the caption in the text rectangle.
+        # A selected row keeps the bright name and lightens the caption.
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasDisplay
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        name = index.data(_ITEM_NAME)
+        meta = index.data(_ITEM_META)
+        if not isinstance(name, str):
+            name = ""
+        if not isinstance(meta, str):
+            meta = ""
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        name_font = _name_font(opt.font)
+        meta_font = _caption_font(opt.font)
+        meta_color = _CAPTION_SELECTED if selected else _CAPTION_COLOR
+        painter.save()
+        painter.setClipRect(option.rect)
+        if index.data(_ITEM_KIND) == "layer":
+            _paint_stacked(painter, rect, name, meta, name_font, meta_font, _NAME_COLOR, meta_color)
+        else:
+            _paint_inline(painter, rect, name, meta, name_font, meta_font, _NAME_COLOR, meta_color)
+        painter.restore()
 
 
 def place_group_block(
@@ -362,9 +497,12 @@ class LayerPanel(QWidget):
         # Pages run top to bottom in export order. Inside a page the front
         # layer is the first row, matching the old flat list.
         for group in document.groups:
-            header = QTreeWidgetItem([self._group_label(group)])
+            group_name, group_meta = self._group_label(group)
+            header = QTreeWidgetItem([f"{group_name}    {group_meta}"])
             header.setData(0, _ITEM_ID, group.id)
             header.setData(0, _ITEM_KIND, "group")
+            header.setData(0, _ITEM_NAME, group_name)
+            header.setData(0, _ITEM_META, group_meta)
             header.setFlags(
                 Qt.ItemFlag.ItemIsSelectable
                 | Qt.ItemFlag.ItemIsEnabled
@@ -378,9 +516,12 @@ class LayerPanel(QWidget):
                 header.setBackground(0, QBrush(QColor("#1c3a4a")))
             self.list.addTopLevelItem(header)
             for layer in reversed(group.layers):
-                item = QTreeWidgetItem([self._label(layer, group.layers)])
+                layer_name, detail = self._label(layer, group.layers)
+                item = QTreeWidgetItem([f"{layer_name}\n{detail}"])
                 item.setData(0, _ITEM_ID, layer.id)
                 item.setData(0, _ITEM_KIND, "layer")
+                item.setData(0, _ITEM_NAME, layer_name)
+                item.setData(0, _ITEM_META, detail)
                 item.setFlags(
                     Qt.ItemFlag.ItemIsUserCheckable
                     | Qt.ItemFlag.ItemIsSelectable
@@ -431,12 +572,13 @@ class LayerPanel(QWidget):
         self._sync_controls()
         self._building = False
 
-    def _group_label(self, group) -> str:
+    def _group_label(self, group) -> tuple[str, str]:
+        """The page name, and its pixel size, kept apart so they can paint differently."""
         name = group.name.replace("\r", " ").replace("\n", " ").strip()
-        return f"{name}    {group.width} × {group.height}"
+        return name, f"{group.width} × {group.height}"
 
-    def _label(self, layer, layers) -> str:
-        """Name on the first line. Opacity, and the text head or the kind, on the second.
+    def _label(self, layer, layers) -> tuple[str, str]:
+        """The layer name, and the caption under it.
 
         A text layer quotes the opening words instead of the word "text".
         The icon already says that the layer is text. A mask is indented and
@@ -455,7 +597,7 @@ class LayerPanel(QWidget):
         name = layer.name.replace("\r", " ").replace("\n", " ").strip()
         if layer.kind == "redaction":
             name = f"  {name}"
-        return f"{name}\n{detail}"
+        return name, detail
 
     def _thumb_icon(self, layer) -> QIcon:
         """Pixel preview, or the text-tool mark on the same checker square.

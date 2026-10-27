@@ -671,7 +671,7 @@ class MainWindow(QMainWindow):
     def _on_session(self, kind: str) -> None:
         if kind == "overlay":
             # The rubber band moved and the photo did not. Rebuilding the
-            # composite here would stall the cursor poll that is collecting points.
+            # composite here would stall the stroke that is still collecting moves.
             self.canvas.update()
             return
         bounds = self.session.preview_bounds if kind == "preview" else None

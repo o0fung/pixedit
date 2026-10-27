@@ -24,6 +24,11 @@ CHECKER_LIGHT = (0x2A, 0x30, 0x38, 255)
 CHECKER_DARK = (0x1B, 0x20, 0x26, 255)
 # Accent used by the sliders and the text-tool icon.
 MASK_TINT = (0x3E, 0xC6, 0xFF)
+# Light rim around ink that disappears on the dark checker. Not a recolor of the ink.
+KEYLINE = (0xD5, 0xDE, 0xE6, 255)
+# About 20% opaque. A fainter dab stays as it was painted.
+_INK_ALPHA = 51
+_CONTRAST_MIN = 3.0
 
 
 def text_head(text: str, limit: int = TEXT_HEAD_LIMIT) -> str:
@@ -63,6 +68,8 @@ def layer_thumb(layer: Layer, size: int = THUMB_SIZE) -> Image.Image:
        fully resampled on every list refresh.
     5. A mask is tinted cyan from its coverage. A raster keeps its own alpha.
        Opacity and blend are left out; the row already shows the percent.
+    6. Dark raster ink that sinks into the checker gets a one-pixel light rim.
+       The ink color itself stays. Masks skip this; the cyan accent already shows.
     """
     size = max(1, int(size))
     canvas = _checker(size)
@@ -138,6 +145,7 @@ def _composite(canvas: np.ndarray, fitted: Image.Image) -> Image.Image:
     patch = out[top : top + src.shape[0], left : left + src.shape[1], :3].astype(np.float32)
     mixed = src[..., :3] * alpha + patch * (1.0 - alpha)
     out[top : top + src.shape[0], left : left + src.shape[1], :3] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
+    _paint_keyline(out, sprite, top, left)
     return Image.fromarray(out, "RGBA")
 
 
@@ -153,3 +161,82 @@ def _tint(canvas: np.ndarray, fitted: Image.Image) -> Image.Image:
         np.uint8
     )
     return Image.fromarray(out, "RGBA")
+
+
+def _srgb_luminance(rgb: tuple[int, int, int]) -> float:
+    """Relative luminance of one sRGB color, in 0..1."""
+
+    def channel(value: int) -> float:
+        s = value / 255.0
+        if s <= 0.04045:
+            return s / 12.92
+        return ((s + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (channel(c) for c in rgb)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+_DARK_LUM = _srgb_luminance(CHECKER_DARK[:3])
+
+
+def _luminance(rgb: np.ndarray) -> np.ndarray:
+    s = rgb.astype(np.float32) * (1.0 / 255.0)
+    linear = np.where(s <= 0.04045, s * (1.0 / 12.92), ((s + 0.055) * (1.0 / 1.055)) ** 2.4)
+    return 0.2126 * linear[..., 0] + 0.7152 * linear[..., 1] + 0.0722 * linear[..., 2]
+
+
+def _below_contrast(rgb: np.ndarray, background: float) -> np.ndarray:
+    """True where ``rgb`` is under ``_CONTRAST_MIN`` against ``background`` luminance.
+
+    Contrast is ``(lighter + 0.05) / (darker + 0.05)`` on relative luminance.
+    """
+    lum = _luminance(rgb)
+    lighter = np.maximum(lum, background)
+    darker = np.minimum(lum, background)
+    return (lighter + 0.05) / (darker + 0.05) < _CONTRAST_MIN
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    """One-pixel 8-neighborhood. The pad stops the rim wrapping to the other edge."""
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    height, width = mask.shape
+    near = np.zeros_like(mask)
+    for dy in range(3):
+        for dx in range(3):
+            near |= padded[dy : dy + height, dx : dx + width]
+    return near
+
+
+def _paint_keyline(canvas: np.ndarray, sprite: np.ndarray, top: int, left: int) -> None:
+    """Light rim around raster ink that disappears on the dark checker.
+
+    The stroke color stays. Flow:
+    1. Keep pixels that are about 20% opaque and under 3:1 contrast against
+       the darker checker square.
+    2. Paint the rim on the checker just outside that ink, so a black stroke
+       stays black and the edge is what shows.
+    3. If that ink is the icon border, paint the border pixel itself. A solid
+       dark layer would otherwise match the panel behind the icon.
+    """
+    alpha = sprite[..., 3]
+    ink = alpha >= _INK_ALPHA
+    if not np.any(ink):
+        return
+    fails_sprite = ink & _below_contrast(sprite[..., :3], _DARK_LUM)
+    if not np.any(fails_sprite):
+        return
+    height, width = canvas.shape[:2]
+    sprite_h, sprite_w = fails_sprite.shape
+    fails = np.zeros((height, width), dtype=bool)
+    covered = np.zeros((height, width), dtype=bool)
+    fails[top : top + sprite_h, left : left + sprite_w] = fails_sprite
+    covered[top : top + sprite_h, left : left + sprite_w] = ink
+    tone = np.array(KEYLINE[:3], np.uint8)
+    # Outside the ink only. A white pixel beside a black one keeps its color.
+    canvas[_dilate(fails) & ~covered, :3] = tone
+    edge = np.zeros((height, width), dtype=bool)
+    edge[0, :] = True
+    edge[-1, :] = True
+    edge[:, 0] = True
+    edge[:, -1] = True
+    canvas[fails & edge, :3] = tone

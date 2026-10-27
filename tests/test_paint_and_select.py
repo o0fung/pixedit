@@ -350,7 +350,7 @@ def test_rect_selection_shift_adds():
 
 
 def test_freehand_select_keeps_sampled_bends():
-    """Points from the cursor poll fill a jog that the straight chord misses."""
+    """Stored samples fill a jog that the straight chord misses."""
     from pixedit.geom import mask_freehand
 
     session = Session(new_document(80, 80, "white"))
@@ -378,7 +378,7 @@ def test_freehand_select_keeps_sampled_bends():
     tool.pointer_down(session, PointerEvent(*start))
     assert tool.stroke_live()
     tool.pointer_move(session, PointerEvent(*bend))
-    # A sample 0.02px from the bend is the same point. The poll drops it.
+    # A sample 0.02px from the bend is the same point. The batch drops it.
     # The new point only redraws the rubber band, so the photo is not rebuilt.
     tool.extend_points(session, [(bend[0] + 0.02, bend[1]), end])
     assert tool._points == [start, bend, end]

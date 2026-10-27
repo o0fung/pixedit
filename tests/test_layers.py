@@ -184,12 +184,52 @@ def test_layer_thumb_fits_ink_masks_and_empty():
     assert int(np.asarray(feathered)[..., 3].min()) == 255
 
 
+def test_layer_thumb_outlines_dark_ink_and_leaves_light_ink():
+    import numpy as np
+
+    from pixedit.ui.thumbs import CHECKER_LIGHT, KEYLINE, layer_thumb
+
+    black = np.asarray(layer_thumb(raster_layer("Black", Image.new("RGBA", (16, 8), (0, 0, 0, 255))), 32))
+    # The bar is letterboxed. Its center stays black, and the pixel just
+    # outside it is the rim. The far corner is still the checker.
+    assert tuple(black[16, 16, :3]) == (0, 0, 0)
+    assert tuple(black[7, 16, :3]) == KEYLINE[:3]
+    assert tuple(black[0, 0, :3]) == CHECKER_LIGHT[:3]
+
+    slab = layer_thumb(raster_layer("Slab", Image.new("RGBA", (8, 8), (0, 0, 0, 255))), 32)
+    assert slab.getpixel((16, 16))[:3] == (0, 0, 0)
+    assert slab.getpixel((0, 0))[:3] == KEYLINE[:3]
+
+    white = np.asarray(layer_thumb(raster_layer("White", Image.new("RGBA", (20, 10), (255, 255, 255, 255))), 32))
+    assert not np.any(np.all(white[:, :, :3] == np.array(KEYLINE[:3]), axis=-1))
+    assert tuple(white[0, 0, :3]) == CHECKER_LIGHT[:3]
+    assert tuple(white[16, 16, :3]) == (255, 255, 255)
+
+    empty = layer_thumb(raster_layer("Empty", Image.new("RGBA", (1, 1), (0, 0, 0, 0))), 32)
+    assert empty.getpixel((0, 0)) == CHECKER_LIGHT
+
+    red = layer_thumb(raster_layer("Red", Image.new("RGBA", (8, 8), (255, 0, 0, 255))), 32)
+    assert red.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert red.getpixel((16, 16))[:3] == (255, 0, 0)
+
+    blue = layer_thumb(raster_layer("Blue", Image.new("RGBA", (4, 4), (0, 80, 200, 255))), 32)
+    assert blue.getpixel((16, 16))[:3] == (0, 80, 200)
+    assert blue.getpixel((0, 0))[:3] == KEYLINE[:3]
+
+    # A white pixel beside black keeps its color. The rim does not eat it.
+    mixed = Image.new("RGBA", (8, 8), (0, 0, 0, 255))
+    mixed.paste((255, 255, 255, 255), (4, 0, 8, 8))
+    side_by_side = np.asarray(layer_thumb(raster_layer("Mixed", mixed), 32))
+    assert tuple(side_by_side[16, 8, :3]) == (0, 0, 0)
+    assert tuple(side_by_side[16, 24, :3]) == (255, 255, 255)
+
+
 def test_layer_rows_show_thumbs_and_text_heads():
     from PyQt6.QtWidgets import QApplication
 
     from pixedit.factory import redaction_layer, text_layer
     from pixedit.model import TextInfo
-    from pixedit.ui.layers_panel import LayerPanel
+    from pixedit.ui.layers_panel import _ITEM_META, _ITEM_NAME, LayerPanel
     from pixedit.ui.thumbs import MASK_TINT
 
     app = QApplication.instance() or QApplication([])
@@ -225,12 +265,117 @@ def test_layer_rows_show_thumbs_and_text_heads():
 
     assert blur.text(0).splitlines()[0] == "  Blur"
     assert "on Caption" in blur.text(0).splitlines()[1]
+    assert group.data(0, _ITEM_NAME) == "Group 1"
+    assert group.data(0, _ITEM_META) == "16 × 16"
+    assert photo.data(0, _ITEM_NAME) == "Photo"
+    assert photo.data(0, _ITEM_META) == "40%  normal"
+    assert blur.data(0, _ITEM_NAME) == "  Blur"
+    assert blur.data(0, _ITEM_META) == blur.text(0).splitlines()[1]
     assert not blur.icon(0).isNull()
     assert _icon_has_color(blur.icon(0), MASK_TINT)
     assert panel.list.visualItemRect(caption).height() >= panel.list.iconSize().height()
     # A long caption stays inside the column instead of opening a sideways scrollbar.
     assert panel.list.horizontalScrollBar().maximum() == 0
     panel.close()
+
+
+def test_row_paint_keeps_the_name_brighter_than_the_caption():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import _CAPTION_COLOR, _CAPTION_SELECTED, _NAME_COLOR, LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(16, 16, "white"))
+    session.document.layers[0].name = "Photo"
+    session.document.layers[0].opacity = 0.4
+    panel = LayerPanel(session)
+    panel.resize(360, 240)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+    group = panel.list.topLevelItem(0)
+    photo = group.child(0)
+
+    plain = _row_pixels(panel, photo, selected=False)
+    name_y, caption_y = _color_bands(plain, _NAME_COLOR, _CAPTION_COLOR)
+    assert name_y < caption_y
+
+    chosen = _row_pixels(panel, photo, selected=True)
+    _name_y, selected_y = _color_bands(chosen, _NAME_COLOR, _CAPTION_SELECTED)
+    assert _name_y < selected_y
+
+    page = _row_pixels(panel, group, selected=False)
+    name_x, size_x = _color_columns(page, _NAME_COLOR, _CAPTION_COLOR)
+    assert name_x < size_x
+    panel.close()
+
+
+def _row_pixels(panel, item, selected: bool):
+    """RGB pixels of one row, cropped to the text the delegate paints."""
+    import numpy as np
+    from PyQt6.QtCore import QRect
+    from PyQt6.QtGui import QColor, QImage, QPainter
+    from PyQt6.QtWidgets import QStyle, QStyleOptionViewItem
+
+    image = QImage(420, 72, QImage.Format.Format_RGB32)
+    image.fill(QColor("#1a1f26"))
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, image.width(), image.height())
+    option.font = panel.font()
+    option.font.setPointSize(15)
+    option.widget = panel.list
+    option.decorationSize = panel.list.iconSize()
+    option.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Active
+    if selected:
+        option.state |= QStyle.StateFlag.State_Selected
+    index = panel.list.indexFromItem(item, 0)
+    painter = QPainter(image)
+    panel.list.itemDelegate().paint(painter, option, index)
+    painter.end()
+    probe = QStyleOptionViewItem(option)
+    panel.list.itemDelegate().initStyleOption(probe, index)
+    text = panel.list.style().subElementRect(QStyle.SubElement.SE_ItemViewItemText, probe, panel.list)
+    view = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    pointer = view.bits()
+    pointer.setsize(view.sizeInBytes())
+    row_stride = view.bytesPerLine() // 4
+    pixels = np.frombuffer(pointer, np.uint8).reshape((view.height(), row_stride, 4))[:, : view.width(), :3]
+    box = text.intersected(QRect(0, 0, view.width(), view.height()))
+    return np.array(pixels[box.top() : box.bottom() + 1, box.left() : box.right() + 1], copy=True)
+
+
+def _nearest_mask(pixels, color, other, tolerance: int = 36):
+    """Pixels closer to ``color`` than to ``other``, and within ``tolerance``."""
+    import numpy as np
+
+    rgb = pixels.astype(np.int16)
+    wanted = np.array((color.red(), color.green(), color.blue()), np.int16)
+    rival = np.array((other.red(), other.green(), other.blue()), np.int16)
+    dist = np.max(np.abs(rgb - wanted), axis=-1)
+    rival_dist = np.max(np.abs(rgb - rival), axis=-1)
+    return (dist <= tolerance) & (dist < rival_dist)
+
+
+def _color_bands(pixels, name_color, caption_color) -> tuple[float, float]:
+    name = _nearest_mask(pixels, name_color, caption_color)
+    caption = _nearest_mask(pixels, caption_color, name_color)
+    assert name.any(), "name color missing"
+    assert caption.any(), "caption color missing"
+    return float(np_rows(name).mean()), float(np_rows(caption).mean())
+
+
+def _color_columns(pixels, name_color, caption_color) -> tuple[float, float]:
+    name = _nearest_mask(pixels, name_color, caption_color)
+    caption = _nearest_mask(pixels, caption_color, name_color)
+    assert name.any(), "name color missing"
+    assert caption.any(), "caption color missing"
+    return float(name.any(axis=0).nonzero()[0].mean()), float(caption.any(axis=0).nonzero()[0].mean())
+
+
+def np_rows(mask):
+    import numpy as np
+
+    return np.nonzero(mask)[0]
 
 
 def _icon_has_color(icon, rgb: tuple[int, int, int], tolerance: int = 8) -> bool:

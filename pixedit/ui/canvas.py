@@ -17,14 +17,22 @@ from pixedit.proxy import PREVIEW_MAX_EDGE
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
 
-# While a sampled tool's button is down, store the cursor this often.
-# Two stores are handed over together, so one redraw covers more than one coordinate.
+# How often a sampled stroke paints the moves stored since the last tick.
+# Mouse moves keep every coordinate. One redraw covers the whole batch.
 _STROKE_SAMPLE_MS = 8
-_STROKE_FLUSH_TICKS = 2
 # A shorter move is still a click. Past this, the zoom tool scrubs instead.
 _ZOOM_DRAG_THRESHOLD = 6.0
 # Vertical pixels that double the zoom, or halve it when dragging down.
 _ZOOM_DRAG_SPAN = 160.0
+# Longest edge of a close-zoom pan crop, in document pixels. Past this, one
+# window of travel still sweeps most of a large page, so the drag keeps the
+# low-resolution whole-page plate.
+PAN_CROP_MAX_EDGE = 4096
+# Extra screen pixels past one window of travel. A drag that ends on the
+# window edge stays inside the crop and does not rebuild it.
+_PAN_CROP_SLACK = 8
+# Checker cell, in screen pixels. The loop is aligned to this grid.
+_CHECKER = 12
 
 _CURSORS = {
     "cross": Qt.CursorShape.CrossCursor,
@@ -129,10 +137,13 @@ class CanvasView(QWidget):
         self._space = False
         self._panning = False
         self._pan_last = None
-        # Low-resolution plate shown while a large page is panned or scrub-zoomed.
+        # Plate shown while a large page is panned or scrub-zoomed.
         # None means this drag is sliding the sharp cache.
+        # _pan_proxy_box is the document rectangle of a close-zoom crop.
+        # None means the plate is the whole page, shrunk to PREVIEW_MAX_EDGE.
         self._pan_proxy: QPixmap | None = None
         self._pan_selection_proxy: QPixmap | None = None
+        self._pan_proxy_box: tuple[float, float, float, float] | None = None
         # Zoom-tool button. Scrub starts after the pointer moves, and the
         # sharp picture is built when the button comes up.
         self._zooming = False
@@ -140,6 +151,9 @@ class CanvasView(QWidget):
         self._zoom_anchor: tuple[float, float] | None = None
         self._zoom_origin = 1.0
         self._zoom_alt = False
+        # Space interrupted a zoom drag and the button is still down. The next
+        # move pans. Other tools keep their own drag.
+        self._space_pan_pending = False
         self._selection_id = None
         self._selection_pixmap: QPixmap | None = None
         self._edge_id = None
@@ -157,14 +171,15 @@ class CanvasView(QWidget):
         self.letterbox = False
         # A guide drag started in a ruler. None when the pointer is a tool.
         self._guide: dict | None = None
-        # Samples only append a coordinate. A second tick flushes the batch
-        # so the stroke is not redrawn on every sample. Single-shot, restarted
-        # at the end of the tick, so a slow redraw cannot queue a burst.
+        # Mouse moves append a coordinate. This timer paints the batch so the
+        # stroke is not redrawn on every sample. Single-shot and precise,
+        # restarted after the paint, so a slow dab cannot queue a burst and
+        # the interval is not coarsened.
         self._stroke_sampling = False
         self._stroke_tool_id = ""
         self._stroke_points: list[tuple[float, float]] = []
-        self._stroke_ticks = 0
         self._stroke_timer = QTimer(self)
+        self._stroke_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._stroke_timer.setSingleShot(True)
         self._stroke_timer.timeout.connect(self._on_stroke_sample)
         # Alt swaps the zoom glass between plus and minus. Key release passes
@@ -254,6 +269,16 @@ class CanvasView(QWidget):
         if not self.session.document.groups:
             return 0
         return 22 if self.session.option("rulers", True) else 0
+
+    def _viewport_rect(self) -> QRectF:
+        """Widget area under the rulers, where the page is drawn."""
+        ruler = float(self.ruler())
+        return QRectF(
+            ruler,
+            ruler,
+            max(0.0, float(self.width()) - ruler),
+            max(0.0, float(self.height()) - ruler),
+        )
 
     def refresh_tool_cursor(self) -> None:
         """Rebuild the pointer after a size, zoom, or tool-option change."""
@@ -823,30 +848,32 @@ class CanvasView(QWidget):
 
     def _paint_checker(self, painter: QPainter, target: QRectF) -> None:
         # Cells are 12px, larger than the leftover space on the right and bottom.
-        # Clip to the canvas or those squares paint into the margin.
+        # The page rectangle grows with zoom. Walk only the cells that meet the
+        # widget, still on the page-corner grid, so a close zoom does not loop
+        # over the off-screen part of the page.
         painter.save()
         painter.setClipRect(target, Qt.ClipOperation.IntersectClip)
-        painter.fillRect(target, QColor("#1b2026"))
-        size = 12
+        clip = self._viewport_rect()
+        span = checker_loop_rect(target, clip, _CHECKER)
+        if span is None:
+            painter.restore()
+            return
+        left, top, right, bottom = span
+        painter.fillRect(target.intersected(clip), QColor("#1b2026"))
+        size = _CHECKER
         c2 = QColor("#2a3038")
-        left = int(math.floor(target.left()))
-        top = int(math.floor(target.top()))
-        right = int(math.ceil(target.right()))
-        bottom = int(math.ceil(target.bottom()))
+        # Same phase as a full-page loop: truncate the corner, so the pattern
+        # scrolls with the photo instead of sticking to the widget.
         origin_x = int(target.left())
         origin_y = int(target.top())
         y = top
-        row = 0
         while y < bottom:
             x = left
-            col = 0
             while x < right:
                 if ((x - origin_x) // size + (y - origin_y) // size) % 2 == 0:
                     painter.fillRect(x, y, size, size, c2)
                 x += size
-                col += 1
             y += size
-            row += 1
         painter.restore()
 
     def _paint_selection(self, painter: QPainter, target: QRectF) -> None:
@@ -984,15 +1011,14 @@ class CanvasView(QWidget):
         pen = QPen(QColor("#8aa0b2"))
         painter.setPen(pen)
         step = _tick_step(self.zoom)
-        doc = self.session.document
-        # Horizontal ticks along the top, vertical ticks down the side.
-        # Visible range is whatever canvas pixels currently fall inside the view.
+        if step <= 0:
+            return
+        # Ticks are only the document range that can fall inside the ruler.
+        # A close zoom used to walk the whole page and skip the off-screen ones.
         view_left, view_top = self.widget_to_canvas(ruler, ruler)
         view_right, view_bottom = self.widget_to_canvas(self.width(), self.height())
-        start = int(math.floor(min(view_left, 0) / step) * step)
-        end = int(math.ceil(max(view_right, doc.width) / step) * step)
-        y_start = int(math.floor(min(view_top, 0) / step) * step)
-        y_end = int(math.ceil(max(view_bottom, doc.height) / step) * step)
+        start, end = ruler_tick_span(view_left, view_right, step)
+        y_start, y_end = ruler_tick_span(view_top, view_bottom, step)
         x = start
         while x <= end:
             sx = ruler + self.offset_x + x * self.zoom
@@ -1017,7 +1043,7 @@ class CanvasView(QWidget):
         self.zoom_at(event.position().x(), event.position().y(), 1.1 if delta > 0 else 1 / 1.1)
 
     def _wants_pan_proxy(self) -> bool:
-        """A page this large is worth sliding as a blurry stand-in."""
+        """A page this large is worth a stand-in while it is dragged."""
         doc = self.session.document
         if doc.width < 1 or doc.height < 1:
             return False
@@ -1042,7 +1068,7 @@ class CanvasView(QWidget):
         )
 
     def _using_pan_proxy(self) -> bool:
-        """Pan and zoom scrub share one whole-page plate."""
+        """A pan or zoom scrub is on screen with its stand-in."""
         proxy = self._pan_proxy
         active = self._panning or self._zoom_scrub
         return active and proxy is not None and not proxy.isNull()
@@ -1050,23 +1076,39 @@ class CanvasView(QWidget):
     def _clear_pan_proxy(self) -> None:
         self._pan_proxy = None
         self._pan_selection_proxy = None
+        self._pan_proxy_box = None
 
-    def _begin_pan_proxy(self) -> None:
-        """Flatten once at the start of a drag. Small pages keep the sharp plate."""
+    def _begin_pan_proxy(self, *, crop: bool = False) -> None:
+        """Build the drag plate once. Small pages keep the sharp cache.
+
+        ``crop`` is for a pan. A close zoom loads the reachable document
+        rectangle at full resolution. Zoom scrub leaves this false: the zoom
+        changes during that drag, so the rectangle is not known at press.
+        """
         if not self._wants_pan_proxy():
             return
-        self._install_pan_proxy()
+        self._install_pan_proxy(crop=crop)
 
-    def _install_pan_proxy(self) -> None:
-        """Replace the pan plate with a fresh low-resolution flatten of the page.
+    def _install_pan_proxy(self, *, crop: bool = False) -> None:
+        """Replace the pan plate.
 
-        A full-page cache is scaled, masks included, so the sharp pixmap stays
-        put. Anything else is box-filtered straight to the stand-in size. A
-        visible mask with no full plate yet is flattened once at full size,
-        then scaled, because blur and noise cannot be cropped from a downsample.
+        A close zoom crops the document rectangle one in-window drag can
+        reach, at one plate pixel per document pixel. The full-page cache is
+        copied when it is current. Otherwise that rectangle is flattened on
+        its own. A visible mask uses ``composite_region`` because a plain
+        view flatten skips blur and noise.
+
+        Zoom scrub, and a pan whose reachable rectangle is the whole page or
+        longer than ``PAN_CROP_MAX_EDGE``, keep the low-resolution whole-page
+        plate. A full-page cache is scaled for that plate. A visible mask
+        with no full plate yet is flattened once at full size, then scaled,
+        because blur and noise cannot be cropped from a downsample of the
+        whole page.
         """
         self._clear_pan_proxy()
         if not self._wants_pan_proxy():
+            return
+        if crop and self._install_pan_crop():
             return
         doc = self.session.document
         width, height = self._pan_proxy_size(doc.width, doc.height)
@@ -1092,6 +1134,94 @@ class CanvasView(QWidget):
             self._pan_proxy = pil_to_pixmap(image)
         self._install_pan_selection()
 
+    def _reachable_pan_box(self) -> tuple[float, float, float, float] | None:
+        """Document rectangle a drag that stays in the window can reveal.
+
+        Start from the rectangle on screen. Add one widget of pointer travel
+        on each side: the button is down, so the pointer can cross the window
+        once, and that is as far as the view can move. A few extra screen
+        pixels keep a drag that ends on the window edge inside the crop.
+        The result is clamped to the page.
+        """
+        visible = self._visible_document_box()
+        if visible is None or self.zoom <= 0:
+            return None
+        doc = self.session.document
+        pad_x = (float(self.width()) + _PAN_CROP_SLACK) / self.zoom
+        pad_y = (float(self.height()) + _PAN_CROP_SLACK) / self.zoom
+        x0, y0, x1, y1 = visible
+        return (
+            max(0.0, x0 - pad_x),
+            max(0.0, y0 - pad_y),
+            min(float(doc.width), x1 + pad_x),
+            min(float(doc.height), y1 + pad_y),
+        )
+
+    def _pan_crop_pixels(self) -> tuple[int, int, int, int] | None:
+        """Integer pixels of the reachable pan rectangle, or None for the whole page.
+
+        The plate is one document pixel per output pixel, so its long edge is
+        the crop's long edge. Floor and ceil keep every document pixel the
+        float rectangle touches. A crop of the entire page would be another
+        full-size picture; the low-resolution stand-in already covers that.
+        A crop longer than ``PAN_CROP_MAX_EDGE`` is the same kind of drag:
+        one window of travel still sweeps most of a large photo.
+        """
+        reached = self._reachable_pan_box()
+        if reached is None:
+            return None
+        doc = self.session.document
+        x0, y0, x1, y1 = reached
+        ix0 = max(0, int(math.floor(x0)))
+        iy0 = max(0, int(math.floor(y0)))
+        ix1 = min(doc.width, int(math.ceil(x1)))
+        iy1 = min(doc.height, int(math.ceil(y1)))
+        if ix1 <= ix0 or iy1 <= iy0:
+            return None
+        if ix0 == 0 and iy0 == 0 and ix1 == doc.width and iy1 == doc.height:
+            return None
+        if max(ix1 - ix0, iy1 - iy0) > PAN_CROP_MAX_EDGE:
+            return None
+        return ix0, iy0, ix1, iy1
+
+    def _install_pan_crop(self) -> bool:
+        """Load a 1:1 crop of the reachable page. False keeps the whole-page plate."""
+        pixels = self._pan_crop_pixels()
+        if pixels is None:
+            return False
+        ix0, iy0, ix1, iy1 = pixels
+        doc = self.session.document
+        box = (float(ix0), float(iy0), float(ix1), float(iy1))
+        plate = self._pixmap if self._full_plate_current() else None
+        if plate is not None and not plate.isNull():
+            pixmap = plate.copy(ix0, iy0, ix1 - ix0, iy1 - iy0)
+        elif shows_redaction(doc):
+            pixmap = pil_to_pixmap(composite_region(doc, pixels))
+        else:
+            pixmap = pil_to_pixmap(composite_view(doc, box, 1.0))
+        if pixmap.isNull() or pixmap.width() < 1 or pixmap.height() < 1:
+            return False
+        self._pan_proxy = pixmap
+        self._pan_proxy_box = box
+        self._install_pan_selection()
+        return True
+
+    def _extend_pan_crop(self) -> None:
+        """Rebuild the crop when the visible rectangle leaves it.
+
+        The plate from press covers one window of travel, so an ordinary
+        drag does not get here. The pointer can leave the widget while the
+        button stays down. That move loads one new crop around the new view.
+        A later move inside the new crop does not load again.
+        """
+        box = self._pan_proxy_box
+        if box is None:
+            return
+        visible = self._visible_document_box()
+        if visible is None or _contains_box(box, visible):
+            return
+        self._install_pan_proxy(crop=True)
+
     def _install_pan_selection(self) -> None:
         """Tint the selection at the stand-in's size, not the page's."""
         selection = self.session.document.selection
@@ -1100,9 +1230,14 @@ class CanvasView(QWidget):
             self._pan_selection_proxy = None
             self._sync_ants(selection)
             return
+        # A crop tints only the preloaded rectangle. The whole-page plate
+        # still tints the whole selection, scaled down with the page.
+        box = self._pan_proxy_box
+        if box is None:
+            box = (0.0, 0.0, float(selection.width), float(selection.height))
         tint = _view_selection_tint(
             selection,
-            (0.0, 0.0, float(selection.width), float(selection.height)),
+            box,
             proxy.width(),
             proxy.height(),
         )
@@ -1113,9 +1248,11 @@ class CanvasView(QWidget):
         """Rebuild the stand-in after the document changes. False if this drag has none."""
         if self._pan_proxy is None and not self._wants_pan_proxy():
             return False
+        # Install clears the box. Remember which plate this drag is using.
+        crop = self._pan_proxy_box is not None
         self._dirty = True
         self._selection_id = None
-        self._install_pan_proxy()
+        self._install_pan_proxy(crop=crop)
         if self._pan_proxy is None:
             return False
         self.update()
@@ -1140,30 +1277,101 @@ class CanvasView(QWidget):
             self._sync_selection_chrome()
         self.update()
 
+    def _pan_proxy_dest(self, full_target: QRectF) -> QRectF:
+        """Widget rectangle the pan plate covers.
+
+        A whole-page stand-in is the page. A close-zoom crop is only the
+        reachable document rectangle, so the draw does not target page times zoom.
+        """
+        box = self._pan_proxy_box
+        if box is None:
+            return full_target
+        x0, y0, x1, y1 = box
+        ruler = self.ruler()
+        return QRectF(
+            ruler + self.offset_x + x0 * self.zoom,
+            ruler + self.offset_y + y0 * self.zoom,
+            (x1 - x0) * self.zoom,
+            (y1 - y0) * self.zoom,
+        )
+
     def _paint_pan_proxy(self, painter: QPainter, target: QRectF) -> None:
         proxy = self._pan_proxy
         if proxy is None or proxy.isNull():
             return
-        # The plate is coarser than the screen. Smooth the stretch so the
-        # drag looks soft instead of blocky. Rulers are drawn after this.
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(target, proxy, QRectF(0, 0, proxy.width(), proxy.height()))
+        # The plate may cover the whole page. Draw only the part inside the
+        # window, mapped back into the plate, so a close zoom does not ask Qt
+        # to scale into a rectangle the size of the page times the zoom.
+        dest = self._pan_proxy_dest(target)
+        pair = plate_visible_source(dest, self._viewport_rect(), proxy.width(), proxy.height())
+        if pair is None:
+            return
+        visible, source = pair
+        # A 1:1 crop is the original pixels. Nearest-neighbor matches the
+        # resting view. The whole-page stand-in is coarser than the screen,
+        # so smooth that stretch. Rulers are drawn after this.
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform,
+            self._pan_proxy_box is None,
+        )
+        painter.drawPixmap(visible, proxy, source)
         selection = self._pan_selection_proxy
         if selection is not None and not selection.isNull():
-            painter.drawPixmap(
-                target,
-                selection,
-                QRectF(0, 0, selection.width(), selection.height()),
+            selected = plate_visible_source(
+                dest,
+                self._viewport_rect(),
+                selection.width(),
+                selection.height(),
             )
+            if selected is not None:
+                painter.drawPixmap(selected[0], selection, selected[1])
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
     def _begin_zoom(self, pos, *, alt: bool) -> None:
         """Remember where a zoom-tool press started. The step waits for release."""
+        # Space is the temporary hand. That hold does not start a zoom drag.
+        if self._space:
+            return
         self._zooming = True
         self._zoom_scrub = False
         self._zoom_anchor = (float(pos.x()), float(pos.y()))
         self._zoom_origin = self.zoom
         self._zoom_alt = alt
+
+    def _stop_zoom_for_hand(self) -> None:
+        """Space ends a zoom drag at the level it has already reached.
+
+        The drag is not a click, so the zoom does not step, and it is not
+        Escape, so the level is not put back. The stand-in is dropped. The
+        caller pans when a button is still down.
+        """
+        if not self._zooming:
+            return
+        self._zooming = False
+        self._zoom_scrub = False
+        self._zoom_anchor = None
+        self._space_pan_pending = True
+        self._end_pan_proxy()
+
+    def _begin_space_pan(self, buttons, pos=None) -> None:
+        """Pan for the rest of a button hold that Space took over.
+
+        Releasing Space does not clear this pan and does not hand the drag
+        back to the zoom tool. The button coming up ends it, including the
+        right button, so the next press can zoom again.
+        """
+        if self._panning or not self._has_page():
+            return
+        if not _pan_button_held(buttons):
+            return
+        if pos is None:
+            local = self.mapFromGlobal(QCursor.pos())
+            pos = QPointF(local)
+        self._panning = True
+        self._pan_last = pos
+        self._space_pan_pending = False
+        self._begin_pan_proxy(crop=True)
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def _move_zoom(self, pos) -> None:
         """Scrub zoom from the press point. The low-res plate covers the drag.
@@ -1213,13 +1421,15 @@ class CanvasView(QWidget):
             self.zoom_at(anchor[0], anchor[1], origin / self.zoom)
         self._end_pan_proxy()
 
-    # Panning a large page flattens once, down to PREVIEW_MAX_EDGE, and slides
-    # that whole-page plate until the button comes up. A zoom-tool drag uses
-    # the same plate: the view scales with the pointer, and release is the one
-    # sharp flatten. A full-page cache is scaled rather than flattened again,
-    # and release keeps it while the zoom is still at 100% or more. A view
-    # cache is dropped on release because the offset and zoom are part of its
-    # key. A document change during the drag rebuilds the low-res plate.
+    # Panning a large page builds one plate and slides it until the button
+    # comes up. Close zoom crops the rectangle one window of travel can reach,
+    # at full resolution. A wider drag, and a zoom-tool scrub, use one
+    # whole-page plate of PREVIEW_MAX_EDGE: scrub changes the zoom, so the
+    # document rectangle is not known at press. A full-page cache is copied
+    # or scaled rather than flattened again, and release keeps it while the
+    # zoom is still at 100% or more. A view cache is dropped on release
+    # because the offset and zoom are part of its key. A document change
+    # during the drag rebuilds the plate.
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         if not self._has_page():
@@ -1228,7 +1438,7 @@ class CanvasView(QWidget):
         if event.button() == Qt.MouseButton.MiddleButton or self._space or self._is_hand():
             self._panning = True
             self._pan_last = pos
-            self._begin_pan_proxy()
+            self._begin_pan_proxy(crop=True)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if event.button() == Qt.MouseButton.LeftButton and self._begin_guide(pos):
@@ -1251,24 +1461,32 @@ class CanvasView(QWidget):
         self._report_status(pos.x(), pos.y())
         # The key may have gone down while another widget had the keyboard.
         self.set_alt_held(bool(event.modifiers() & Qt.KeyboardModifier.AltModifier))
+        # Space took over a zoom drag. A button that is still down pans.
+        # A brush or other tool drag is left alone until the next press.
+        if self._space and self._space_pan_pending and not self._panning:
+            self._begin_space_pan(event.buttons(), pos)
         if self._panning and self._pan_last is not None:
-            # Slide the plate from press. Do not flatten again on this move.
+            # Slide the plate. An in-window drag stays inside the crop loaded
+            # at press. Leaving the window can walk off that crop; rebuild then.
             self.offset_x += pos.x() - self._pan_last.x()
             self.offset_y += pos.y() - self._pan_last.y()
             self._pan_last = pos
+            self._extend_pan_crop()
             self.update()
             return
-        if self._zooming and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._zooming and not self._space and event.buttons() & Qt.MouseButton.LeftButton:
             self._move_zoom(pos)
             return
         if self._guide is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self._move_guide(pos)
             return
         self._sync_hover_cursor(event)
-        # The stroke timer owns coordinates for tools that poll, such as the
-        # brush and freehand Select. A mouse-move during the drag only
-        # refreshes the status readout above.
+        # A sampled stroke (brush, eraser, freehand Select) stores this move
+        # and returns. The timer paints the batch. pointer_move would stamp
+        # now, and the timer would stamp the same points again.
         if self._stroke_sampling:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._remember_cursor(event)
             return
         if event.buttons() & Qt.MouseButton.LeftButton:
             tool = self.tool_getter()
@@ -1278,10 +1496,17 @@ class CanvasView(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if not self._has_page():
             return
+        # The hold Space might take over ends with the button. A later move
+        # must not start a pan from a zoom drag that already finished.
+        self._space_pan_pending = False
         if self._guide is not None and event.button() == Qt.MouseButton.LeftButton:
             self._finish_guide(event.position())
             return
-        if self._panning and event.button() in {Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton}:
+        if self._panning and event.button() in {
+            Qt.MouseButton.MiddleButton,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.RightButton,
+        }:
             self._panning = False
             self._pan_last = None
             self._end_pan_proxy()
@@ -1312,8 +1537,15 @@ class CanvasView(QWidget):
         if event.key() == Qt.Key.Key_Alt and not event.isAutoRepeat():
             self.set_alt_held(True)
         if event.key() == Qt.Key.Key_Space:
+            if event.isAutoRepeat():
+                return
+            # Space is only the temporary hand. A zoom drag in progress keeps
+            # the level it has reached and pans for the rest of the button hold.
             self._space = True
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self._stop_zoom_for_hand()
+            self._begin_space_pan(QApplication.mouseButtons())
+            if not self._panning:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
             return
         if event.key() == Qt.Key.Key_Escape:
             if self._guide is not None:
@@ -1347,8 +1579,11 @@ class CanvasView(QWidget):
             # False is passed through. A keyboard query during this release can
             # still report Alt, which would leave the zoom glass on minus.
             self.set_alt_held(False)
-        if event.key() == Qt.Key.Key_Space:
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            # The drag keeps panning until the button comes up. Letting Space
+            # go first must not turn that same drag into a zoom.
             self._space = False
+            self._space_pan_pending = False
             self._apply_cursor()
             return
         super().keyReleaseEvent(event)
@@ -1357,14 +1592,12 @@ class CanvasView(QWidget):
         self._stroke_sampling = True
         self._stroke_tool_id = tool_id
         self._stroke_points = []
-        self._stroke_ticks = 0
         self._stroke_timer.start(_STROKE_SAMPLE_MS)
 
     def _cancel_stroke_sampling(self) -> None:
         self._stroke_sampling = False
         self._stroke_timer.stop()
         self._stroke_points = []
-        self._stroke_ticks = 0
 
     def _on_stroke_sample(self) -> None:
         if not self._stroke_sampling:
@@ -1376,19 +1609,16 @@ class CanvasView(QWidget):
             and tool.id == self._stroke_tool_id
             and bool(getattr(tool, "stroke_live", lambda: False)())
         )
-        # Escape or a tool change already restored the layer. A release that
-        # the canvas missed still has to flush the stored coordinates.
+        # Escape or a tool change already restored the layer. A release the
+        # canvas missed still flushes the stored moves and commits. While the
+        # button is down this tick only paints moves the pointer already stored.
         if not live:
             self._cancel_stroke_sampling()
             return
         if not button_down:
             self._finish_stroke_sampling(None)
             return
-        self._remember_cursor(None)
-        self._stroke_ticks += 1
-        if self._stroke_ticks >= _STROKE_FLUSH_TICKS:
-            self._flush_stroke_points()
-            self._stroke_ticks = 0
+        self._flush_stroke_points()
         if self._stroke_sampling:
             self._stroke_timer.start(_STROKE_SAMPLE_MS)
 
@@ -1502,6 +1732,100 @@ class CanvasView(QWidget):
     def _is_hand(self) -> bool:
         tool = self.tool_getter()
         return tool is not None and tool.id == "hand"
+
+
+def plate_visible_source(
+    dest: QRectF,
+    clip: QRectF,
+    plate_width: float,
+    plate_height: float,
+) -> tuple[QRectF, QRectF] | None:
+    """Widget rect and plate rect for the part of ``dest`` inside ``clip``.
+
+    ``dest`` is where the whole plate would be drawn. A zoom drag makes that
+    the page times the zoom, far larger than the window. The pair is only the
+    overlap, so the draw stays the size of the window.
+    """
+    if dest.width() <= 0 or dest.height() <= 0 or plate_width <= 0 or plate_height <= 0:
+        return None
+    visible = dest.intersected(clip)
+    if visible.isEmpty():
+        return None
+    source = QRectF(
+        plate_width * (visible.left() - dest.left()) / dest.width(),
+        plate_height * (visible.top() - dest.top()) / dest.height(),
+        plate_width * visible.width() / dest.width(),
+        plate_height * visible.height() / dest.height(),
+    )
+    if source.width() <= 0 or source.height() <= 0:
+        return None
+    return visible, source
+
+
+def ruler_tick_span(view_min: float, view_max: float, step: float) -> tuple[float, float]:
+    """First and last tick that can fall inside the view, snapped to ``step``.
+
+    The span is the document range on screen, not the whole page. Ticks are
+    aligned to the same grid a full walk would use, so the marks that show
+    stay put.
+    """
+    if step <= 0:
+        return view_min, view_max
+    if view_max < view_min:
+        view_min, view_max = view_max, view_min
+    start = math.floor(view_min / step) * step
+    end = math.ceil(view_max / step) * step
+    return start, end
+
+
+def _pan_button_held(buttons) -> bool:
+    """True when the left, middle, or right button is in ``buttons``."""
+    held = Qt.MouseButton.LeftButton | Qt.MouseButton.MiddleButton | Qt.MouseButton.RightButton
+    return bool(buttons & held)
+
+
+def checker_loop_rect(
+    target: QRectF,
+    clip: QRectF,
+    cell: int = _CHECKER,
+) -> tuple[int, int, int, int] | None:
+    """Pixel span of the checker cells that meet ``clip``.
+
+    Cells are ``cell`` pixels on the grid that starts at the page corner
+    (``target`` floored), the same grid a full-page loop would walk. A close
+    zoom makes ``target`` enormous. Walking every cell of it is what stalled
+    a pan, so the span is only the cells that touch ``clip``. The phase still
+    follows the page, and the pattern scrolls with the photo.
+    """
+    if cell < 1:
+        return None
+    inter = target.intersected(clip)
+    if inter.isEmpty():
+        return None
+    grid_x = int(math.floor(target.left()))
+    grid_y = int(math.floor(target.top()))
+    left = grid_x + ((int(math.floor(inter.left())) - grid_x) // cell) * cell
+    top = grid_y + ((int(math.floor(inter.top())) - grid_y) // cell) * cell
+    right = grid_x + _grid_ceil(int(math.ceil(inter.right())) - grid_x, cell)
+    bottom = grid_y + _grid_ceil(int(math.ceil(inter.bottom())) - grid_y, cell)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _grid_ceil(delta: int, cell: int) -> int:
+    """Smallest multiple of ``cell`` that is >= ``delta``."""
+    return ((delta + cell - 1) // cell) * cell
+
+
+def _contains_box(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+) -> bool:
+    """True when ``inner`` sits inside ``outer``, aside from float noise."""
+    x0, y0, x1, y1 = outer
+    ix0, iy0, ix1, iy1 = inner
+    return ix0 >= x0 - 1e-3 and iy0 >= y0 - 1e-3 and ix1 <= x1 + 1e-3 and iy1 <= y1 + 1e-3
 
 
 def _span_pixels(span: float, scale: float) -> int:

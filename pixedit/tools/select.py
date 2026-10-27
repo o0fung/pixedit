@@ -33,7 +33,7 @@ class SelectTool(Tool):
 
     def __init__(self) -> None:
         self._dragging = False
-        # Locked at press time. The poll keeps running until release even if
+        # Locked at press time. Sampling keeps running until release even if
         # the mode menu changes during the drag.
         self._freehand = False
         self._start = (0.0, 0.0)
@@ -99,11 +99,11 @@ class SelectTool(Tool):
         session.notify("overlay")
 
     def extend_points(self, session, points: list[tuple[float, float]]) -> None:
-        """Append freehand samples. The canvas polls the cursor and flushes batches here.
+        """Append freehand samples. The canvas stores mouse moves and flushes batches here.
 
-        A full preview would rebuild the photo and stall that poll, so a new
-        point only asks the view to redraw the rubber band. A point within
-        0.05 image pixels of the last one is dropped, the same rule as the brush.
+        A full preview would rebuild the photo on every move, so a new point
+        only asks the view to redraw the rubber band. A point within 0.05
+        image pixels of the last one is dropped, the same rule as the brush.
         """
         if not self._dragging or not self._freehand:
             return

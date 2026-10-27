@@ -35,8 +35,8 @@ class MaskTool(Tool):
 
     def __init__(self) -> None:
         self._dragging = False
-        # Latched at press. The cursor poll keeps running until release even
-        # if the mode control changes during the drag.
+        # Latched at press. The drag keeps the shape it started with even if
+        # the mode control changes before release.
         self._freehand = False
         self._start = (0.0, 0.0)
         self._points: list[tuple[float, float]] = []

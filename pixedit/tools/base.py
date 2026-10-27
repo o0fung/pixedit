@@ -68,11 +68,11 @@ class Tool:
         return []
 
     def wants_stroke_sampling(self, _session) -> bool:
-        """True when the canvas should poll the cursor while the button is down.
+        """True when the canvas should store mouse moves and paint them in batches.
 
-        Mouse-move events arrive in bursts. The canvas stores a point every
-        8 ms and passes the batch to ``extend_points``. Release calls
-        ``commit_stroke`` with the pointer, including Shift and Alt.
+        Mouse-move events arrive in bursts. Each move stores a coordinate.
+        About every 8 ms the canvas passes that batch to ``extend_points``.
+        Release calls ``commit_stroke`` with the pointer, including Shift and Alt.
         """
         return False
 
