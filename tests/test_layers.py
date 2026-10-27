@@ -91,7 +91,7 @@ def test_layer_list_drop_reorders_the_document():
     panel = LayerPanel(session)
     panel.refresh()
     icons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
-    assert {"New", "Copy", "Delete", "Up", "Down", "Visibility", "Group", "Merge down"} <= set(icons)
+    assert {"New", "Copy", "Delete", "Up", "Down", "Visibility", "Page", "Group", "Tag", "Merge down"} <= set(icons)
     for name, button in icons.items():
         assert not button.icon().isNull(), name
         if name == "Visibility":
@@ -99,8 +99,12 @@ def test_layer_list_drop_reorders_the_document():
         elif name == "Delete":
             assert "selected layer" in button.toolTip()
             assert "group" in button.toolTip()
-        elif name == "Group":
+        elif name == "Page":
             assert "own canvas" in button.toolTip()
+        elif name == "Group":
+            assert "tagged" in button.toolTip()
+        elif name == "Tag":
+            assert "tag" in button.toolTip().lower()
         elif name == "Merge down":
             assert "below" in button.toolTip()
             assert "Flatten" in button.toolTip()
@@ -265,7 +269,7 @@ def test_layer_rows_show_thumbs_and_text_heads():
 
     assert blur.text(0).splitlines()[0] == "  Blur"
     assert "on Caption" in blur.text(0).splitlines()[1]
-    assert group.data(0, _ITEM_NAME) == "Group 1"
+    assert group.data(0, _ITEM_NAME) == "Page 1"
     assert group.data(0, _ITEM_META) == "16 × 16"
     assert photo.data(0, _ITEM_NAME) == "Photo"
     assert photo.data(0, _ITEM_META) == "40%  normal"
@@ -563,7 +567,7 @@ def test_groups_keep_separate_canvases_and_selections():
     session.add_group()
     second = session.document.active_group_id
     assert second != first
-    assert session.document.group.name == "Group 2"
+    assert session.document.group.name == "Page 2"
     session.document.layers[0].image.putpixel((1, 1), (255, 0, 0, 255))
     session.select_all()
     session.activate_group(first)
@@ -632,7 +636,7 @@ def test_delete_groups_removes_selected_pages_in_one_undo():
     assert [group.name for group in session.document.groups] == ["Page 1"]
     assert session.document.active_group_id == first
     assert len(session.history.undo_stack) == depth + 1
-    assert session.history.undo_stack[-1].name == "Delete groups"
+    assert session.history.undo_stack[-1].name == "Delete pages"
     session.undo()
     assert [group.name for group in session.document.groups] == ["Page 1", "Page 2", "Page 3"]
     assert session.document.active_group_id == second
@@ -643,7 +647,7 @@ def test_delete_groups_removes_selected_pages_in_one_undo():
     session.delete_groups([])
     session.delete_groups([first])
     assert [group.name for group in session.document.groups] == ["Page 2", "Page 3"]
-    assert session.history.undo_stack[-1].name == "Delete group"
+    assert session.history.undo_stack[-1].name == "Delete page"
     session.undo()
 
 
@@ -654,7 +658,7 @@ def test_delete_groups_refuses_to_remove_the_last_page():
     only = session.document.groups[0].id
     session.delete_groups([only])
     assert len(session.document.groups) == 1
-    assert messages == ["The last group stays. A document always has one page."]
+    assert messages == ["The last page stays. A document always has one page."]
     assert session.history.undo_stack == []
     session.add_group()
     session.add_group()
@@ -663,7 +667,7 @@ def test_delete_groups_refuses_to_remove_the_last_page():
     session.delete_groups([group.id for group in session.document.groups])
     assert len(session.document.groups) == 3
     assert len(session.history.undo_stack) == depth
-    assert messages == ["The last group stays. A document always has one page."]
+    assert messages == ["The last page stays. A document always has one page."]
 
 
 def test_delete_group_keeps_the_last_page_and_reorder_sets_page_order():
@@ -888,7 +892,7 @@ def test_open_pix_names_an_automatic_group_from_the_filename(tmp_path):
     app.processEvents()
     assert window.session.document.group.name == "holiday"
     window.session.add_group()
-    assert window.session.document.group.name == "Group 2"
+    assert window.session.document.group.name == "Page 2"
 
     source.document.groups[0].name = "Cover"
     cover = tmp_path / "cover.pix"
@@ -941,8 +945,8 @@ def test_rename_dialog_edits_the_selected_group_or_layer(monkeypatch):
 
     monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", group_name)
     panel.rename_selection()
-    assert seen["title"] == "Rename group"
-    assert seen["text"] == "Group 1"
+    assert seen["title"] == "Rename page"
+    assert seen["text"] == "Page 1"
     assert session.document.group.name == "Cover"
 
     monkeypatch.setattr("pixedit.ui.layers_panel.QInputDialog.getText", lambda *_a, **_k: ("  ", True))

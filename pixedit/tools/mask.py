@@ -132,12 +132,13 @@ class MaskTool(Tool):
         if baked is None:
             return
         if created:
+            stack = session._stack()
             try:
-                index = session.document.layers.index(baked)
+                index = stack.index(baked)
             except ValueError:
-                index = len(session.document.layers)
+                index = len(stack)
             else:
-                session.document.layers.pop(index)
+                stack.pop(index)
             session.add_layer(baked, index=index, name="Mask")
             return
         if before is None:

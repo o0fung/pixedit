@@ -223,7 +223,7 @@ class PdfImportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Import PDF")
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Each page becomes its own group. The canvas shows one page at a time."))
+        layout.addWidget(QLabel("Each page is its own canvas, in one group. The canvas shows one page at a time."))
         form = QFormLayout()
         self.dpi = QComboBox()
         self.dpi.addItem("72 DPI  (screen)", 1.0)

@@ -10,11 +10,20 @@ from PIL import Image
 
 from pixedit.composite import composite, composite_group_over, composite_over
 from pixedit.factory import raster_layer, redaction_layer, text_layer
-from pixedit.model import Document, Layer, LayerGroup, RedactionInfo, TextInfo, bind_mask_targets, new_id
+from pixedit.model import (
+    Document,
+    Layer,
+    LayerGroup,
+    RedactionInfo,
+    SharedGroup,
+    TextInfo,
+    bind_mask_targets,
+    new_id,
+)
 
 RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
 PROJECT_SUFFIX = ".pix"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 DEFAULT_DPI = 72.0
 
 # Export dialog order. The first suffix is appended when the chosen name has none.
@@ -104,11 +113,13 @@ def limit_longest_edge(image: Image.Image, max_edge: int | None) -> Image.Image:
 
 
 def load_raster(path: str, max_edge: int | None = None) -> Document:
-    """Load a still image, or each frame of a GIF/TIFF, as layers.
+    """Load a still image, or each frame of a GIF/TIFF, as its own page.
 
-    Extra frames are hidden so a multi-page file opens on its first page
-    instead of stacking every frame on top of the others. ``max_edge``
-    limits the longer side when the open dialog asks for a smaller copy.
+    A still is one page and one layer. A multi-frame file is one page per
+    frame, every frame visible on its page, and one group tagging all of
+    those pages so a layer added to the group is drawn on every frame.
+    ``max_edge`` limits the longer side when the open dialog asks for a
+    smaller copy.
     """
     with Image.open(path) as source:
         dpi = image_dpi(source)
@@ -117,25 +128,40 @@ def load_raster(path: str, max_edge: int | None = None) -> Document:
         for index in range(count):
             source.seek(index)
             frames.append(limit_longest_edge(source.convert("RGBA"), max_edge).copy())
-    width = max(frame.width for frame in frames)
-    height = max(frame.height for frame in frames)
-    stem = Path(path).stem
-    layers: list[Layer] = []
-    multiple = len(frames) > 1
+    stem = Path(path).stem or "Image"
+    if len(frames) == 1:
+        return Document(width=frames[0].width, height=frames[0].height, layers=[raster_layer(stem, frames[0])], dpi=dpi)
+    shared = SharedGroup(id=new_id(), name=stem, layers=[])
+    pages: list[LayerGroup] = []
     for index, frame in enumerate(frames):
-        name = f"{stem} {index + 1}" if multiple else stem
-        layer = raster_layer(name, frame)
-        layer.visible = index == 0 or not multiple
-        layers.append(layer)
-    return Document(width=width, height=height, layers=layers, dpi=dpi)
+        layer = raster_layer(f"{stem} {index + 1}", frame)
+        pages.append(
+            LayerGroup(
+                id=new_id(),
+                name=f"Page {index + 1}",
+                width=frame.width,
+                height=frame.height,
+                layers=[layer],
+                shared_ids=[shared.id],
+            )
+        )
+    return Document(
+        width=pages[0].width,
+        height=pages[0].height,
+        dpi=dpi,
+        groups=pages,
+        active_group_id=pages[0].id,
+        shared_groups=[shared],
+    )
 
 
 def load_pdf(path: str, scale: float = 1.0) -> Document:
-    """Render each PDF page as its own group.
+    """Render each PDF page as its own page, tagged with one group.
 
     ``scale`` is the PDFium zoom. 1.0 is about 72 DPI and 2.0 is about 144 DPI.
-    Every page stays visible inside its group. The canvas shows the first page.
-    Groups are stored in page order, which is the order PDF export writes.
+    Every page stays visible. The canvas shows the first page. Page order is
+    the order PDF export writes. The group starts empty, so a layer added to
+    it is drawn on every page.
     """
     import pypdfium2 as pdfium
 
@@ -154,6 +180,7 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
         pdf.close()
     if not pages:
         raise ValueError("PDF has no pages")
+    shared = SharedGroup(id=new_id(), name=Path(path).stem or "Document", layers=[])
     groups: list[LayerGroup] = []
     for index, page in enumerate(pages):
         layer = raster_layer(f"Page {index + 1}", page)
@@ -164,6 +191,7 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
                 width=page.width,
                 height=page.height,
                 layers=[layer],
+                shared_ids=[shared.id],
             )
         )
     return Document(
@@ -172,6 +200,7 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
         dpi=DEFAULT_DPI * float(scale),
         groups=groups,
         active_group_id=groups[0].id,
+        shared_groups=[shared],
     )
 
 
@@ -333,56 +362,73 @@ def _read_selection(archive: zipfile.ZipFile, name: str | None) -> Image.Image |
     return selection
 
 
+def _write_layers(archive: zipfile.ZipFile, folder: str, layers: list[Layer]) -> list[dict]:
+    """Store each layer's PNG under ``folder`` and return the manifest entries."""
+    manifest_layers = []
+    for index, layer in enumerate(layers):
+        image_name = f"{folder}/layers/{index:03d}.png"
+        mask_name = None
+        with archive.open(image_name, "w") as handle:
+            layer.image.save(handle, format="PNG")
+        if layer.mask is not None:
+            mask_name = f"{folder}/layers/{index:03d}_mask.png"
+            with archive.open(mask_name, "w") as handle:
+                layer.mask.save(handle, format="PNG")
+        manifest_layers.append(_layer_manifest(layer, image_name, mask_name))
+    return manifest_layers
+
+
 def save_project(document: Document, path: str) -> None:
-    """Write a version 2 ``.pix`` zip: one folder of PNGs per group."""
+    """Write a version 3 ``.pix`` zip: one folder per page, plus shared groups."""
     destination = Path(path)
-    manifest_groups = []
+    manifest_pages = []
+    manifest_shared = []
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for group_index, group in enumerate(document.groups):
-            manifest_layers = []
-            for index, layer in enumerate(group.layers):
-                image_name = f"groups/{group_index:03d}/layers/{index:03d}.png"
-                mask_name = None
-                with archive.open(image_name, "w") as handle:
-                    layer.image.save(handle, format="PNG")
-                if layer.mask is not None:
-                    mask_name = f"groups/{group_index:03d}/layers/{index:03d}_mask.png"
-                    with archive.open(mask_name, "w") as handle:
-                        layer.mask.save(handle, format="PNG")
-                manifest_layers.append(_layer_manifest(layer, image_name, mask_name))
+            folder = f"pages/{group_index:03d}"
             selection_name = None
             if group.selection is not None:
-                selection_name = f"groups/{group_index:03d}/selection.png"
+                selection_name = f"{folder}/selection.png"
                 with archive.open(selection_name, "w") as handle:
                     group.selection.save(handle, format="PNG")
-            manifest_groups.append(
+            manifest_pages.append(
                 {
                     "id": group.id,
                     "name": group.name,
                     "width": group.width,
                     "height": group.height,
                     "selection": selection_name,
-                    "layers": manifest_layers,
+                    "layers": _write_layers(archive, folder, group.layers),
+                    "shared_ids": list(group.shared_ids),
                     "guides": {
                         "vertical": list(group.guides_v),
                         "horizontal": list(group.guides_h),
                     },
                 }
             )
+        for group_index, group in enumerate(document.shared_groups):
+            manifest_shared.append(
+                {
+                    "id": group.id,
+                    "name": group.name,
+                    "layers": _write_layers(archive, f"shared/{group_index:03d}", group.layers),
+                }
+            )
         manifest = {
             "format": "pixedit",
             "version": FORMAT_VERSION,
             "dpi": float(document.dpi),
-            "active_group": document.active_group_id,
-            "groups": manifest_groups,
+            "active_page": document.active_group_id,
+            "pages": manifest_pages,
+            "shared_groups": manifest_shared,
         }
         archive.writestr("manifest.json", json.dumps(manifest, indent=2))
 
 
 def _load_project_v1(archive: zipfile.ZipFile, manifest: dict) -> Document:
-    """Wrap a one-canvas project as a single group named Group 1.
+    """Wrap a one-canvas project as a single page named Page 1.
 
-    The file on disk is left unchanged. The next save writes version 2.
+    The file on disk is left unchanged. The next Save writes version 3.
     """
     width = int(manifest["width"])
     height = int(manifest["height"])
@@ -392,7 +438,7 @@ def _load_project_v1(archive: zipfile.ZipFile, manifest: dict) -> Document:
     bind_mask_targets(layers)
     group = LayerGroup(
         id=new_id(),
-        name="Group 1",
+        name="Page 1",
         width=width,
         height=height,
         layers=layers,
@@ -407,29 +453,44 @@ def _load_project_v1(archive: zipfile.ZipFile, manifest: dict) -> Document:
     )
 
 
+def _page_from_entry(archive: zipfile.ZipFile, entry: dict) -> LayerGroup:
+    width = int(entry["width"])
+    height = int(entry["height"])
+    layers = [_read_layer(archive, layer_entry, width, height) for layer_entry in entry.get("layers", [])]
+    bind_mask_targets(layers)
+    vertical, horizontal = _guides_from_entry(entry)
+    raw_tags = entry.get("shared_ids")
+    shared_ids = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
+    return LayerGroup(
+        id=str(entry.get("id") or new_id()),
+        name=str(entry.get("name") or "Page"),
+        width=width,
+        height=height,
+        layers=layers,
+        selection=_read_selection(archive, entry.get("selection")),
+        guides_v=vertical,
+        guides_h=horizontal,
+        shared_ids=shared_ids,
+    )
+
+
+def _shared_from_entry(archive: zipfile.ZipFile, entry: dict) -> SharedGroup:
+    layers = [_read_layer(archive, layer_entry, 1, 1) for layer_entry in entry.get("layers", [])]
+    bind_mask_targets(layers)
+    return SharedGroup(
+        id=str(entry.get("id") or new_id()),
+        name=str(entry.get("name") or "Group"),
+        layers=layers,
+    )
+
+
 def _load_project_v2(archive: zipfile.ZipFile, manifest: dict) -> Document:
     raw_groups = manifest.get("groups")
     if not isinstance(raw_groups, list) or not raw_groups:
-        raise ValueError("This PixEdit project has no groups")
-    groups: list[LayerGroup] = []
-    for entry in raw_groups:
-        width = int(entry["width"])
-        height = int(entry["height"])
-        layers = [_read_layer(archive, layer_entry, width, height) for layer_entry in entry.get("layers", [])]
-        bind_mask_targets(layers)
-        vertical, horizontal = _guides_from_entry(entry)
-        groups.append(
-            LayerGroup(
-                id=str(entry.get("id") or new_id()),
-                name=str(entry.get("name") or "Group"),
-                width=width,
-                height=height,
-                layers=layers,
-                selection=_read_selection(archive, entry.get("selection")),
-                guides_v=vertical,
-                guides_h=horizontal,
-            )
-        )
+        raise ValueError("This PixEdit project has no pages")
+    groups = [_page_from_entry(archive, entry) for entry in raw_groups]
+    for page in groups:
+        page.shared_ids = []
     active = manifest.get("active_group")
     if not isinstance(active, str):
         active = groups[0].id
@@ -439,6 +500,31 @@ def _load_project_v2(archive: zipfile.ZipFile, manifest: dict) -> Document:
         dpi=_dpi_from_manifest(manifest),
         groups=groups,
         active_group_id=active,
+    )
+
+
+def _load_project_v3(archive: zipfile.ZipFile, manifest: dict) -> Document:
+    raw_pages = manifest.get("pages")
+    if not isinstance(raw_pages, list) or not raw_pages:
+        raise ValueError("This PixEdit project has no pages")
+    pages = [_page_from_entry(archive, entry) for entry in raw_pages]
+    raw_shared = manifest.get("shared_groups")
+    shared = (
+        [_shared_from_entry(archive, entry) for entry in raw_shared] if isinstance(raw_shared, list) else []
+    )
+    known = {group.id for group in shared}
+    for page in pages:
+        page.shared_ids = [tag for tag in page.shared_ids if tag in known]
+    active = manifest.get("active_page")
+    if not isinstance(active, str):
+        active = pages[0].id
+    return Document(
+        width=pages[0].width,
+        height=pages[0].height,
+        dpi=_dpi_from_manifest(manifest),
+        groups=pages,
+        active_group_id=active,
+        shared_groups=shared,
     )
 
 
@@ -452,12 +538,14 @@ def load_project(path: str) -> Document:
             version = int(raw_version)
         except (TypeError, ValueError) as exc:
             raise ValueError("This PixEdit project has an unreadable version.") from exc
-        # Version 1 is one canvas. Opening it builds one group. The next Save
-        # writes version 2. Any other version is refused.
+        # Version 1 is one canvas. Version 2 is pages without shared groups.
+        # The next Save writes version 3. Any other version is refused.
         if version <= 1:
             return _load_project_v1(archive, manifest)
-        if version == FORMAT_VERSION:
+        if version == 2:
             return _load_project_v2(archive, manifest)
+        if version == FORMAT_VERSION:
+            return _load_project_v3(archive, manifest)
         raise ValueError(
             f"This PixEdit project uses version {version}, which this version of PixEdit cannot open."
         )
@@ -484,8 +572,9 @@ def export_image(document: Document, path: str, fmt: str | None = None, quality:
     PNG, WebP, and TIFF keep transparency. JPEG, BMP, GIF, and PDF are
     composited on white, because those formats cannot keep a real alpha
     channel. GIF is reduced to 256 colors. PNG and the other single-image
-    formats save the page on screen. PDF writes every group, in group order,
-    one raster page each, at the document resolution.
+    formats save the page on screen. PDF writes every page, in page order,
+    one raster page each, including that page's group layers, at the document
+    resolution.
     """
     suffix = (fmt or Path(path).suffix.lstrip(".")).lower()
     # Empty means "caller passed a path with no extension"; write PNG.
@@ -495,7 +584,10 @@ def export_image(document: Document, path: str, fmt: str | None = None, quality:
     dpi = max(1.0, float(document.dpi))
     resolution = (dpi, dpi)
     if suffix == "pdf":
-        pages = [composite_group_over(group, (255, 255, 255, 255)).convert("RGB") for group in document.groups]
+        pages = [
+            composite_group_over(group, (255, 255, 255, 255), document.shared_groups).convert("RGB")
+            for group in document.groups
+        ]
         if not pages:
             raise ValueError("Nothing to export")
         first, *rest = pages

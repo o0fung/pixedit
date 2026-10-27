@@ -1096,16 +1096,14 @@ def layer_hit_box(layer: Layer) -> tuple[int, int, int, int] | None:
     return layer.x + x0, layer.y + y0, layer.x + x1, layer.y + y1
 
 
-def hit_layer(document: Document, x: float, y: float) -> int | None:
-    """Index of the topmost visible layer whose selection box contains ``(x, y)``.
+def top_layer_at(document: Document, x: float, y: float) -> Layer | None:
+    """The topmost visible layer under ``(x, y)``, including shared groups.
 
-    The pointer is floored to a pixel. A higher layer wins even when that
-    pixel is empty, as long as the point sits inside its box. Hidden layers
-    are skipped.
+    Shared layers paint above the page, so a header wins over the page layer
+    under it. The pointer is floored to a pixel. Hidden layers are skipped.
     """
     px, py = int(math.floor(x)), int(math.floor(y))
-    for index in range(len(document.layers) - 1, -1, -1):
-        layer = document.layers[index]
+    for layer in reversed(document.composited_layers()):
         if not layer.visible:
             continue
         box = layer_hit_box(layer)
@@ -1113,6 +1111,21 @@ def hit_layer(document: Document, x: float, y: float) -> int | None:
             continue
         left, top, right, bottom = box
         if left <= px < right and top <= py < bottom:
+            return layer
+    return None
+
+
+def hit_layer(document: Document, x: float, y: float) -> int | None:
+    """Index of the topmost visible page layer whose box contains ``(x, y)``.
+
+    A shared layer on top of that point returns None, so a click does not
+    fall through the header onto the page. The index is into the page stack.
+    """
+    layer = top_layer_at(document, x, y)
+    if layer is None:
+        return None
+    for index, item in enumerate(document.layers):
+        if item is layer:
             return index
     return None
 

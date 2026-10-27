@@ -63,8 +63,39 @@ class CoreMixin:
         new_index = int(value)
         self._activate(new_index, self._ids_at(new_index))
 
+    def _stack(self) -> list[Layer]:
+        """The layer list the selection lives in: a group, or the page."""
+        shared_id = self._shared_id
+        if shared_id:
+            group = self.document.shared_by_id(shared_id)
+            if group is not None:
+                return group.layers
+            self._shared_id = None
+        return self.document.layers
+
+    def _editing_shared_id(self) -> str | None:
+        """The shared group structural edits should write, or None for the page."""
+        if self._shared_id and self.document.shared_by_id(self._shared_id) is not None:
+            return self._shared_id
+        return None
+
+    def _replace_stack(self, layers: list[Layer]) -> None:
+        shared_id = self._editing_shared_id()
+        if shared_id:
+            group = self.document.shared_by_id(shared_id)
+            if group is not None:
+                group.layers = list(layers)
+            return
+        self.document.layers = list(layers)
+
+    def _index_in_stack(self, layer_id: str) -> int:
+        for index, layer in enumerate(self._stack()):
+            if layer.id == layer_id:
+                return index
+        raise KeyError(layer_id)
+
     def _ids_at(self, index: int) -> list[str]:
-        layers = self.document.layers
+        layers = self._stack()
         if 0 <= index < len(layers):
             return [layers[index].id]
         return []
@@ -81,8 +112,9 @@ class CoreMixin:
         if preview is None:
             return
         current = None
-        if self.document.layers and 0 <= self._layer_index < len(self.document.layers):
-            current = self.document.layers[self._layer_index]
+        layers = self._stack()
+        if layers and 0 <= self._layer_index < len(layers):
+            current = layers[self._layer_index]
         if current is not preview:
             self.cancel_color_adjust()
 
@@ -94,7 +126,7 @@ class CoreMixin:
     def selected_layers(self) -> list[Layer]:
         """Selected layers in stack order, back to front."""
         chosen = set(self.selected_ids())
-        return [layer for layer in self.document.layers if layer.id in chosen]
+        return [layer for layer in self._stack() if layer.id in chosen]
 
     def select_layers(self, layer_ids: list[str], active_id: str | None = None) -> None:
         """Select these layers. Paint, opacity, and blend stay on ``active_id``.
@@ -104,6 +136,7 @@ class CoreMixin:
         survive, the front-most remaining layer becomes active. An empty
         result leaves the current selection alone.
         """
+        self._shared_id = None
         layers = self.document.layers
         known = {layer.id for layer in layers}
         wanted = {layer_id for layer_id in layer_ids if layer_id in known}
@@ -171,6 +204,9 @@ class CoreMixin:
         command.group_id = self.document.active_group_id
 
     def _remember_group_ui(self) -> None:
+        # A shared-layer selection is not the page's remembered layer.
+        if self._shared_id:
+            return
         group_id = self.document.active_group_id
         self._group_ui[group_id] = (self._layer_index, list(self._selected_ids))
 
@@ -264,7 +300,7 @@ class CoreMixin:
         does. The active id is always one of the remaining ids. If it was
         deleted, the front-most survivor becomes active.
         """
-        layers = self.document.layers
+        layers = self._stack()
         if not layers:
             self._layer_index = -1
             self._selected_ids = []
@@ -280,7 +316,7 @@ class CoreMixin:
         if kept and active_id in kept:
             return
         if kept:
-            self._layer_index = self.document.index_of(kept[-1])
+            self._layer_index = self._index_in_stack(kept[-1])
             return
         self._layer_index = max(0, min(self._layer_index, len(layers) - 1))
         self._selected_ids = [layers[self._layer_index].id]
@@ -289,7 +325,55 @@ class CoreMixin:
         self.clamp_index()
         if self.layer_index < 0:
             return None
-        return self.document.layers[self.layer_index]
+        layers = self._stack()
+        if not layers:
+            return None
+        return layers[self.layer_index]
+
+    def focus_shared(self, shared_id: str, layer_ids: list[str] | None = None, active_id: str | None = None) -> None:
+        """Select layers in a shared group. The page on screen stays put."""
+        group = self.document.shared_by_id(shared_id)
+        if group is None:
+            return
+        self._shared_id = shared_id
+        layers = group.layers
+        if layer_ids is None and active_id is None:
+            if not layers:
+                self._layer_index = -1
+                self._selected_ids = []
+                return
+            self._activate(len(layers) - 1, [layers[-1].id])
+            return
+        known = {layer.id for layer in layers}
+        wanted = {layer_id for layer_id in (layer_ids or []) if layer_id in known}
+        if active_id in known:
+            wanted.add(active_id)
+        ordered = [layer.id for layer in layers if layer.id in wanted]
+        if not ordered:
+            if layers:
+                self._activate(len(layers) - 1, [layers[-1].id])
+            else:
+                self._layer_index = -1
+                self._selected_ids = []
+            return
+        if active_id not in ordered:
+            active_id = ordered[-1]
+        self._activate(self._index_in_stack(active_id), ordered)
+
+    def focus_layer(self, layer: Layer) -> None:
+        """Select this layer, whether it sits on the page or in a group."""
+        for page in self.document.groups:
+            if any(item is layer for item in page.layers):
+                self._shared_id = None
+                if page.id != self.document.active_group_id:
+                    self.activate_group(page.id, layer_ids=[layer.id], active_id=layer.id)
+                else:
+                    self.select_layers([layer.id], active_id=layer.id)
+                return
+        for group in self.document.shared_groups:
+            if any(item is layer for item in group.layers):
+                self.focus_shared(group.id, [layer.id], layer.id)
+                return
 
     def option(self, key: str, default: Any = None) -> Any:
         return self.options.get(key, default)
@@ -309,6 +393,7 @@ class CoreMixin:
         self.document = document
         self.history = History()
         self._group_ui = {}
+        self._shared_id = None
         self.layer_index = len(document.layers) - 1
         self.path = path
         self.source_name = source_name

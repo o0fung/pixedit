@@ -49,6 +49,9 @@ class Session(
         self._color_before: dict[str, Any] | None = None
         self._color_layer: Layer | None = None
         self._ending_color = False
+        # None means the active layer is on the page. A shared group id means
+        # the active layer lives in that group's stack.
+        self._shared_id: str | None = None
         self._layer_index = len(self.document.layers) - 1
         # Ids in stack order, back to front. Assigning layer_index replaces
         # this with that one layer. select_layers is the multi-select path.

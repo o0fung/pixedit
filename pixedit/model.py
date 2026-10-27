@@ -1,10 +1,19 @@
 """Document model and undoable commands.
 
-The model has no Qt dependency. A document is an ordered list of groups.
-Each group is its own canvas: a size, a selection, and an ordered layer list
-(index 0 is the bottom). The document's width, layers, and selection are the
-group on screen. Tools and plugins mutate the model only through ``Command``
-objects so every edit can be undone.
+The model has no Qt dependency. A document is an ordered list of pages
+(``LayerGroup``). Each page is its own canvas: a size, a selection, and an
+ordered layer list (index 0 is the bottom). The document's width, layers,
+and selection are the page on screen.
+
+A ``SharedGroup`` is a tag, not a folder. Its layers are painted on every
+page that lists the group's id, after that page's own layers. Tag order on
+the page is paint order, so the last tag is on top. The same tag can sit on
+pages that are not next to each other, and one page can carry several tags:
+a header from one group and a footer from another. Shared layers are placed
+in page coordinates and clipped to each page.
+
+Tools and plugins mutate the model only through ``Command`` objects so every
+edit can be undone.
 """
 
 from __future__ import annotations
@@ -384,7 +393,12 @@ def move_stack(layers: list[Layer], old: int, new: int) -> tuple[list[Layer], in
 
 @dataclass
 class LayerGroup:
-    """One page. Its layers do not composite with any other group."""
+    """One page. Its own layers do not composite with any other page.
+
+    ``shared_ids`` are tags, in paint order. Each id names a ``SharedGroup``.
+    That group's layers are drawn on this page after ``layers``, and the same
+    pixels are drawn on every other page that lists the id.
+    """
 
     id: str
     name: str
@@ -393,14 +407,20 @@ class LayerGroup:
     layers: list[Layer] = field(default_factory=list)
     # None means "no selection" (edits hit the whole target). An L image is a
     # real selection: 255 is fully included, 0 is excluded, and a value in
-    # between fades the edit. The mask is this page's size, not another group's.
+    # between fades the edit. The mask is this page's size, not another page's.
     selection: Image.Image | None = None
     # Pixel positions. Vertical guides are x, horizontal guides are y.
     guides_v: tuple[int, ...] = ()
     guides_h: tuple[int, ...] = ()
+    # Shared groups, bottom to top. The last id paints above the others.
+    shared_ids: list[str] = field(default_factory=list)
 
     def clone(self) -> LayerGroup:
-        """A new group with copied layers. Mask targets point at the copies."""
+        """A new page with copied layers. Mask targets point at the copies.
+
+        Tags are the same ids. The caller remaps them when the shared groups
+        themselves are copied into another document.
+        """
         copies = [layer.clone() for layer in self.layers]
         id_map = {original.id: copy.id for original, copy in zip(self.layers, copies)}
         for layer in copies:
@@ -415,16 +435,44 @@ class LayerGroup:
             selection=None if self.selection is None else self.selection.copy(),
             guides_v=tuple(self.guides_v),
             guides_h=tuple(self.guides_h),
+            shared_ids=list(self.shared_ids),
         )
 
 
+@dataclass
+class SharedGroup:
+    """Layers drawn on every page tagged with this group.
+
+    Index 0 is the bottom of this group's stack. Coordinates are page
+    pixels, measured from the top-left of whichever page is showing, and
+    clipped to that page. A mask in this stack filters a picture in this
+    stack, not a different picture on each page.
+    """
+
+    id: str
+    name: str
+    layers: list[Layer] = field(default_factory=list)
+
+    def clone(self) -> SharedGroup:
+        """A new group with copied layers. Mask targets point at the copies."""
+        copies = [layer.clone() for layer in self.layers]
+        id_map = {original.id: copy.id for original, copy in zip(self.layers, copies)}
+        for layer in copies:
+            if layer.target_id in id_map:
+                layer.target_id = id_map[layer.target_id]
+        return SharedGroup(id=new_id(), name=self.name, layers=copies)
+
+
 class Document:
-    """Pages that share one printed resolution.
+    """Pages that share one printed resolution, plus groups that tag them.
 
     ``width``, ``height``, ``layers``, and ``selection`` read and write the
-    active group. Existing edits keep using those names and only touch the
+    active page. Existing edits keep using those names and only touch the
     page on screen. ``dpi`` belongs to the whole file: one PDF import is one
     render scale, so changing it changes every page's printed size.
+
+    ``groups`` is the page list, in export order. ``shared_groups`` is the
+    catalog of tags. Membership lives on each page as ``shared_ids``.
 
     An explicit empty ``groups`` list is the start state: no page is on
     screen. ``layers`` and ``selection`` then read as empty. ``group``,
@@ -440,25 +488,27 @@ class Document:
         dpi: float = 72.0,
         groups: list[LayerGroup] | None = None,
         active_group_id: str | None = None,
+        shared_groups: list[SharedGroup] | None = None,
     ) -> None:
         stored = float(dpi)
         if stored <= 0:
             stored = 72.0
         self.dpi = stored
+        self.shared_groups = list(shared_groups or [])
         if groups is not None:
             self.groups = list(groups)
         else:
             self.groups = [
                 LayerGroup(
                     id=new_id(),
-                    name="Group 1",
+                    name="Page 1",
                     width=max(1, int(width)),
                     height=max(1, int(height)),
                     layers=list(layers or []),
                     selection=selection,
                 )
             ]
-        # No pages yet. Leave the active id blank so nothing is treated as Group 1.
+        # No pages yet. Leave the active id blank so nothing is treated as Page 1.
         if not self.groups:
             self.active_group_id = ""
             return
@@ -477,6 +527,34 @@ class Document:
             if group.id == group_id:
                 return index
         raise KeyError(group_id)
+
+    def shared_by_id(self, group_id: str) -> SharedGroup | None:
+        for group in self.shared_groups:
+            if group.id == group_id:
+                return group
+        return None
+
+    def composited_layers(self, page: LayerGroup | None = None) -> list[Layer]:
+        """Page layers, then each tagged group's layers, bottom to top.
+
+        The layer objects are the live ones. A missing tag is skipped. A
+        repeated tag is painted once, the first time it appears.
+        """
+        if page is None:
+            if not self.groups:
+                return []
+            page = self.group
+        layers = list(page.layers)
+        seen: set[str] = set()
+        for shared_id in page.shared_ids:
+            if shared_id in seen:
+                continue
+            seen.add(shared_id)
+            shared = self.shared_by_id(shared_id)
+            if shared is None:
+                continue
+            layers.extend(shared.layers)
+        return layers
 
     @property
     def group(self) -> LayerGroup:
@@ -570,6 +648,32 @@ def empty_document(dpi: float = 72.0) -> Document:
     if stored <= 0:
         stored = 72.0
     return Document(width=1, height=1, groups=[], dpi=stored)
+
+
+def stack_layers(document: Document, shared_id: str | None) -> list[Layer] | None:
+    """The live layer list a command edits.
+
+    ``None`` for ``shared_id`` is the page on screen. A shared id is that
+    group's list. An unknown id returns None so the command does nothing.
+    """
+    if not shared_id:
+        if not document.groups:
+            return None
+        return document.layers
+    shared = document.shared_by_id(shared_id)
+    if shared is None:
+        return None
+    return shared.layers
+
+
+def set_stack_layers(document: Document, shared_id: str | None, layers: list[Layer]) -> None:
+    """Replace the page stack, or a shared group's stack."""
+    if not shared_id:
+        document.layers = list(layers)
+        return
+    shared = document.shared_by_id(shared_id)
+    if shared is not None:
+        shared.layers = list(layers)
 
 
 class Command:
@@ -762,22 +866,44 @@ class SetRedactionSettings(Command):
 
 
 class InsertLayerCommand(Command):
-    def __init__(self, document: Document, layer: Layer, index: int, name: str = "Add layer") -> None:
+    def __init__(
+        self,
+        document: Document,
+        layer: Layer,
+        index: int,
+        name: str = "Add layer",
+        shared_id: str | None = None,
+    ) -> None:
         self.document = document
         self.layer = layer
         self.index = index
         self.name = name
+        # None edits the page on screen. A shared id edits that group's stack.
+        self.shared_id = shared_id
+
+    def _layers(self) -> list[Layer] | None:
+        return stack_layers(self.document, self.shared_id)
 
     def execute(self) -> None:
-        index = max(0, min(self.index, len(self.document.layers)))
-        self.document.layers.insert(index, self.layer)
+        layers = self._layers()
+        if layers is None:
+            return
+        index = max(0, min(self.index, len(layers)))
+        layers.insert(index, self.layer)
         self.index = index
 
     def undo(self) -> None:
-        if self.index < len(self.document.layers) and self.document.layers[self.index] is self.layer:
-            self.document.layers.pop(self.index)
+        layers = self._layers()
+        if layers is None:
             return
-        self.document.layers = [layer for layer in self.document.layers if layer is not self.layer]
+        if self.index < len(layers) and layers[self.index] is self.layer:
+            layers.pop(self.index)
+            return
+        set_stack_layers(
+            self.document,
+            self.shared_id,
+            [layer for layer in layers if layer is not self.layer],
+        )
 
 
 class DeleteLayersCommand(Command):
@@ -789,52 +915,79 @@ class DeleteLayersCommand(Command):
 
     name = "Delete layer"
 
-    def __init__(self, document: Document, victims: list[Layer]) -> None:
+    def __init__(
+        self,
+        document: Document,
+        victims: list[Layer],
+        shared_id: str | None = None,
+    ) -> None:
         self.document = document
         self.victims = list(victims)
+        self.shared_id = shared_id
         self.slots: list[tuple[int, Layer]] | None = None
 
     def execute(self) -> None:
+        layers = stack_layers(self.document, self.shared_id)
+        if layers is None:
+            return
         if self.slots is None:
             wanted = {id(layer) for layer in self.victims}
             self.slots = [
                 (index, layer)
-                for index, layer in enumerate(self.document.layers)
+                for index, layer in enumerate(layers)
                 if id(layer) in wanted
             ]
         wanted = {id(layer) for layer in self.victims}
-        self.document.layers = [layer for layer in self.document.layers if id(layer) not in wanted]
+        set_stack_layers(
+            self.document,
+            self.shared_id,
+            [layer for layer in layers if id(layer) not in wanted],
+        )
 
     def undo(self) -> None:
         if not self.slots:
             return
+        layers = stack_layers(self.document, self.shared_id)
+        if layers is None:
+            return
         for index, layer in self.slots:
-            self.document.layers.insert(index, layer)
+            layers.insert(index, layer)
 
 
 class DuplicateLayerCommand(Command):
     name = "Duplicate layer"
 
-    def __init__(self, document: Document, index: int) -> None:
+    def __init__(self, document: Document, index: int, shared_id: str | None = None) -> None:
         self.document = document
         self.index = index
+        self.shared_id = shared_id
         self.copy: Layer | None = None
         self.insert_at = index + 1
 
     def execute(self) -> None:
+        layers = stack_layers(self.document, self.shared_id)
+        if layers is None:
+            return
         if self.copy is None:
-            source = self.document.layers[self.index]
+            source = layers[self.index]
             self.copy = source.clone()
             self.copy.name = f"{source.name} copy"
             # A picture copy goes above that picture's masks. A mask copy
             # stays in the same run, on the same picture.
-            self.insert_at = duplicate_slot(self.document.layers, self.index)
-        self.document.layers.insert(self.insert_at, self.copy)
+            self.insert_at = duplicate_slot(layers, self.index)
+        layers.insert(self.insert_at, self.copy)
 
     def undo(self) -> None:
         if self.copy is None:
             return
-        self.document.layers = [layer for layer in self.document.layers if layer is not self.copy]
+        layers = stack_layers(self.document, self.shared_id)
+        if layers is None:
+            return
+        set_stack_layers(
+            self.document,
+            self.shared_id,
+            [layer for layer in layers if layer is not self.copy],
+        )
 
 
 class ReorderStackCommand(Command):
@@ -846,20 +999,29 @@ class ReorderStackCommand(Command):
 
     name = "Reorder layer"
 
-    def __init__(self, document: Document, layers: list[Layer]) -> None:
+    def __init__(
+        self,
+        document: Document,
+        layers: list[Layer],
+        shared_id: str | None = None,
+    ) -> None:
         self.document = document
         self.new_layers = list(layers)
+        self.shared_id = shared_id
         self.old_layers: list[Layer] | None = None
 
     def execute(self) -> None:
+        layers = stack_layers(self.document, self.shared_id)
+        if layers is None:
+            return
         if self.old_layers is None:
-            self.old_layers = list(self.document.layers)
-        self.document.layers = list(self.new_layers)
+            self.old_layers = list(layers)
+        set_stack_layers(self.document, self.shared_id, self.new_layers)
 
     def undo(self) -> None:
         if self.old_layers is None:
             return
-        self.document.layers = list(self.old_layers)
+        set_stack_layers(self.document, self.shared_id, self.old_layers)
 
 
 class SetSelectionCommand(Command):
@@ -937,6 +1099,7 @@ class ReplaceDocumentContent(Command):
         name: str = "Edit",
         dpi: float | None = None,
         guides: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
+        shared_ids: list[str] | None = None,
     ) -> None:
         self.document = document
         self.new_layers = list(layers)
@@ -945,6 +1108,9 @@ class ReplaceDocumentContent(Command):
         self.new_selection = _copy_selection(selection)
         self.new_dpi = None if dpi is None else float(dpi)
         self.new_guides = None if guides is None else (tuple(int(v) for v in guides[0]), tuple(int(v) for v in guides[1]))
+        # None leaves the page's tags alone. A list replaces them. Flatten
+        # passes an empty list so a baked header is not painted a second time.
+        self.new_shared_ids = None if shared_ids is None else list(shared_ids)
         self.name = name
         self.old_layers: list[Layer] | None = None
         self.old_width = 0
@@ -952,6 +1118,7 @@ class ReplaceDocumentContent(Command):
         self.old_selection: Image.Image | None = None
         self.old_dpi: float | None = None
         self.old_guides: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self.old_shared_ids: list[str] | None = None
         self._captured = False
 
     def execute(self) -> None:
@@ -964,11 +1131,15 @@ class ReplaceDocumentContent(Command):
             if self.new_guides is not None:
                 group = self.document.group
                 self.old_guides = (tuple(group.guides_v), tuple(group.guides_h))
+            if self.new_shared_ids is not None:
+                self.old_shared_ids = list(self.document.group.shared_ids)
             self._captured = True
         self.document.layers = list(self.new_layers)
         self.document.width = self.new_width
         self.document.height = self.new_height
         self.document.selection = _copy_selection(self.new_selection)
+        if self.new_shared_ids is not None:
+            self.document.group.shared_ids = list(self.new_shared_ids)
         # Crop and rotate keep the resolution. Image size passes a new one,
         # and undo puts the previous resolution back with the pixels.
         if self.new_dpi is not None:
@@ -989,6 +1160,8 @@ class ReplaceDocumentContent(Command):
         if self.old_guides is not None:
             self.document.group.guides_v = self.old_guides[0]
             self.document.group.guides_h = self.old_guides[1]
+        if self.old_shared_ids is not None:
+            self.document.group.shared_ids = list(self.old_shared_ids)
 
 
 class RenameGroupCommand(Command):
@@ -1011,7 +1184,7 @@ class InsertGroupCommand(Command):
     """Insert a page and show it. Undo returns to the page that was showing."""
 
     document_level = True
-    name = "New group"
+    name = "New page"
 
     def __init__(self, document: Document, group: LayerGroup, index: int) -> None:
         self.document = document
@@ -1043,7 +1216,7 @@ class DeleteGroupCommand(Command):
     """Remove one page. The last page cannot be deleted; the caller checks."""
 
     document_level = True
-    name = "Delete group"
+    name = "Delete page"
 
     def __init__(self, document: Document, group_id: str) -> None:
         self.document = document
@@ -1166,5 +1339,251 @@ class MoveLayersToGroupCommand(Command):
             return
         source.layers = list(self._source_before)
         dest.layers = list(self._dest_before)
+        if self._previous_active and self.document.group_by_id(self._previous_active) is not None:
+            self.document.active_group_id = self._previous_active
+
+
+def _bucket(document: Document, kind: str, bucket_id: str) -> list[Layer] | None:
+    """The layer list for a page or a shared group. Unknown ids return None."""
+    if kind == "page":
+        page = document.group_by_id(bucket_id)
+        return None if page is None else page.layers
+    if kind == "shared":
+        shared = document.shared_by_id(bucket_id)
+        return None if shared is None else shared.layers
+    return None
+
+
+def _set_bucket(document: Document, kind: str, bucket_id: str, layers: list[Layer]) -> None:
+    if kind == "page":
+        page = document.group_by_id(bucket_id)
+        if page is not None:
+            page.layers = list(layers)
+        return
+    if kind == "shared":
+        shared = document.shared_by_id(bucket_id)
+        if shared is not None:
+            shared.layers = list(layers)
+
+
+class InsertSharedGroupCommand(Command):
+    """Add a group and, when asked, tag the page that was showing."""
+
+    document_level = True
+    name = "New group"
+
+    def __init__(
+        self,
+        document: Document,
+        group: SharedGroup,
+        index: int,
+        tag_page_id: str | None = None,
+    ) -> None:
+        self.document = document
+        self.group = group
+        self.index = int(index)
+        self.tag_page_id = tag_page_id
+        self._tagged = False
+
+    def execute(self) -> None:
+        if self.document.shared_by_id(self.group.id) is None:
+            index = max(0, min(self.index, len(self.document.shared_groups)))
+            self.document.shared_groups.insert(index, self.group)
+        self.index = next(
+            index for index, group in enumerate(self.document.shared_groups) if group.id == self.group.id
+        )
+        page = None if self.tag_page_id is None else self.document.group_by_id(self.tag_page_id)
+        if page is not None and self.group.id not in page.shared_ids:
+            page.shared_ids.append(self.group.id)
+            self._tagged = True
+
+    def undo(self) -> None:
+        self.document.shared_groups = [
+            group for group in self.document.shared_groups if group.id != self.group.id
+        ]
+        if self._tagged and self.tag_page_id:
+            page = self.document.group_by_id(self.tag_page_id)
+            if page is not None:
+                page.shared_ids = [group_id for group_id in page.shared_ids if group_id != self.group.id]
+        self._tagged = False
+
+
+class DeleteSharedGroupCommand(Command):
+    """Remove a group and strip its tag from every page. The pages stay."""
+
+    document_level = True
+    name = "Delete group"
+
+    def __init__(self, document: Document, group_id: str) -> None:
+        self.document = document
+        self.group_id = group_id
+        self._group: SharedGroup | None = None
+        self._index = 0
+        self._tags: list[tuple[str, list[str]]] | None = None
+
+    def execute(self) -> None:
+        if self._group is None:
+            self._index = next(
+                index for index, group in enumerate(self.document.shared_groups) if group.id == self.group_id
+            )
+            self._group = self.document.shared_groups[self._index]
+            self._tags = [(page.id, list(page.shared_ids)) for page in self.document.groups]
+        self.document.shared_groups = [
+            group for group in self.document.shared_groups if group.id != self.group_id
+        ]
+        for page in self.document.groups:
+            page.shared_ids = [group_id for group_id in page.shared_ids if group_id != self.group_id]
+
+    def undo(self) -> None:
+        if self._group is None:
+            return
+        index = max(0, min(self._index, len(self.document.shared_groups)))
+        self.document.shared_groups.insert(index, self._group)
+        saved = {page_id: tags for page_id, tags in self._tags or []}
+        for page in self.document.groups:
+            if page.id in saved:
+                page.shared_ids = list(saved[page.id])
+
+
+class ReorderSharedGroupsCommand(Command):
+    """Catalog order in the layer list. Paint order stays on each page."""
+
+    document_level = True
+    name = "Reorder groups"
+
+    def __init__(self, document: Document, ordered_ids: list[str]) -> None:
+        self.document = document
+        self.new_ids = list(ordered_ids)
+        self.old_ids: list[str] | None = None
+
+    def execute(self) -> None:
+        if self.old_ids is None:
+            self.old_ids = [group.id for group in self.document.shared_groups]
+        self._apply(self.new_ids)
+
+    def undo(self) -> None:
+        if self.old_ids is None:
+            return
+        self._apply(self.old_ids)
+
+    def _apply(self, ordered_ids: list[str]) -> None:
+        by_id = {group.id: group for group in self.document.shared_groups}
+        if set(ordered_ids) != set(by_id) or len(ordered_ids) != len(by_id):
+            return
+        self.document.shared_groups = [by_id[group_id] for group_id in ordered_ids]
+
+
+class SetPageTagsCommand(Command):
+    """Replace the tags on these pages. Order in each list is paint order."""
+
+    document_level = True
+    name = "Tag pages"
+
+    def __init__(self, document: Document, updates: list[tuple[str, list[str]]]) -> None:
+        self.document = document
+        self.updates = [(page_id, list(tags)) for page_id, tags in updates]
+        self._old: list[tuple[str, list[str]]] | None = None
+
+    def execute(self) -> None:
+        if self._old is None:
+            self._old = []
+            for page_id, _tags in self.updates:
+                page = self.document.group_by_id(page_id)
+                if page is not None:
+                    self._old.append((page_id, list(page.shared_ids)))
+        self._write(self.updates)
+
+    def undo(self) -> None:
+        if self._old is None:
+            return
+        self._write(self._old)
+
+    def _write(self, updates: list[tuple[str, list[str]]]) -> None:
+        for page_id, tags in updates:
+            page = self.document.group_by_id(page_id)
+            if page is None:
+                continue
+            seen: set[str] = set()
+            cleaned: list[str] = []
+            for tag in tags:
+                if tag in seen:
+                    continue
+                seen.add(tag)
+                cleaned.append(tag)
+            page.shared_ids = cleaned
+
+
+class TransferLayersCommand(Command):
+    """Move pictures, and the masks that filter them, between a page and a group.
+
+    ``kind`` is ``page`` or ``shared``. The destination is shown when it is a
+    page. Undo puts the same layer objects back.
+    """
+
+    document_level = True
+    name = "Move layers"
+
+    def __init__(
+        self,
+        document: Document,
+        source_kind: str,
+        source_id: str,
+        dest_kind: str,
+        dest_id: str,
+        layer_ids: list[str],
+        dest_index: int,
+    ) -> None:
+        self.document = document
+        self.source_kind = source_kind
+        self.source_id = source_id
+        self.dest_kind = dest_kind
+        self.dest_id = dest_id
+        self.layer_ids = list(layer_ids)
+        self.dest_index = int(dest_index)
+        self._moving: list[Layer] = []
+        self._source_before: list[Layer] | None = None
+        self._dest_before: list[Layer] | None = None
+        self._previous_active: str | None = None
+        self._captured = False
+
+    def execute(self) -> None:
+        source = _bucket(self.document, self.source_kind, self.source_id)
+        dest = _bucket(self.document, self.dest_kind, self.dest_id)
+        if source is None or dest is None or source is dest:
+            return
+        if not self._captured:
+            self._moving = layers_leaving(source, self.layer_ids)
+            self._source_before = list(source)
+            self._dest_before = list(dest)
+            self._previous_active = self.document.active_group_id
+            self._captured = True
+        if not self._moving:
+            return
+        moving_ids = {id(layer) for layer in self._moving}
+        _set_bucket(
+            self.document,
+            self.source_kind,
+            self.source_id,
+            [layer for layer in source if id(layer) not in moving_ids],
+        )
+        dest_now = _bucket(self.document, self.dest_kind, self.dest_id)
+        if dest_now is None:
+            return
+        kept = [layer for layer in dest_now if id(layer) not in moving_ids]
+        index = max(0, min(self.dest_index, len(kept)))
+        _set_bucket(
+            self.document,
+            self.dest_kind,
+            self.dest_id,
+            kept[:index] + list(self._moving) + kept[index:],
+        )
+        if self.dest_kind == "page":
+            self.document.active_group_id = self.dest_id
+
+    def undo(self) -> None:
+        if self._source_before is None or self._dest_before is None:
+            return
+        _set_bucket(self.document, self.source_kind, self.source_id, self._source_before)
+        _set_bucket(self.document, self.dest_kind, self.dest_id, self._dest_before)
         if self._previous_active and self.document.group_by_id(self._previous_active) is not None:
             self.document.active_group_id = self._previous_active

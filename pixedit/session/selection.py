@@ -192,8 +192,9 @@ class SelectionMixin:
             return
         pixels, x0, y0 = cropped
         placed = raster_layer(f"{layer.name} copy", Image.fromarray(pixels, "RGBA"), layer.x + x0, layer.y + y0)
-        index = len(self.document.layers) if self.layer_index < 0 else self.layer_index + 1
-        index = slot_above_block(self.document.layers, index)
+        stack = self._stack()
+        index = len(stack) if self.layer_index < 0 else self.layer_index + 1
+        index = slot_above_block(stack, index)
         name = "Cut selection" if clear else "Copy selection"
         commands: list[Any] = []
         if clear:
@@ -218,7 +219,9 @@ class SelectionMixin:
             if not full:
                 tighten_raster_layer(scratch)
             commands.append(MutateLayerCommand(layer, visual_state(scratch), old_state=before, name=name))
-        commands.append(InsertLayerCommand(self.document, placed, index, name=name))
+        commands.append(
+            InsertLayerCommand(self.document, placed, index, name=name, shared_id=self._editing_shared_id())
+        )
         self.commit(CompoundCommand(commands, name))
         self.layer_index = index
         verb = "Cut" if clear else "Copied"

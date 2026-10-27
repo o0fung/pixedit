@@ -57,7 +57,7 @@ def render_frames(document: Document) -> list[Image.Image]:
     """
     kind = frame_kind(document)
     if kind == "pages":
-        return [composite_group(group) for group in document.groups]
+        return [composite_group(group, document.shared_groups) for group in document.groups]
     if kind != "layers":
         return []
     pictures = [layer for layer in document.layers if layer.kind != "redaction"]

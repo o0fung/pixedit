@@ -240,9 +240,14 @@ def apply_redaction(
     return (effect * mix + canvas * (1.0 - mix)).astype(np.float32)
 
 
+def _stack(document: Document) -> list[Layer]:
+    """The page on screen, then the groups it is tagged with."""
+    return document.composited_layers()
+
+
 def shows_redaction(document: Document) -> bool:
     """A visible mask layer. The zoomed-out view cache does not downsample one."""
-    return any(layer.visible and layer.opacity > 0 and layer.kind == "redaction" for layer in document.layers)
+    return any(layer.visible and layer.opacity > 0 and layer.kind == "redaction" for layer in _stack(document))
 
 
 def redaction_padding(document: Document) -> int | None:
@@ -253,7 +258,7 @@ def redaction_padding(document: Document) -> int | None:
     dim, invert, and desaturate are per pixel and need no padding.
     """
     pad = 0
-    for layer in document.layers:
+    for layer in _stack(document):
         if layer.kind != "redaction" or not layer.visible or layer.opacity <= 0:
             continue
         info = layer.redaction
@@ -272,7 +277,7 @@ def redaction_padding(document: Document) -> int | None:
 
 def _pixelate_block(document: Document) -> int:
     block = 1
-    for layer in document.layers:
+    for layer in _stack(document):
         if layer.kind != "redaction" or not layer.visible or layer.opacity <= 0:
             continue
         info = layer.redaction
@@ -321,14 +326,15 @@ def _composite_opaque(document: Document) -> Image.Image | None:
     Those stay on the float path so partial opacity does not change.
     """
     prepared: list[tuple[Layer, np.ndarray]] = []
-    for layer in document.layers:
+    layers = _stack(document)
+    for layer in layers:
         if layer.kind == "redaction":
             if layer.visible and layer.opacity > 0:
                 return None
             continue
         if not layer.visible or layer.opacity <= 0:
             continue
-        if any(mask.visible and mask.opacity > 0 for mask in masks_for(document.layers, layer)):
+        if any(mask.visible and mask.opacity > 0 for mask in masks_for(layers, layer)):
             return None
         pixels = _opaque_pixels(layer)
         if pixels is None:
@@ -502,7 +508,7 @@ def composite_view(
     out_w = _view_size(span_x, scale)
     out_h = _view_size(span_y, scale)
     canvas = np.zeros((out_h, out_w, 4), dtype=np.float32)
-    for layer in document.layers:
+    for layer in _stack(document):
         if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
             continue
         _blit_scaled(canvas, layer, x0, y0, x1, y1)
@@ -536,7 +542,7 @@ def composite_region(document: Document, box: tuple[int, int, int, int]) -> Imag
     if ex1 <= ex0 or ey1 <= ey0:
         return Image.new("RGBA", (max(1, x1 - x0), max(1, y1 - y0)), (0, 0, 0, 0))
     canvas = np.zeros((ey1 - ey0, ex1 - ex0, 4), dtype=np.float32)
-    layers = document.layers
+    layers = _stack(document)
     for layer in layers:
         if layer.kind == "redaction" or not layer.visible or layer.opacity <= 0:
             continue
@@ -566,7 +572,7 @@ def composite(document: Document) -> Image.Image:
     if fast is not None:
         return fast
     canvas = _borrow_float("canvas", document.height, document.width)
-    layers = document.layers
+    layers = _stack(document)
     for layer in layers:
         if layer.kind == "redaction":
             continue
@@ -588,20 +594,32 @@ def composite_over(document: Document, background: tuple[int, int, int, int]) ->
     return Image.alpha_composite(base, flat)
 
 
-def composite_group(group: LayerGroup) -> Image.Image:
-    """Flatten one page without changing which page the document is showing."""
+def composite_group(
+    group: LayerGroup,
+    shared_groups: list | None = None,
+) -> Image.Image:
+    """Flatten one page without changing which page the document is showing.
+
+    ``shared_groups`` are the document's tags. The page's ``shared_ids`` pick
+    which of them are painted on top of its own layers.
+    """
     document = Document(
         width=group.width,
         height=group.height,
         groups=[group],
         active_group_id=group.id,
+        shared_groups=list(shared_groups or []),
     )
     return composite(document)
 
 
-def composite_group_over(group: LayerGroup, background: tuple[int, int, int, int]) -> Image.Image:
+def composite_group_over(
+    group: LayerGroup,
+    background: tuple[int, int, int, int],
+    shared_groups: list | None = None,
+) -> Image.Image:
     """Flatten one page onto a solid background."""
-    flat = composite_group(group)
+    flat = composite_group(group, shared_groups)
     base = Image.new("RGBA", flat.size, background)
     return Image.alpha_composite(base, flat)
 

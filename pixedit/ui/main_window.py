@@ -423,8 +423,11 @@ class MainWindow(QMainWindow):
         self._action(image_menu, "Invert", lambda: self.session.run_filter("Invert", invert))
 
         self._action(layer_menu, "New layer", self.session.add_blank_layer, QKeySequence("Ctrl+Shift+N"))
-        self._action(layer_menu, "New group", self.session.add_group)
-        self._action(layer_menu, "Delete group", self.session.delete_active_group)
+        self._action(layer_menu, "New page", self.session.add_group)
+        self._action(layer_menu, "Delete page", self.session.delete_active_group)
+        self._action(layer_menu, "New group", self.session.add_shared_group)
+        self._action(layer_menu, "Delete group", self._delete_shared_group)
+        self._action(layer_menu, "Tag pages", self._tag_pages)
         self._action(layer_menu, "Place image…", self._place)
         self._action(layer_menu, "Duplicate", self.session.duplicate_active, QKeySequence("Ctrl+J"))
         self._action(layer_menu, "Delete", self.session.delete_active)
@@ -991,7 +994,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
         if Path(path).suffix.lower() == ".pdf":
-            self.session.place_groups(incoming.groups)
+            self.session.place_groups(incoming.groups, incoming.shared_groups)
         else:
             self.session.place_layers(incoming.layers)
 
@@ -1084,6 +1087,20 @@ class MainWindow(QMainWindow):
 
     def _rename_layer(self) -> None:
         self.layers.rename_selection()
+
+    def _delete_shared_group(self) -> None:
+        """Delete the group selected in the layer list, or the one being edited."""
+        selected = list(self.layers._selected_shared)
+        if not selected and self.session._shared_id:
+            selected = [self.session._shared_id]
+        if not selected:
+            self.session.show_message("Select a group to delete.")
+            return
+        self.session.delete_shared_groups(selected)
+
+    def _tag_pages(self) -> None:
+        """Tag the selected pages with the selected group, or remove that tag."""
+        self.layers.tag_selection()
 
     def _scale_layer(self) -> None:
         if not self.session.require_page():
@@ -1222,7 +1239,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
         apply_pix_group_names(incoming.groups, path)
-        self.session.place_groups(incoming.groups)
+        self.session.place_groups(incoming.groups, incoming.shared_groups)
 
     def _toggle_play(self) -> None:
         if self._playing:

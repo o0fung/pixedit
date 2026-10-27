@@ -4,11 +4,11 @@ PixEdit is a layered desktop image editor. Launch it with `pix`, or with `python
 
 ## Open
 
-PNG, JPEG, WebP, TIFF, BMP, GIF, and PDF. Multi-frame GIF and TIFF become one layer per frame, and only the first frame starts visible. A multi-page PDF is rendered at 72, 144, or 216 DPI, one layer per page. A `.pix` project opens with its layers, masks, and selection.
+PNG, JPEG, WebP, TIFF, BMP, GIF, and PDF. A still image is one page. Multi-frame GIF and TIFF become one page per frame, tagged with one group. A multi-page PDF is rendered at 72, 144, or 216 DPI, one page per PDF page, tagged with one group. A group's layers, such as a header or footer, are drawn on every page with that tag. A `.pix` project opens with its pages, groups, masks, and selection.
 
 ## Save and export
 
-Save writes a `.pix` project: a zip of the layer stack, masks, and the selection. Opening a PNG does not overwrite that file on Save. Use Export for a flattened PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF. JPEG, BMP, GIF, and PDF are composited on white.
+Save writes a `.pix` project: a zip of the pages, shared groups, masks, and the selection. Opening a PNG does not overwrite that file on Save. Use Export for a flattened PNG, JPEG, WebP, TIFF, BMP, GIF, or PDF. JPEG, BMP, GIF, and PDF are composited on white. PDF and animated GIF include each page's group layers.
 
 ## Output folder
 
