@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 
 from pixedit.geom import (
+    _corner_of,
     _orbit_point,
+    _place_from_corner,
     clip_box,
     hit_layer,
     layer_union_bounds,
@@ -21,6 +23,7 @@ from pixedit.model import (
     apply_visual,
     visual_state,
 )
+from pixedit.proxy import DragProxy, flatten_for_drag
 from pixedit.tools.base import (
     Overlay,
     PointerEvent,
@@ -76,6 +79,11 @@ class TransformTool(Tool):
         self._start_angle = 0.0
         self._angle = 0.0
         self._start_box: tuple[float, float, float, float] | None = None
+        # Set for a large picture. The layer itself stays full resolution
+        # until the handle is released.
+        self._stand_in: DragProxy | None = None
+        self._live_box: tuple[float, float, float, float] | None = None
+        self._proxy_active = False
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         # The layers already selected are the only ones that move. Where the
@@ -145,9 +153,25 @@ class TransformTool(Tool):
             self._start_angle = math.degrees(
                 math.atan2(event.y - (y + height / 2.0), event.x - (x + width / 2.0))
             )
+        # One screen-sized flatten. Move and scale draw it; release resamples.
+        self._stand_in = flatten_for_drag(layers, session.document.layers, self._start_box, event.zoom)
+        self._live_box = self._start_box
+        self._proxy_active = False
+
+    def drag_proxy(self) -> DragProxy | None:
+        """The stand-in the canvas draws, or None when this drag resamples."""
+        if not self._proxy_active:
+            return None
+        return self._stand_in
 
     def pointer_move(self, session, event: PointerEvent) -> None:
         if self._mode is None or not self._starts or self._start_box is None:
+            return
+        if self._stand_in is not None:
+            # The bitmap stays at full resolution. The canvas moves the flatten.
+            self._proxy_active = True
+            self._place_stand_in(session, event)
+            session.notify("overlay")
             return
         self._apply(session, event, final=False)
         rows = self._rows(session, self._ids, self._starts, self._origins)
@@ -170,13 +194,31 @@ class TransformTool(Tool):
             )
         return box
 
-    def _scale_group(
-        self,
-        rows: list[tuple[Layer, dict, tuple[int, int]]],
-        event: PointerEvent,
-        *,
-        final: bool,
-    ) -> None:
+    def _move_delta(self, session, event: PointerEvent) -> tuple[float, float]:
+        dx = event.x - self._start_mouse[0]
+        dy = event.y - self._start_mouse[1]
+        group = session.document.group
+        return snap_delta(
+            dx,
+            dy,
+            self._start_box,
+            group.guides_v,
+            group.guides_h,
+            bool(session.option("snap", True)),
+        )
+
+    def _scale_event(self, session, event: PointerEvent) -> PointerEvent:
+        group = session.document.group
+        sx, sy = snap_point(
+            event.x,
+            event.y,
+            group.guides_v,
+            group.guides_h,
+            bool(session.option("snap", True)),
+        )
+        return PointerEvent(sx, sy, event.shift, event.alt, event.ctrl, event.button, event.zoom)
+
+    def _scale_factors(self, event: PointerEvent) -> tuple[float, float]:
         assert self._start_box is not None
         box = self._start_box
         _left, _top, width, height = size_from_anchor(
@@ -187,8 +229,59 @@ class TransformTool(Tool):
         )
         new_w = max(1, int(round(width)))
         new_h = max(1, int(round(height)))
-        scale_x = new_w / max(box[2], 1e-6)
-        scale_y = new_h / max(box[3], 1e-6)
+        return new_w / max(box[2], 1e-6), new_h / max(box[3], 1e-6)
+
+    def _scaled_union(self, event: PointerEvent) -> tuple[int, int, int, int]:
+        """Where the mouse-down box lands. Same corner math as one layer."""
+        assert self._start_box is not None
+        box = self._start_box
+        scale_x, scale_y = self._scale_factors(event)
+        target_w = max(1, int(round(box[2] * scale_x)))
+        target_h = max(1, int(round(box[3] * scale_y)))
+        corner = _corner_of(box[0], box[1], box[2], box[3], self._anchor_name)
+        ax, ay = self._anchor
+        mapped = (ax + (corner[0] - ax) * scale_x, ay + (corner[1] - ay) * scale_y)
+        return _place_from_corner(self._anchor_name, mapped, target_w, target_h) + (target_w, target_h)
+
+    def _turn_delta(self, event: PointerEvent) -> float:
+        assert self._start_box is not None
+        x, y, width, height = self._start_box
+        cx = x + width / 2.0
+        cy = y + height / 2.0
+        angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
+        # Screen Y grows downward, so atan2 increases clockwise. Wrap so the
+        # gesture doesn't jump at ±180.
+        return (angle - self._start_angle + 180.0) % 360.0 - 180.0
+
+    def _place_stand_in(self, session, event: PointerEvent) -> None:
+        """Move the flatten. The layer bitmaps are not touched."""
+        assert self._stand_in is not None and self._start_box is not None
+        if self._mode == "move":
+            dx, dy = self._move_delta(session, event)
+            x, y, width, height = self._start_box
+            # One translation for the whole flatten. Integer origins share it
+            # except exactly on a half pixel, which the release resolves per layer.
+            ix = int(round(x + dx)) - int(round(x))
+            iy = int(round(y + dy)) - int(round(y))
+            self._stand_in.live_box = (x + ix, y + iy, width, height)
+            self._stand_in.angle = 0.0
+        elif self._mode in _FIXED:
+            placed = self._scaled_union(self._scale_event(session, event))
+            self._stand_in.live_box = placed
+            self._stand_in.angle = 0.0
+        elif self._mode == "rot":
+            self._stand_in.live_box = self._start_box
+            self._stand_in.angle = self._turn_delta(event)
+        self._live_box = self._stand_in.live_box
+
+    def _scale_group(
+        self,
+        rows: list[tuple[Layer, dict, tuple[int, int]]],
+        event: PointerEvent,
+        *,
+        final: bool,
+    ) -> None:
+        scale_x, scale_y = self._scale_factors(event)
         for layer, start, _origin in rows:
             apply_visual(
                 layer,
@@ -212,16 +305,11 @@ class TransformTool(Tool):
     ) -> None:
         assert self._start_box is not None
         x, y, width, height = self._start_box
-        cx = x + width / 2.0
-        cy = y + height / 2.0
-        angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
-        # Screen Y grows downward, so atan2 increases clockwise. Wrap so the
-        # gesture doesn't jump at ±180. Same rule as a single layer.
         # The frame turns by this angle and ignores the bitmap bounds, which
         # grow into a straight box as the rectangle turns.
-        delta = (angle - self._start_angle + 180.0) % 360.0 - 180.0
+        delta = self._turn_delta(event)
         self._angle = delta
-        center = (cx, cy)
+        center = (x + width / 2.0, y + height / 2.0)
         for layer, start, _origin in rows:
             apply_visual(layer, rotate_visual_around(start, delta, center, zoom=event.zoom, final=final))
 
@@ -229,31 +317,12 @@ class TransformTool(Tool):
         """Move, scale, or rotate. ``final`` resamples at full resolution."""
         rows = self._rows(session, self._ids, self._starts, self._origins)
         if self._mode == "move":
-            dx = event.x - self._start_mouse[0]
-            dy = event.y - self._start_mouse[1]
-            group = session.document.group
-            dx, dy = snap_delta(
-                dx,
-                dy,
-                self._start_box,
-                group.guides_v,
-                group.guides_h,
-                bool(session.option("snap", True)),
-            )
+            dx, dy = self._move_delta(session, event)
             for layer, _start, origin in rows:
                 layer.x = int(round(origin[0] + dx))
                 layer.y = int(round(origin[1] + dy))
         elif self._mode in _FIXED:
-            group = session.document.group
-            sx, sy = snap_point(
-                event.x,
-                event.y,
-                group.guides_v,
-                group.guides_h,
-                bool(session.option("snap", True)),
-            )
-            snapped = PointerEvent(sx, sy, event.shift, event.alt, event.ctrl, event.button, event.zoom)
-            self._scale_group(rows, snapped, final=final)
+            self._scale_group(rows, self._scale_event(session, event), final=final)
         elif self._mode == "rot":
             self._rotate_group(rows, event, final=final)
 
@@ -266,36 +335,46 @@ class TransformTool(Tool):
         origins = list(self._origins)
         moved = math.hypot(event.x - self._start_mouse[0], event.y - self._start_mouse[1])
         if moved < 0.5:
-            rows = self._rows(session, ids, starts, origins)
-            for layer, start, _origin in rows:
-                apply_visual(layer, start)
+            # A large drag never wrote the layer, so there is nothing to copy back.
+            if self._stand_in is None:
+                rows = self._rows(session, ids, starts, origins)
+                for layer, start, _origin in rows:
+                    apply_visual(layer, start)
             self._clear()
             session.preview()
             return
-        # The drag showed a stand-in when the layer was large. Release writes
-        # the Lanczos or bicubic pixels that get stored.
+        # The drag showed a stand-in when the picture was large. Release writes
+        # the Lanczos or bicubic pixels, or the integer position for a move.
+        showed_proxy = self._proxy_active
         self._apply(session, event, final=True)
         self._clear()
         rows = self._rows(session, ids, starts, origins)
+        before = len(session.history.undo_stack)
         if mode == "move":
             session.commit_layer_moves(
                 [(layer, layer.x, layer.y, origin[0], origin[1]) for layer, _start, origin in rows]
             )
-            return
-        session.commit_layer_visuals(
-            [(layer, visual_state(layer), start) for layer, start, _origin in rows],
-            "Transform",
-        )
+        else:
+            session.commit_layer_visuals(
+                [(layer, visual_state(layer), start) for layer, start, _origin in rows],
+                "Transform",
+            )
+        # A move that lands on the same pixel commits nothing, so the canvas
+        # would keep painting the stand-in. The cached picture is still correct.
+        if showed_proxy and len(session.history.undo_stack) == before:
+            session.notify("overlay")
 
     def pointer_cancel(self, session) -> bool:
         # A click that misses clears the mode but leaves the snapshots, so
         # Escape can still put a half-finished drag back.
         active = bool(self._starts)
-        if active:
+        if active and self._stand_in is None:
             for layer, start, _origin in self._rows(session, self._ids, self._starts, self._origins):
                 apply_visual(layer, start)
-            session.preview()
+        # Drop the stand-in before the repaint, or the canvas would keep drawing it.
         self._clear()
+        if active:
+            session.preview()
         return active
 
     def overlays(self, session) -> list[Overlay]:
@@ -307,7 +386,11 @@ class TransformTool(Tool):
         # mouse-down size and only rotates, so the handle stays with the cursor.
         if self._mode == "rot" and self._start_box is not None:
             return [self._rotated_overlay(self._start_box, self._angle, zoom)]
-        box = layer_union_bounds(layers)
+        # The stored bounds have not moved yet. The frame follows the flatten.
+        if self._proxy_active and self._live_box is not None:
+            box = self._live_box
+        else:
+            box = layer_union_bounds(layers)
         points = self._handle_points(box, zoom)
         x, y, width, height = box
         handles = [(name, px, py) for name, (px, py) in points.items()]
@@ -413,3 +496,6 @@ class TransformTool(Tool):
         self._origins = []
         self._start_box = None
         self._angle = 0.0
+        self._stand_in = None
+        self._live_box = None
+        self._proxy_active = False

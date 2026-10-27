@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from pixedit.composite import composite, composite_region, composite_view, redaction_padding, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
+from pixedit.model import Document, mask_target
 from pixedit.proxy import PREVIEW_MAX_EDGE
 from pixedit.tools.base import PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
@@ -114,6 +115,14 @@ class CanvasView(QWidget):
         self._pixmap_mode = "full"
         self._view_box: tuple[float, float, float, float] | None = None
         self._view_key: tuple | None = None
+        # Plates for a transform drag. Built once, then the stand-in moves on top.
+        self._drag_plates_key = None
+        self._drag_below: QPixmap | None = None
+        self._drag_above: QPixmap | None = None
+        self._drag_sprite: QPixmap | None = None
+        self._drag_selection: QPixmap | None = None
+        self._drag_plate_mode = "full"
+        self._drag_view_box: tuple[float, float, float, float] | None = None
         self._view_group_id = session.document.active_group_id
         # Zoom and pan for pages already visited. The first visit of a page fits it.
         self._group_views: dict[str, tuple[float, float, float]] = {}
@@ -410,7 +419,6 @@ class CanvasView(QWidget):
             self._apply_letterbox()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#101318"))
-        self._ensure_pixmap()
         ruler = self.ruler()
         doc = self.session.document
         target = QRectF(
@@ -421,9 +429,18 @@ class CanvasView(QWidget):
         )
         painter.setClipRect(ruler, ruler, max(0, self.width() - ruler), max(0, self.height() - ruler))
         self._paint_checker(painter, target)
-        if self._using_pan_proxy():
+        # Transform drag and pan/scrub each keep their own stand-in. The sharp
+        # cache is rebuilt only when neither preview is on screen.
+        proxy = self._transform_proxy()
+        if proxy is not None:
+            # The photo stays in the cached pixmap. This paint draws the plates
+            # around it and the low-resolution flatten, and does not resample.
+            self._paint_transform_proxy(painter, target, proxy)
+        elif self._using_pan_proxy():
             self._paint_pan_proxy(painter, target)
         else:
+            self._clear_drag_plates()
+            self._ensure_pixmap()
             dest = self._pixmap_dest(target)
             if self._pixmap is not None and not self._pixmap.isNull():
                 painter.drawPixmap(dest, self._pixmap, QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
@@ -643,6 +660,142 @@ class CanvasView(QWidget):
             (x1 - x0) * self.zoom,
             (y1 - y0) * self.zoom,
         )
+
+    def _transform_proxy(self):
+        tool = self.tool_getter()
+        if tool is None:
+            return None
+        drag_proxy = getattr(tool, "drag_proxy", None)
+        if drag_proxy is None:
+            return None
+        return drag_proxy()
+
+    def _clear_drag_plates(self) -> None:
+        if self._drag_plates_key is None and self._drag_sprite is None:
+            return
+        self._drag_plates_key = None
+        self._drag_below = None
+        self._drag_above = None
+        self._drag_sprite = None
+        self._drag_selection = None
+        self._drag_plate_mode = "full"
+        self._drag_view_box = None
+
+    def _ensure_drag_plates(self, proxy) -> None:
+        """Flatten what sits under and over the selection, once per gesture.
+
+        The stand-in is drawn between those plates. A later move only changes
+        where that pixmap goes, so the document composite stays cached.
+        """
+        use_view = self._use_view_cache()
+        view_box = self._visible_document_box() if use_view else None
+        if use_view and view_box is None:
+            use_view = False
+        doc = self.session.document
+        selection = doc.selection
+        if use_view:
+            view_key: tuple = ("view", self._current_view_key())
+        else:
+            view_key = ("full", doc.width, doc.height)
+        key = (proxy.layer_ids, id(proxy.image), id(selection) if selection is not None else None, view_key)
+        if key == self._drag_plates_key:
+            return
+        self._drag_plate_mode = "view" if use_view else "full"
+        self._drag_view_box = view_box if use_view else None
+        below, above = _split_around_selection(doc.layers, set(proxy.layer_ids))
+        self._drag_below = self._plate_pixmap(below, use_view, view_box)
+        self._drag_above = self._plate_pixmap(above, use_view, view_box)
+        self._drag_sprite = pil_to_pixmap(proxy.image)
+        self._drag_selection = self._selection_plate(selection, use_view, view_box)
+        self._drag_plates_key = key
+
+    def _plate_pixmap(self, layers: list, use_view: bool, view_box) -> QPixmap | None:
+        doc = self.session.document
+        members = _plate_members(doc.layers, layers)
+        if not any(layer.visible and layer.opacity > 0 and layer.kind != "redaction" for layer in members):
+            return None
+        temp = Document(doc.width, doc.height, members)
+        if use_view and view_box is not None:
+            image = composite_view(temp, view_box, self._view_scale())
+        else:
+            image = composite(temp)
+        return pil_to_pixmap(image)
+
+    def _selection_plate(self, selection, use_view: bool, view_box) -> QPixmap | None:
+        if selection is None:
+            return None
+        if use_view and view_box is not None:
+            x0, y0, x1, y1 = view_box
+            scale = self._view_scale()
+            image = _view_selection_tint(
+                selection,
+                view_box,
+                _span_pixels(x1 - x0, scale),
+                _span_pixels(y1 - y0, scale),
+            )
+        else:
+            image = _selection_tint(selection)
+        return pil_to_pixmap(image)
+
+    def _plate_dest(self, full_target: QRectF) -> QRectF:
+        if self._drag_plate_mode != "view" or self._drag_view_box is None:
+            return full_target
+        x0, y0, x1, y1 = self._drag_view_box
+        ruler = self.ruler()
+        return QRectF(
+            ruler + self.offset_x + x0 * self.zoom,
+            ruler + self.offset_y + y0 * self.zoom,
+            (x1 - x0) * self.zoom,
+            (y1 - y0) * self.zoom,
+        )
+
+    def _paint_plate(self, painter: QPainter, target: QRectF, pixmap: QPixmap | None) -> None:
+        if pixmap is None or pixmap.isNull():
+            return
+        painter.drawPixmap(
+            self._plate_dest(target),
+            pixmap,
+            QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
+
+    def _paint_stand_in(self, painter: QPainter, proxy) -> None:
+        pixmap = self._drag_sprite
+        if pixmap is None or pixmap.isNull():
+            return
+        ruler = self.ruler()
+        painter.save()
+        painter.translate(ruler + self.offset_x, ruler + self.offset_y)
+        painter.scale(self.zoom, self.zoom)
+        # Qt rotates clockwise, which is the same direction as the tool angle.
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        rect = proxy.live_box
+        if proxy.angle:
+            x, y, width, height = proxy.box
+            cx = x + width / 2.0
+            cy = y + height / 2.0
+            painter.translate(cx, cy)
+            painter.rotate(proxy.angle)
+            painter.translate(-cx, -cy)
+            rect = proxy.box
+        painter.drawPixmap(
+            QRectF(rect[0], rect[1], rect[2], rect[3]),
+            pixmap,
+            QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
+        painter.restore()
+
+    def _paint_transform_proxy(self, painter: QPainter, target: QRectF, proxy) -> None:
+        self._ensure_drag_plates(proxy)
+        # Keep the flatten inside the page. Handles are drawn later and may
+        # sit above the top edge, so this clip does not cover them.
+        painter.save()
+        painter.setClipRect(target, Qt.ClipOperation.IntersectClip)
+        self._paint_plate(painter, target, self._drag_below)
+        self._paint_stand_in(painter, proxy)
+        self._paint_plate(painter, target, self._drag_above)
+        self._paint_plate(painter, target, self._drag_selection)
+        painter.restore()
+        self._sync_ants(self.session.document.selection)
 
     def _sync_selection_chrome(self) -> None:
         selection = self.session.document.selection
@@ -1349,6 +1502,50 @@ class CanvasView(QWidget):
     def _is_hand(self) -> bool:
         tool = self.tool_getter()
         return tool is not None and tool.id == "hand"
+
+
+def _span_pixels(span: float, scale: float) -> int:
+    """Screen pixels covering ``span`` document pixels, never above one per source pixel.
+
+    Matches ``composite._view_size`` so a view-sized selection tint lines up
+    with the plates.
+    """
+    if span <= 0 or scale <= 0:
+        return 1
+    return max(1, min(int(math.ceil(span)), int(round(span * scale))))
+
+
+def _split_around_selection(layers: list, selected_ids: set[str]) -> tuple[list, list]:
+    """Pictures under the selection, and pictures over it.
+
+    A layer sitting between two selected layers stays on the lower plate, so
+    it does not move with the drag and paints under the whole selection until
+    the handle is released.
+    """
+    indexes = [index for index, layer in enumerate(layers) if layer.id in selected_ids]
+    if not indexes:
+        return [], []
+    hi = max(indexes)
+    below = [layer for layer in layers[: hi + 1] if layer.id not in selected_ids]
+    above = [layer for layer in layers[hi + 1 :] if layer.id not in selected_ids]
+    return below, above
+
+
+def _plate_members(all_layers: list, plate_layers: list) -> list:
+    """``plate_layers`` plus the masks that filter them, in stack order.
+
+    A mask that lives on the other side of the selection still belongs to its
+    picture. Leaving it on the opposite plate would attach it to the wrong layer.
+    """
+    content_ids = {layer.id for layer in plate_layers if layer.kind != "redaction"}
+    wanted = set(content_ids)
+    for layer in all_layers:
+        if layer.kind != "redaction":
+            continue
+        owner = mask_target(all_layers, layer)
+        if owner is not None and owner.id in content_ids:
+            wanted.add(layer.id)
+    return [layer for layer in all_layers if layer.id in wanted]
 
 
 def _clip_document_box(

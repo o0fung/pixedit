@@ -2,13 +2,16 @@
 
 The stored pixels stay full resolution. A live grade, resample, or gradient
 runs on a screen-sized stand-in when the layer is large, and the release
-computes the real bitmap once. A picture that already fits on screen is left
-alone, so a small edit stays exact the whole way through.
+computes the real bitmap once. A transform drag flattens the selected layers
+into one of those stand-ins so the canvas can move it without rebuilding the
+document. A picture that already fits on screen is left alone, so a small
+edit stays exact the whole way through.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from PIL import Image
 
@@ -148,6 +151,120 @@ def set_preview_source(layer, image: Image.Image | None) -> None:
             delattr(layer, "preview_source")
         return
     layer.preview_source = image
+
+
+@dataclass
+class DragProxy:
+    """Low-resolution flatten of the layers a transform drag is moving.
+
+    ``image`` covers ``box`` (x, y, width, height) in document pixels at
+    mouse-down. ``live_box`` is where that picture is drawn for a move or a
+    scale. Rotation leaves ``live_box`` on ``box`` and sets ``angle`` in
+    clockwise degrees. ``layer_ids`` stay out of the plates drawn under and
+    over the stand-in, so the sharp composite is not rebuilt on each move.
+    """
+
+    image: Image.Image
+    box: tuple[float, float, float, float]
+    layer_ids: tuple[str, ...]
+    live_box: tuple[float, float, float, float]
+    angle: float = 0.0
+
+
+def _drag_keeps_full_resample(layers: list, stack: list) -> bool:
+    """True when a flattened stand-in would not match the release.
+
+    A mask is resized with the picture, and blur or noise read the real
+    pixels. Baking either into the preview would change what the drag shows.
+    """
+    from pixedit.model import masks_for
+
+    for layer in layers:
+        if layer.kind == "redaction":
+            return True
+        if any(mask.visible and mask.opacity > 0 for mask in masks_for(stack, layer)):
+            return True
+    return False
+
+
+def _stand_slot(start: float, length: float, origin: float, span: float, pixels: int) -> tuple[int, int]:
+    """Pixel origin and size of one document interval inside the stand-in."""
+    if span <= 0 or pixels < 1 or length <= 0:
+        return 0, 0
+    begin = (start - origin) / span * pixels
+    end = (start + length - origin) / span * pixels
+    i0 = int(round(begin))
+    i1 = int(round(end))
+    if i1 < i0:
+        i0, i1 = i1, i0
+    if i1 <= i0:
+        i1 = i0 + 1
+    return i0, i1 - i0
+
+
+def _blend_stand_in(canvas, image: Image.Image, x: int, y: int, opacity: float, mode: str) -> None:
+    """Blend ``image`` into the small float plate. Coordinates may fall outside."""
+    from pixedit.composite import blend_arrays, pil_to_float
+
+    src = pil_to_float(image)
+    height, width = canvas.shape[:2]
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(width, int(x) + src.shape[1])
+    y1 = min(height, int(y) + src.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return
+    cropped = src[y0 - int(y) : y0 - int(y) + (y1 - y0), x0 - int(x) : x0 - int(x) + (x1 - x0)]
+    canvas[y0:y1, x0:x1] = blend_arrays(canvas[y0:y1, x0:x1], cropped, opacity, mode)
+
+
+def flatten_for_drag(
+    layers: list,
+    stack: list,
+    box: tuple[float, float, float, float],
+    zoom: float,
+) -> DragProxy | None:
+    """Flatten ``layers`` once for a transform drag, or None to keep resampling.
+
+    The stand-in is the union of the selected layers, gaps included, at the
+    on-screen size capped by ``PREVIEW_MAX_EDGE``. None means the pictures
+    already fit that cap, or a mask is in the drag: those keep the per-move
+    resample so the preview and the release stay the same.
+    """
+    if not layers or box[2] < 1 or box[3] < 1:
+        return None
+    if _drag_keeps_full_resample(layers, stack):
+        return None
+    pixel_w = max(1, int(round(box[2])))
+    pixel_h = max(1, int(round(box[3])))
+    scale = preview_scale(pixel_w, pixel_h, zoom)
+    if scale >= 1.0:
+        return None
+    small_w = max(1, int(round(box[2] * scale)))
+    small_h = max(1, int(round(box[3] * scale)))
+    import numpy as np
+
+    from pixedit.composite import float_to_pil
+
+    plate = np.zeros((small_h, small_w, 4), dtype=np.float32)
+    for layer in layers:
+        if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
+            continue
+        image = layer.image
+        if image.width < 1 or image.height < 1:
+            continue
+        slot_x, slot_w = _stand_slot(layer.x, image.width, box[0], box[2], small_w)
+        slot_y, slot_h = _stand_slot(layer.y, image.height, box[1], box[3], small_h)
+        if slot_w < 1 or slot_h < 1:
+            continue
+        resized = image.convert("RGBA").resize((slot_w, slot_h), Image.Resampling.BOX)
+        _blend_stand_in(plate, resized, slot_x, slot_y, layer.opacity, layer.blend_mode)
+    return DragProxy(
+        image=float_to_pil(plate),
+        box=box,
+        layer_ids=tuple(layer.id for layer in layers),
+        live_box=box,
+    )
 
 
 def layer_sample(layer) -> tuple[Image.Image, float, float]:
