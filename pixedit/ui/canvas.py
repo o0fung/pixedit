@@ -7,14 +7,14 @@ import math
 import numpy as np
 from PIL import Image
 from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, QRectF, QTimer
-from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QPolygon, QPolygonF
+from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygon, QPolygonF
 from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from pixedit.composite import composite, composite_region, composite_view, redaction_padding, shows_redaction
 from pixedit.frames import letterbox_offset, shared_frame_zoom
 from pixedit.model import Document, mask_target
 from pixedit.proxy import PREVIEW_MAX_EDGE
-from pixedit.tools.base import PointerEvent
+from pixedit.tools.base import Overlay, PointerEvent
 from pixedit.ui.cursors import tool_pixmap_cursor
 
 # How often a sampled stroke paints the moves stored since the last tick.
@@ -33,6 +33,16 @@ PAN_CROP_MAX_EDGE = 4096
 _PAN_CROP_SLACK = 8
 # Checker cell, in screen pixels. The loop is aligned to this grid.
 _CHECKER = 12
+# Box chrome. Widths are screen pixels. The dark halo is drawn under the cyan
+# so the edge reads on a light photo and on a dark one.
+_BOX_HALO = QColor("#0c1014")
+_BOX_ACCENT = QColor("#3ec6ff")
+_BOX_HALO_PX = 3.0
+_BOX_ACCENT_PX = 1.5
+_HANDLE_FACE = QColor("#f4fbff")
+_HANDLE_ROTATE = QColor("#ffb020")
+_ANT_LIGHT = QColor("#f4fbff")
+_ANT_DARK = QColor("#12161c")
 
 _CURSORS = {
     "cross": Qt.CursorShape.CrossCursor,
@@ -938,10 +948,15 @@ class CanvasView(QWidget):
         painter.save()
         painter.translate(ruler + self.offset_x, ruler + self.offset_y)
         painter.scale(self.zoom, self.zoom)
-        # At least one screen pixel, and one image pixel when zoomed in.
-        pen_w = max(1.0, 1.0 / max(self.zoom, 0.02))
-        self._draw_ant_points(painter, self._edge_xs[light], self._edge_ys[light], QColor("#f4fbff"), pen_w)
-        self._draw_ant_points(painter, self._edge_xs[~light], self._edge_ys[~light], QColor("#12161c"), pen_w)
+        # The march is 2 screen pixels, and at least one image pixel when zoomed
+        # in. A dark rim 2 screen pixels wider sits under both dash colors, so
+        # the light dash still shows on a white page.
+        scale = max(self.zoom, 0.02)
+        pen_w = max(1.0, 2.0 / scale)
+        halo_w = pen_w + 2.0 / scale
+        self._draw_ant_points(painter, self._edge_xs, self._edge_ys, _BOX_HALO, halo_w)
+        self._draw_ant_points(painter, self._edge_xs[light], self._edge_ys[light], _ANT_LIGHT, pen_w)
+        self._draw_ant_points(painter, self._edge_xs[~light], self._edge_ys[~light], _ANT_DARK, pen_w)
         painter.restore()
 
     def _draw_ant_points(self, painter: QPainter, xs: np.ndarray, ys: np.ndarray, color: QColor, pen_w: float) -> None:
@@ -967,41 +982,15 @@ class CanvasView(QWidget):
         painter.save()
         painter.translate(ruler + self.offset_x, ruler + self.offset_y)
         painter.scale(self.zoom, self.zoom)
-        pen = QPen(QColor("#d8f6ff"))
-        pen.setWidthF(1.25 / self.zoom)
-        pen.setCosmetic(False)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # Halo, then accent, then handles. The handle rim has to cover the stroke.
         for item in overlays:
-            if item.kind in {"rect", "ellipse"} and item.rect is not None:
-                rect = QRectF(*item.rect)
-                if item.kind == "ellipse":
-                    painter.drawEllipse(rect)
-                else:
-                    painter.drawRect(rect)
-            elif item.kind == "polyline" and len(item.points) >= 2:
-                painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in item.points]))
-            elif item.kind == "handles" and (item.rect is not None or len(item.points) >= 4):
-                # A turn passes the four corners. A move or scale keeps the straight rectangle.
-                if len(item.points) >= 4:
-                    painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in item.points]))
-                elif item.rect is not None:
-                    painter.drawRect(QRectF(*item.rect))
-                size = 4.0 / self.zoom
-                for name, hx, hy in item.handles:
-                    color = QColor("#ffb020") if name == "rot" else QColor("#ffffff")
-                    painter.fillRect(QRectF(hx - size, hy - size, size * 2, size * 2), color)
-                # Stem from the middle of the top edge (nw–ne) to the rotate handle.
-                nw = next((pt for pt in item.handles if pt[0] == "nw"), None)
-                ne = next((pt for pt in item.handles if pt[0] == "ne"), None)
-                rot = next((pt for pt in item.handles if pt[0] == "rot"), None)
-                if nw is not None and ne is not None and rot is not None:
-                    painter.drawLine(
-                        int((nw[1] + ne[1]) / 2),
-                        int((nw[2] + ne[2]) / 2),
-                        int(rot[1]),
-                        int(rot[2]),
-                    )
+            built = _overlay_path(item)
+            if built is None:
+                continue
+            path, rounded = built
+            _stroke_box(painter, path, self.zoom, rounded=rounded)
+            if item.kind == "handles":
+                _paint_handle_marks(painter, item.handles, self.zoom)
         painter.restore()
 
     def _paint_rulers(self, painter: QPainter, ruler: int) -> None:
@@ -1904,6 +1893,96 @@ def _is_clear_shortcut(event) -> bool:
     return event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
 
 
+def _overlay_path(item: Overlay) -> tuple[QPainterPath, bool] | None:
+    """Path in canvas pixels, and whether the stroke ends should be round.
+
+    A rectangle and the layer frame keep sharp corners. An ellipse or a
+    freehand line uses a round end so the stroke does not spike. The rotate
+    stem is a second subpath on the layer frame, so one stroke draws the box
+    and the line up to the handle.
+    """
+    path = QPainterPath()
+    rounded = False
+    if item.kind in {"rect", "ellipse"} and item.rect is not None:
+        rect = QRectF(*item.rect)
+        if item.kind == "ellipse":
+            path.addEllipse(rect)
+            rounded = True
+        else:
+            path.addRect(rect)
+    elif item.kind == "polyline" and len(item.points) >= 2:
+        path.moveTo(QPointF(*item.points[0]))
+        for x, y in item.points[1:]:
+            path.lineTo(x, y)
+        rounded = True
+    elif item.kind == "handles" and (item.rect is not None or len(item.points) >= 4):
+        # A turn passes the four corners. A move or scale keeps the straight rectangle.
+        if len(item.points) >= 4:
+            path.addPolygon(QPolygonF([QPointF(x, y) for x, y in item.points]))
+        elif item.rect is not None:
+            path.addRect(QRectF(*item.rect))
+        # Stem from the middle of the top edge (nw–ne) to the rotate handle.
+        nw = next((pt for pt in item.handles if pt[0] == "nw"), None)
+        ne = next((pt for pt in item.handles if pt[0] == "ne"), None)
+        rot = next((pt for pt in item.handles if pt[0] == "rot"), None)
+        if nw is not None and ne is not None and rot is not None:
+            path.moveTo((nw[1] + ne[1]) / 2.0, (nw[2] + ne[2]) / 2.0)
+            path.lineTo(rot[1], rot[2])
+    else:
+        return None
+    if path.isEmpty():
+        return None
+    return path, rounded
+
+
+def _box_pen(color: QColor, width: float, *, rounded: bool) -> QPen:
+    pen = QPen(color)
+    pen.setWidthF(width)
+    pen.setCosmetic(False)
+    if rounded:
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    else:
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    return pen
+
+
+def _stroke_box(painter: QPainter, path: QPainterPath, zoom: float, *, rounded: bool) -> None:
+    """Dark halo, then the cyan accent. Widths are screen pixels at this zoom.
+
+    The painter is already scaled by ``zoom``, so a screen pixel is ``1/zoom``
+    document pixels. The halo shows on a light photo. The accent, drawn on
+    top, shows on a dark photo.
+    """
+    scale = max(zoom, 0.02)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    # Smooth a diagonal and an ellipse. A rectangle still uses a miter join,
+    # so its corners stay sharp.
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(_box_pen(_BOX_HALO, _BOX_HALO_PX / scale, rounded=rounded))
+    painter.drawPath(path)
+    painter.setPen(_box_pen(_BOX_ACCENT, _BOX_ACCENT_PX / scale, rounded=rounded))
+    painter.drawPath(path)
+
+
+def _paint_handle_marks(
+    painter: QPainter, handles: list[tuple[str, float, float]], zoom: float
+) -> None:
+    """Dark square behind the face, so a corner reads on white and on black.
+
+    The face stays 8 screen pixels. The rim is the dark margin around it.
+    Amber is only the rotate handle.
+    """
+    scale = max(zoom, 0.02)
+    face = 4.0 / scale
+    rim = face + 1.5 / scale
+    for name, hx, hy in handles:
+        painter.fillRect(QRectF(hx - rim, hy - rim, rim * 2, rim * 2), _BOX_HALO)
+        face_color = _HANDLE_ROTATE if name == "rot" else _HANDLE_FACE
+        painter.fillRect(QRectF(hx - face, hy - face, face * 2, face * 2), face_color)
+
+
 def _selection_core(mask: np.ndarray) -> np.ndarray:
     """True where coverage is at least half. The marching outline follows this edge."""
     return mask >= 128
@@ -1944,7 +2023,8 @@ def _selection_tint(selection: Image.Image) -> Image.Image:
     rgba[visible, 1] = 170
     rgba[visible, 2] = 255
     rgba[visible, 3] = (mask[visible].astype(np.uint16) * 70 // 255).astype(np.uint8)
-    # One-pixel edge so the 50% boundary stays readable over a busy photo.
+    # One-pixel dark rim on the 50% boundary. The marching outline is drawn
+    # on top, so a light dash still has a dark edge on a white page.
     on = _selection_core(mask)
     eroded = on.copy()
     eroded[1:, :] &= on[:-1, :]
@@ -1952,5 +2032,5 @@ def _selection_tint(selection: Image.Image) -> Image.Image:
     eroded[:, 1:] &= on[:, :-1]
     eroded[:, :-1] &= on[:, 1:]
     edge = on & ~eroded
-    rgba[edge] = (236, 248, 255, 220)
+    rgba[edge] = (12, 16, 20, 220)
     return Image.fromarray(rgba, "RGBA")
