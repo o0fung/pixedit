@@ -13,7 +13,7 @@ from typing import Any
 
 from PIL import Image
 
-from pixedit.composite import baked_placement, composite, merge_pair
+from pixedit.composite import baked_placement, composite, merge_layers, merge_pair
 from pixedit.factory import blank_layer, empty_raster_layer, raster_layer
 from pixedit.geom import alpha_bbox, tighten_raster_layer
 from pixedit.model import (
@@ -49,6 +49,49 @@ from pixedit.model import (
 
 # A page that was never renamed. "Page 1" and the older "Group 1" count.
 _AUTOMATIC_GROUP_NAME = re.compile(r"^(?:Page|Group) \d+$")
+
+
+def _victims(stack: list[Layer], chosen: list[Layer]) -> list[Layer]:
+    """Layers a cut or delete removes, in stack order.
+
+    A selected picture or text layer takes its masks. A selected mask is only
+    itself. A mask already covered by its picture is listed once.
+    """
+    ids: set[str] = set()
+    for layer in chosen:
+        ids.add(layer.id)
+        if layer.kind in ("raster", "text"):
+            for mask in masks_for(stack, layer):
+                ids.add(mask.id)
+    return [layer for layer in stack if layer.id in ids]
+
+
+def _mask_picture_missing(placed: list[Layer], stack: list[Layer]) -> bool:
+    """True when a pasted mask would not attach to a picture on this page.
+
+    A mask whose picture is in the pasted block points at that copy. Any other
+    mask must still find its picture in the stack.
+    """
+    present = {layer.id for layer in placed}
+    present.update(layer.id for layer in stack if layer.kind in ("raster", "text"))
+    for layer in placed:
+        if layer.kind == "redaction" and layer.target_id not in present:
+            return True
+    return False
+
+
+def _clone_layer_block(layers: list[Layer]) -> list[Layer]:
+    """Fresh copies of a cut or paste block.
+
+    A mask in the block points at the copied picture. A mask whose picture
+    is not in the block keeps the id it had, so it still filters that picture.
+    """
+    copies = [layer.clone() for layer in layers]
+    id_map = {original.id: copy.id for original, copy in zip(layers, copies)}
+    for layer in copies:
+        if layer.target_id in id_map:
+            layer.target_id = id_map[layer.target_id]
+    return copies
 
 
 def apply_pix_group_names(groups: list[LayerGroup], path: str) -> None:
@@ -124,21 +167,74 @@ class LayersMixin:
                 return
 
     def copy_active_layer(self) -> bool:
-        """Remember the active layer so a later paste can duplicate it.
+        """Remember the selected layers so a later paste can duplicate them.
 
-        The snapshot is taken now. Painting the original afterwards does not
-        change what paste inserts. This is not an undo step. False means the
-        status line already says why nothing was copied.
+        One selected layer copies that layer. Two or more copy every selected
+        layer, in stack order. The snapshot is taken now. Painting an original
+        afterwards does not change what paste inserts. This is not an undo
+        step. False means the status line already says why nothing was copied.
         """
         if not self.require_page():
             return False
+        chosen = self.selected_layers()
+        if len(chosen) > 1:
+            self._copied_layers = _clone_layer_block(chosen)
+            self._copied_layer = None
+            self._copied_cut = False
+            self._copied_multi = True
+            self._copied_source_id = chosen[-1].id
+            self.show_message(f"Copied {len(chosen)} layers. Ctrl+V pastes them.")
+            return True
         layer = self.active_layer()
         if layer is None:
             self.show_message("Choose a layer to copy.")
             return False
         self._copied_layer = layer.clone()
+        self._copied_layers = None
+        self._copied_cut = False
+        self._copied_multi = False
         self._copied_source_id = layer.id
         self.show_message(f'Copied "{layer.name}". Ctrl+V pastes a duplicate.')
+        return True
+
+    def cut_active_layer(self) -> bool:
+        """Remove the selected layers and remember them for Ctrl+V.
+
+        One selected layer is cut, and a picture takes its masks. Two or more
+        cut every selected layer the same way: each picture takes its masks,
+        and a mask is not removed twice. The snapshot is taken first, then one
+        undo step removes them. A later paste keeps the names. False means the
+        status line already says why nothing was cut.
+        """
+        if not self.require_page():
+            return False
+        stack = self._stack()
+        if self.layer_index < 0 or not stack:
+            self.show_message("Choose a layer to cut.")
+            return False
+        chosen = self.selected_layers()
+        if len(chosen) > 1:
+            victims = _victims(stack, chosen)
+            self._copied_layers = _clone_layer_block(victims)
+            self._copied_cut = True
+            self._copied_multi = True
+            self._copied_layer = None
+            self._copied_source_id = chosen[-1].id
+            self._delete_victims(victims, name="Cut")
+            self.show_message(f"Cut {len(chosen)} layers. Ctrl+V pastes them.")
+            return True
+        layer = stack[self.layer_index]
+        if layer.kind in ("raster", "text"):
+            victims = [layer, *masks_for(stack, layer)]
+        else:
+            victims = [layer]
+        self._copied_layers = _clone_layer_block(victims)
+        self._copied_cut = True
+        self._copied_multi = False
+        self._copied_layer = None
+        self._copied_source_id = layer.id
+        self.delete_active()
+        self.show_message(f'Cut "{layer.name}". Ctrl+V pastes it.')
         return True
 
     def paste_copied_layer(self) -> bool:
@@ -162,6 +258,10 @@ class LayersMixin:
         """
         if not self.require_page():
             return False
+        if self._copied_cut:
+            return self._paste_cut_block()
+        if self._copied_multi and self._copied_layers:
+            return self._paste_multi_copy()
         source = self._copied_layer
         if source is None:
             self.show_message("Copy a layer first. Ctrl+C copies the active layer.")
@@ -179,6 +279,129 @@ class LayersMixin:
         self.add_layer(placed, index, name="Paste")
         self.show_message(f'Pasted a copy of "{source.name}".')
         return True
+
+    def _paste_cut_block(self) -> bool:
+        """Insert the layers stored by ``cut_active_layer``, keeping their names.
+
+        A lone mask goes back onto its picture. A picture and its masks are
+        inserted together, above the active layer, as one undo step. Each
+        paste clones the snapshot again.
+        """
+        stored = self._copied_layers
+        if not stored:
+            self.show_message("Cut a layer first. Ctrl+X cuts the active layer.")
+            return False
+        placed = _clone_layer_block(stored)
+        stack = self._stack()
+        if len(placed) == 1 and placed[0].kind == "redaction":
+            index = self._mask_slot(placed[0], stack)
+            if index is None:
+                self.show_message("That mask's picture is not on this page.")
+                return False
+            self.add_layer(placed[0], index, name="Paste")
+            self.show_message(f'Pasted "{placed[0].name}".')
+            return True
+        index = self._paste_index(stack)
+        self._commit_inserts(placed, index)
+        if self._copied_multi:
+            self._select_block(placed)
+            self.show_message(f"Pasted {len(placed)} layers.")
+            return True
+        anchor = next((layer for layer in placed if layer.kind != "redaction"), placed[0])
+        for slot, layer in enumerate(self._stack()):
+            if layer is anchor:
+                self.layer_index = slot
+                break
+        self.notify("change")
+        self.show_message(f'Pasted "{anchor.name}".')
+        return True
+
+    def _paste_multi_copy(self) -> bool:
+        """Insert a duplicate of every layer stored by a multi-layer copy.
+
+        Names gain " copy". The block sits just in front of the front-most
+        selected layer. One undo step. The pasted layers become the selection.
+        """
+        stored = self._copied_layers
+        if not stored:
+            self.show_message("Copy a layer first. Ctrl+C copies the selected layers.")
+            return False
+        placed = _clone_layer_block(stored)
+        for layer in placed:
+            layer.name = f"{layer.name} copy"
+        stack = self._stack()
+        if _mask_picture_missing(placed, stack):
+            self.show_message("That mask's picture is not on this page.")
+            return False
+        self._commit_inserts(placed, self._paste_index(stack))
+        self._select_block(placed)
+        self.show_message(f"Pasted {len(placed)} layers.")
+        return True
+
+    def _paste_index(self, stack: list[Layer]) -> int:
+        """Insert slot just in front of the front-most selected layer.
+
+        With nothing selected, the slot is above the active layer. Either way
+        it moves above a mask run so the paste does not split a picture from
+        its masks.
+        """
+        selected = self.selected_layers()
+        if selected:
+            index = stack.index(selected[-1]) + 1
+        else:
+            index = 0 if self.layer_index < 0 else self.layer_index + 1
+        return slot_above_block(stack, index)
+
+    def _commit_inserts(self, placed: list[Layer], index: int) -> None:
+        """Insert ``placed`` as one undo step, keeping their order."""
+        shared_id = self._editing_shared_id()
+        commands = [
+            InsertLayerCommand(self.document, layer, index + offset, name="Paste", shared_id=shared_id)
+            for offset, layer in enumerate(placed)
+        ]
+        if len(commands) == 1:
+            self.commit(commands[0])
+            return
+        self.commit(CompoundCommand(commands, "Paste"))
+
+    def _select_block(self, placed: list[Layer]) -> None:
+        """Select the pasted layers. The front one is active."""
+        if not placed:
+            return
+        shared_id = self._editing_shared_id()
+        ids = [layer.id for layer in placed]
+        front = placed[-1].id
+        if shared_id:
+            self.focus_shared(shared_id, ids, front)
+        else:
+            self.select_layers(ids, active_id=front)
+        self._remember_group_ui()
+        self.notify("change")
+
+    def _delete_victims(self, victims: list[Layer], *, name: str) -> None:
+        """Remove ``victims`` as one undo step and keep the selection valid."""
+        if not victims:
+            return
+        command = DeleteLayersCommand(self.document, victims, shared_id=self._editing_shared_id())
+        command.name = name
+        self.commit(command)
+        self.clamp_index()
+        self._remember_group_ui()
+
+    def _mask_slot(self, copied: Layer, layers: list[Layer]) -> int | None:
+        """Where a pasted mask sits on ``layers``, or None when its picture is absent."""
+        target = None
+        if copied.target_id:
+            for layer in layers:
+                if layer.id == copied.target_id and layer.kind in ("raster", "text"):
+                    target = layer
+                    break
+        if target is None:
+            return None
+        span = contiguous_mask_span(layers, target)
+        if span is None:
+            return None
+        return span[1] + 1
 
     def _copied_mask_index(self, copied: Layer) -> int | None:
         """Insert slot for a copied mask, or None when its picture is absent.
@@ -222,6 +445,21 @@ class LayersMixin:
             victims = [layer]
         self.commit(DeleteLayersCommand(self.document, victims, shared_id=self._editing_shared_id()))
         self.clamp_index()
+
+    def delete_selected(self) -> None:
+        """Delete every selected layer. One layer deletes the active layer.
+
+        Two or more use the same set as Cut: each picture takes its masks, and
+        a mask is not removed twice. One undo step. A highlighted page or group
+        is not handled here.
+        """
+        if not self.require_page():
+            return
+        chosen = self.selected_layers()
+        if len(chosen) <= 1:
+            self.delete_active()
+            return
+        self._delete_victims(_victims(self._stack(), chosen), name="Delete layers")
 
     def rename_active(self, name: str) -> None:
         layer = self.active_layer()
@@ -272,12 +510,12 @@ class LayersMixin:
         return f"Page {number}"
 
     def _next_shared_name(self) -> str:
-        """The next ``Group N`` that is not already a group's name."""
+        """The next ``Tag N`` that is not already a tag's name."""
         names = {group.name for group in self.document.shared_groups}
         number = len(self.document.shared_groups) + 1
-        while f"Group {number}" in names:
+        while f"Tag {number}" in names:
             number += 1
-        return f"Group {number}"
+        return f"Tag {number}"
 
     def activate_group(
         self,
@@ -409,7 +647,7 @@ class LayersMixin:
             return
         command = CompoundCommand(
             [DeleteSharedGroupCommand(self.document, group_id) for group_id in ordered],
-            "Delete group" if len(ordered) == 1 else "Delete groups",
+            "Delete tag" if len(ordered) == 1 else "Delete tags",
         )
         command.document_level = True
         if self._shared_id in wanted:
@@ -424,7 +662,7 @@ class LayersMixin:
         if cleaned == group.name:
             return
         command = RenameGroupCommand(group, cleaned)
-        command.name = "Rename group"
+        command.name = "Rename tag"
         self.commit(command)
 
     def reorder_shared_groups(self, ordered_ids: list[str]) -> None:
@@ -543,14 +781,27 @@ class LayersMixin:
         return True
 
     def merge_down_active(self) -> None:
-        """Bake the active layer downward, as one undo step.
+        """Bake the selection downward, as one undo step.
 
-        A mask bakes into the picture it belongs to and leaves that picture
-        in the stack.         A picture bakes every mask that filters it, then merges
-        that result into the layer below.
+        One selected layer keeps the old meaning. A mask bakes into the
+        picture it belongs to. A picture bakes every mask that filters it,
+        then merges into the layer below.
+
+        Two or more selected layers merge with each other, back to front.
+        A layer that is not selected stays, even when it sat between them.
+        A selected mask joins that merge only when its picture is selected
+        too. A selection that is only masks asks for the layers instead.
         """
         if not self.require_page():
             return
+        selected = self.selected_layers()
+        if len(selected) >= 2:
+            self._merge_selected(selected)
+            return
+        self._merge_down_one()
+
+    def _merge_down_one(self) -> None:
+        """Bake the active layer into the layer below, or a mask into its picture."""
         layer = self.active_layer()
         if layer is None:
             self.show_message("Nothing below this layer to merge into.")
@@ -568,6 +819,57 @@ class LayersMixin:
             self.show_message("Nothing below this layer to merge into.")
             return
         self._merge_content_down(layer)
+
+    def _merge_selected(self, selected: list) -> None:
+        """Merge the selected layers into one at the front selected layer's place.
+
+        Pictures and text in the selection are the layers that merge. A mask
+        is included when its picture is one of those. Anything else stays in
+        the stack. The plate keeps the front selected layer's name and id, so
+        a mask that still points at that layer keeps filtering the result.
+        """
+        stack = self._stack()
+        pictures = [layer for layer in selected if layer.kind != "redaction"]
+        if not pictures:
+            self.show_message("Select the layers to merge.")
+            return
+        picture_ids = {layer.id for layer in pictures}
+        merging_ids = set(picture_ids)
+        for layer in selected:
+            if layer.kind != "redaction":
+                continue
+            target = mask_target(stack, layer)
+            if target is not None and target.id in picture_ids:
+                merging_ids.add(layer.id)
+        # One picture plus masks of some other picture is not a merge of
+        # those rows. Leave the neighbor below it alone.
+        if len(merging_ids) < 2:
+            self.show_message("Select the layers to merge.")
+            return
+        merging = [layer for layer in stack if layer.id in merging_ids]
+        front = merging[-1]
+        merged = merge_layers(merging)
+        merged.name = front.name
+        merged.id = front.id
+        merged.visible = True
+        removed = merging_ids - {front.id}
+        layers = []
+        for layer in stack:
+            if layer.id == front.id:
+                layers.append(merged)
+                continue
+            if layer.id in removed:
+                continue
+            # A mask of a picture that was merged away follows the plate.
+            # Clone it so undo still has the mask that pointed at the old picture.
+            if layer.kind == "redaction" and layer.target_id in removed:
+                carried = layer.clone()
+                carried.id = layer.id
+                carried.target_id = merged.id
+                layers.append(carried)
+                continue
+            layers.append(layer)
+        self._commit_stack(layers, "Merge layers", merged.id)
 
     def apply_active_mask(self) -> None:
         """Bake the active mask into its picture and remove the masks up through it.
@@ -695,34 +997,38 @@ class LayersMixin:
     def set_visibility(self, layer: Layer, visible: bool) -> None:
         if layer.visible == visible:
             return
-        command = SetLayerAttrCommand(layer, "visible", visible, name="Toggle layer")
-        for group in self.document.groups:
-            if any(item is layer for item in group.layers):
-                command.group_id = group.id
-                break
+        command = self._visibility_command(layer, visible)
+        command.name = "Toggle layer"
         self.commit(command)
 
-    def toggle_selected_visibility(self) -> None:
-        """Flip every selected layer's visibility as one undo step.
+    def set_selected_visibility(self, visible: bool) -> None:
+        """Show or hide every selected layer as one undo step.
 
-        Each layer inverts on its own, so a mix of shown and hidden layers
-        swaps instead of collapsing to all shown or all hidden. A second
-        click restores that mix. Layers outside the selection stay put.
-        The row checkbox still changes only the layer that was clicked.
+        Layers already in that state are left out of the step. Layers outside
+        the selection stay put. A checkbox on one selected row uses this so
+        the whole selection follows that check.
         """
         if not self.require_page():
             return
-        layers = self.selected_layers()
-        if not layers:
-            return
         commands = [
-            SetLayerAttrCommand(layer, "visible", not layer.visible, name="Toggle visibility")
-            for layer in layers
+            self._visibility_command(layer, visible)
+            for layer in self.selected_layers()
+            if layer.visible != visible
         ]
+        if not commands:
+            return
         if len(commands) == 1:
             self.commit(commands[0])
             return
         self.commit(CompoundCommand(commands, "Toggle visibility"))
+
+    def _visibility_command(self, layer: Layer, visible: bool) -> SetLayerAttrCommand:
+        command = SetLayerAttrCommand(layer, "visible", visible, name="Toggle visibility")
+        for group in self.document.groups:
+            if any(item is layer for item in group.layers):
+                command.group_id = group.id
+                break
+        return command
 
     def set_opacity(self, layer: Layer, opacity: float) -> None:
         opacity = min(1.0, max(0.0, float(opacity)))

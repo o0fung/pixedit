@@ -36,6 +36,60 @@ def test_adjustments_are_predictable():
     assert pixel[1] > pixel[2]
 
 
+def test_colorize_turns_black_into_a_strong_color():
+    """Colorize assigns a hue and lifts its value. Brightness alone still adds gray."""
+    from pixedit.adjust import color_grade
+
+    image = Image.new("RGBA", (1, 1), (0, 0, 0, 180))
+    washed = color_grade(image, hue=120, saturation=100, brightness=50)
+    gray = washed.getpixel((0, 0))
+    assert gray[0] == gray[1] == gray[2]
+    assert gray[0] > 0
+    assert gray[3] == 180
+
+    colored = color_grade(image, hue=120, saturation=100, brightness=50, colorize=True)
+    pixel = colored.getpixel((0, 0))
+    assert pixel[1] > 100
+    assert pixel[0] < 10
+    assert pixel[2] < 10
+    assert pixel[3] == 180
+
+
+def test_colorize_preview_recolors_black_and_stays_active_at_zero():
+    """Colorize reaches the layer through the Image sliders and still grades at slider zero."""
+    session = Session(new_document(4, 4, "white"))
+    black = raster_layer("Shape", Image.new("RGBA", (4, 4), (0, 0, 0, 180)))
+    session.add_layer(black)
+    session.select_layers([black.id], active_id=black.id)
+    session.options["color_colorize"] = True
+    session.options["color_hue"] = 120
+    session.options["color_saturation"] = 100
+    session.options["color_brightness"] = 50
+    session.preview_color_adjust()
+    pixel = black.image.getpixel((1, 1))
+    assert pixel[1] > 100
+    assert pixel[0] < 10
+    assert pixel[2] < 10
+    assert pixel[3] == 180
+    session.commit_color_adjust()
+    kept = black.image.getpixel((1, 1))
+    assert kept[1] > 100 and kept[3] == 180
+    assert session.option("color_colorize") == 0
+    assert session.option("color_brightness") == 0
+
+    red = raster_layer("Red", Image.new("RGBA", (4, 4), (200, 10, 10, 255)))
+    session.add_layer(red)
+    session.select_layers([red.id], active_id=red.id)
+    session.options["color_colorize"] = True
+    session.preview_color_adjust()
+    assert session.color_adjust_active()
+    gray = red.image.getpixel((1, 1))
+    assert abs(gray[0] - gray[1]) <= 1 and abs(gray[1] - gray[2]) <= 1
+    session.cancel_color_adjust()
+    assert red.image.getpixel((1, 1))[:3] == (200, 10, 10)
+    assert not session.option("color_colorize")
+
+
 def test_text_render_and_edit():
     info = TextInfo("Hi", None, "Default", 28, (255, 0, 0, 255), 0)
     image = render_text(info)
@@ -327,6 +381,42 @@ def test_highlight_and_shade_move_opposite_ends():
     lifted = highlights_shadows(image, 80, 0)
     assert lifted.getpixel((1, 0))[0] - 230 > lifted.getpixel((0, 0))[0] - 20
     assert lifted.getpixel((1, 0))[3] == 200
+
+
+def test_color_sliders_grade_every_selected_layer():
+    """The Image sliders preview and apply every selected picture. A mask is skipped."""
+    session = Session(new_document(8, 8, "white"))
+    left = raster_layer("Left", Image.new("RGBA", (8, 8), (40, 40, 40, 255)))
+    right = raster_layer("Right", Image.new("RGBA", (8, 8), (40, 40, 40, 255)))
+    session.add_layer(left)
+    session.add_layer(right)
+    mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=left.id)
+    session.add_layer(mask)
+    session.select_layers([left.id, right.id, mask.id], active_id=left.id)
+    session.options["color_brightness"] = 100
+    session.preview_color_adjust()
+    assert left.image.getpixel((1, 1))[0] > 40
+    assert right.image.getpixel((1, 1))[0] > 40
+    assert mask.kind == "redaction"
+    steps = len(session.history.undo_stack)
+    session.commit_color_adjust()
+    assert len(session.history.undo_stack) == steps + 1
+    assert session.history.undo_stack[-1].name == "Color"
+    assert session.option("color_brightness") == 0
+    graded = left.image.getpixel((1, 1))[0]
+    assert graded > 40
+    assert right.image.getpixel((1, 1))[0] == graded
+    session.undo()
+    assert left.image.getpixel((1, 1))[0] == 40
+    assert right.image.getpixel((1, 1))[0] == 40
+
+    session.options["color_brightness"] = 80
+    session.preview_color_adjust()
+    assert left.image.getpixel((1, 1))[0] > 40
+    session.cancel_color_adjust()
+    assert left.image.getpixel((1, 1))[0] == 40
+    assert right.image.getpixel((1, 1))[0] == 40
+    assert session.option("color_brightness") == 0
 
 
 def test_color_preview_commits_inside_the_selection_and_cancels():

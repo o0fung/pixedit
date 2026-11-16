@@ -1,13 +1,15 @@
-"""The layer list.
+"""The layer lists.
 
-Rows show each page and its layers. Drags, visibility, and opacity go
+Pages and tags are separate lists. Drags, visibility, and opacity go
 through the session so they stay one undo step.
 """
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
+from contextlib import contextmanager
+
+from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -80,6 +82,7 @@ _ITEM_ID = Qt.ItemDataRole.UserRole
 _ITEM_KIND = Qt.ItemDataRole.UserRole + 1
 _ITEM_NAME = Qt.ItemDataRole.UserRole + 2
 _ITEM_META = Qt.ItemDataRole.UserRole + 3
+_ITEM_TAGS = Qt.ItemDataRole.UserRole + 4
 
 
 def _name_font(base: QFont) -> QFont:
@@ -171,6 +174,66 @@ def _paint_stacked(
         )
 
 
+def branch_line_rect(row: QRect, line_height: int) -> QRect:
+    """The bottom line of a tagged page row, where the fold arrow is drawn."""
+    height = max(1, min(int(line_height), row.height()))
+    return QRect(row.left(), row.bottom() - height + 1, row.width(), height)
+
+
+def _paint_tagged_page(
+    painter: QPainter,
+    rect: QRect,
+    name: str,
+    meta: str,
+    tags: list[str],
+    name_font: QFont,
+    meta_font: QFont,
+    name_color: QColor,
+    meta_color: QColor,
+) -> None:
+    """Page row: the name and size, then one tag name on each line, then a blank line.
+
+    The blank line is the fold arrow. The tags follow paint order. The first
+    tag is under the name. The last tag, which paints on top, sits just above
+    the arrow, and the layer rows follow the arrow.
+    """
+    name_height = QFontMetrics(name_font).height()
+    tag_height = QFontMetrics(meta_font).height()
+    text_height = name_height + tag_height * len(tags)
+    # Style padding stays above the text. The arrow line stays at the bottom.
+    spare = rect.height() - text_height - tag_height
+    top = rect.top() + max(0, spare // 2)
+    _paint_inline(
+        painter,
+        QRect(rect.left(), top, rect.width(), name_height),
+        name,
+        meta,
+        name_font,
+        meta_font,
+        name_color,
+        meta_color,
+    )
+    for index, tag in enumerate(tags):
+        _draw_fitted(
+            painter,
+            QRect(rect.left(), top + name_height + index * tag_height, rect.width(), tag_height),
+            tag,
+            meta_font,
+            meta_color,
+        )
+
+
+def _tag_names(index) -> list[str]:
+    tags = index.data(_ITEM_TAGS)
+    if isinstance(tags, str) or tags is None:
+        return []
+    try:
+        values = list(tags)
+    except TypeError:
+        return []
+    return [tag for tag in values if isinstance(tag, str) and tag]
+
+
 class LayerRowDelegate(QStyledItemDelegate):
     """Rows stay as wide as the list, so a long name or caption ellipsizes.
 
@@ -189,6 +252,25 @@ class LayerRowDelegate(QStyledItemDelegate):
             width = widget.viewport().width()
             if width > 0:
                 hint.setWidth(width)
+        tags = _tag_names(index)
+        if not tags:
+            return hint
+        # The display text already has one line per tag, so the style sized
+        # the row with the item font. Paint draws the page name, then a
+        # caption line for each tag, then a blank line for the fold arrow.
+        # Replace that style height with the stack that is actually drawn.
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        lines = text.count("\n") + 1 if isinstance(text, str) and text else 1
+        metrics = QFontMetrics(option.font)
+        line = metrics.lineSpacing()
+        padding = hint.height() - line * lines
+        if padding < 0:
+            line = metrics.height()
+            padding = hint.height() - line * lines
+        padding = max(0, padding)
+        name_height = QFontMetrics(_name_font(option.font)).height()
+        tag_height = QFontMetrics(_caption_font(option.font)).height()
+        hint.setHeight(padding + name_height + tag_height * (len(tags) + 1))
         return hint
 
     def paint(self, painter: QPainter, option, index) -> None:
@@ -218,8 +300,11 @@ class LayerRowDelegate(QStyledItemDelegate):
         meta_color = _CAPTION_SELECTED if selected else _CAPTION_COLOR
         painter.save()
         painter.setClipRect(option.rect)
+        tags = _tag_names(index)
         if index.data(_ITEM_KIND) == "layer":
             _paint_stacked(painter, rect, name, meta, name_font, meta_font, _NAME_COLOR, meta_color)
+        elif tags:
+            _paint_tagged_page(painter, rect, name, meta, tags, name_font, meta_font, _NAME_COLOR, meta_color)
         else:
             _paint_inline(painter, rect, name, meta, name_font, meta_font, _NAME_COLOR, meta_color)
         painter.restore()
@@ -271,16 +356,44 @@ def _drop_index(visual_front_first: list[str], moved: set[str]) -> int:
     return behind
 
 
+def _is_layer_move_key(event) -> bool:
+    """Ctrl+Up or Ctrl+Down, the keys that move the active layer.
+
+    On macOS that shortcut arrives as Command. The portable text matches
+    both, and a plain arrow stays free to move the list highlight.
+    """
+    text = QKeySequence(event.keyCombination()).toString(QKeySequence.SequenceFormat.PortableText)
+    return text in {"Ctrl+Up", "Ctrl+Down"}
+
+
+def _blocked_shortcut(event) -> bool:
+    """Ctrl, Alt, or Command. Those combinations belong to other shortcuts."""
+    mods = event.modifiers()
+    blocked = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier
+    return bool(mods & blocked)
+
+
+def _event_pos(event):
+    """The pointer in the widget, for both Qt drop positions and tests."""
+    position = event.position()
+    return position.toPoint()
+
+
 class LayerTree(QTreeWidget):
-    """Groups, then the layers inside each group.
+    """One list of pages, or one list of groups, with the layers inside each.
 
     ``startDrag`` does not return until the drop or cancel has finished, so
     ``drag_finished`` is emitted outside Qt's nested drag loop. The panel
     updates the document from that signal, not from inside the drop.
+
+    A drag that stays in this list is Qt's internal move. A layer dragged
+    into the other list is recorded and applied when the drag ends, because
+    the two lists do not share one item model.
     """
 
     drag_started = pyqtSignal()
     drag_finished = pyqtSignal()
+    delete_pressed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -288,21 +401,123 @@ class LayerTree(QTreeWidget):
         self.setHeaderHidden(True)
         self.setIndentation(16)
 
+    def drawBranches(self, painter, rect, index) -> None:
+        # A tagged page is several lines tall. Qt would center the arrow on
+        # that whole row, which lands it under the page name. The last line
+        # of the row is blank so the arrow sits under the last tag.
+        if _tag_names(index):
+            line = QFontMetrics(_caption_font(self.font())).height()
+            rect = branch_line_rect(rect, line)
+        super().drawBranches(painter, rect, index)
+
+    def event(self, event) -> bool:
+        # The list would claim Ctrl+Up and Ctrl+Down for the highlight.
+        # Leaving the override unaccepted lets the window shortcut move the layer.
+        if event.type() == QEvent.Type.ShortcutOverride and _is_layer_move_key(event):
+            event.ignore()
+            return True
+        return super().event(event)
+
     def startDrag(self, supported_actions) -> None:
         self.drag_started.emit()
         super().startDrag(supported_actions)
         self.drag_finished.emit()
 
+    def dragEnterEvent(self, event) -> None:
+        if self._foreign_layers(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self._foreign_layers(event):
+            # Reject a hover that is not over a page or a group, so the
+            # pointer shows that the layer cannot land in empty space.
+            if self.drop_slot(_event_pos(event)) is None:
+                event.ignore()
+                return
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
     def dropEvent(self, event) -> None:
+        # A layer from the other list is not moved here. The source still owns
+        # the row until the drag ends, and deleting it early would remove
+        # whichever row slid into that index. The panel records the landing
+        # spot and applies it from the document when ``drag_finished`` runs.
+        source = event.source()
+        panel = self.parent()
+        if isinstance(source, LayerTree) and source is not self and isinstance(panel, LayerPanel):
+            slot = self._foreign_slot(source, _event_pos(event))
+            if slot is None or not panel.prepare_cross_drop(source, slot[0], slot[1]):
+                event.ignore()
+                return
+            event.acceptProposedAction()
+            return
         super().dropEvent(event)
         self._flatten_group_nesting()
 
-    def _flatten_group_nesting(self) -> None:
-        """Keep every page as a top-level row.
+    def _foreign_layers(self, event) -> bool:
+        source = event.source()
+        if not isinstance(source, LayerTree) or source is self:
+            return False
+        selected = source.selectedItems()
+        return bool(selected) and all(item.data(0, _ITEM_KIND) == "layer" for item in selected)
 
-        A drop on the middle of a page nests the row under it. Pages have to
-        stay siblings so their order is the PDF page order. A layer that
-        landed under another layer is lifted back beside it.
+    def _foreign_slot(self, source: LayerTree, pos) -> tuple[QTreeWidgetItem, int] | None:
+        """The header that receives a foreign layer, and the child index.
+
+        The child index is front-first, matching the rows. ``None`` means the
+        pointer is not over a page or a group that can take the layer.
+        """
+        if not self._foreign_layers_from(source):
+            return None
+        return self.drop_slot(pos)
+
+    def _foreign_layers_from(self, source: LayerTree) -> bool:
+        selected = source.selectedItems()
+        return bool(selected) and all(item.data(0, _ITEM_KIND) == "layer" for item in selected)
+
+    def drop_slot(self, pos) -> tuple[QTreeWidgetItem, int] | None:
+        """Header under ``pos``, and where a layer would be inserted among its children."""
+        if self.topLevelItemCount() == 0:
+            return None
+        index = self.indexAt(pos)
+        if not index.isValid():
+            last = self.topLevelItem(self.topLevelItemCount() - 1)
+            if last is None or last.data(0, _ITEM_KIND) not in ("group", "shared"):
+                return None
+            tail = last
+            if last.isExpanded() and last.childCount():
+                child = last.child(last.childCount() - 1)
+                if child is not None:
+                    tail = child
+            if pos.y() >= self.visualItemRect(tail).bottom():
+                return last, last.childCount()
+            return None
+        item = self.itemFromIndex(index)
+        if item is None:
+            return None
+        kind = item.data(0, _ITEM_KIND)
+        rect = self.visualItemRect(item)
+        before = pos.y() < rect.center().y()
+        if kind in ("group", "shared"):
+            return item, 0 if before else item.childCount()
+        if kind != "layer":
+            return None
+        parent = item.parent()
+        if parent is None or parent.data(0, _ITEM_KIND) not in ("group", "shared"):
+            return None
+        row = parent.indexOfChild(item)
+        return parent, row if before else row + 1
+
+    def _flatten_group_nesting(self) -> None:
+        """Keep every page or group as a top-level row.
+
+        A drop on the middle of a row nests it under that row. Pages stay
+        siblings so their order is the export order, and the same rule holds
+        for groups. A layer that landed under another layer is lifted back
+        beside it.
         """
         index = 0
         while index < self.topLevelItemCount():
@@ -331,6 +546,17 @@ class LayerTree(QTreeWidget):
         if event.key() == Qt.Key.Key_Space:
             event.ignore()
             return
+        if _is_layer_move_key(event):
+            event.ignore()
+            return
+        # Delete and Backspace remove the highlighted row. A repeat is
+        # swallowed so a held key does not walk down the stack. A modifier
+        # is left for the window.
+        if event.key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace} and not _blocked_shortcut(event):
+            if not event.isAutoRepeat():
+                self.delete_pressed.emit()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
@@ -346,6 +572,10 @@ class LayerPanel(QWidget):
         super().__init__()
         self.session = session
         self._building = False
+        # itemChanged and itemSelectionChanged bump this. refresh() waits
+        # until it is zero, because those callbacks run inside Qt's row update.
+        self._item_event_depth = 0
+        self._refresh_pending = False
         # True from the drop until the document matches the list, so a
         # selection change during the drag does not pick the wrong layer.
         self._reordering = False
@@ -362,99 +592,73 @@ class LayerPanel(QWidget):
         self._drag_groups: list[str] = []
         self._drag_shared: list[str] = []
         self._drag_current: str | None = None
+        # Set while a layer is dragged from one list into the other.
+        # (layer ids, "page" or "shared", destination id, bottom-to-top index)
+        self._pending_cross: tuple[list[str], str, str, int] | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        title = QLabel("Layers")
-        title.setObjectName("section")
-        layout.addWidget(title)
-        self.list = LayerTree()
-        self.list.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
-        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list.setItemDelegate(LayerRowDelegate(self.list))
-        self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.list.setDropIndicatorShown(True)
-        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list.setRootIsDecorated(True)
-        self.list.setItemsExpandable(True)
-        # Double-click renames the row, the same way a layer does. The arrow
-        # still folds a page on a single click.
-        self.list.setExpandsOnDoubleClick(False)
-        self.list.setToolTip(
+        pages_title = QLabel("Pages")
+        pages_title.setObjectName("section")
+        layout.addWidget(pages_title)
+        self.list = self._make_tree(
             "Click a page, or a layer in it, to show that page. "
-            "Groups sit under the pages. A group's layers are drawn on every page tagged with it. "
-            "Double-click a page, a group, or a layer to rename it. "
-            "The arrow folds a row. Shift-click or Command-click folded pages, "
+            "Double-click a page or a layer to rename it. "
+            "The arrow folds a page. Shift-click or Command-click folded pages, "
             "then drag them to change the page order. "
-            "Drag a layer to restack it, onto another page, or into a group. "
-            "Shift-click selects a range inside one page or one group."
+            "Drag a layer to restack it, onto another page, or into the Tags list. "
+            "Shift-click selects a range inside one page. "
+            "Delete or Backspace removes the highlighted row."
         )
-        self.list.itemCollapsed.connect(self._on_group_folded)
-        self.list.itemExpanded.connect(self._on_group_folded)
-        self.list.itemSelectionChanged.connect(self._on_selection)
-        self.list.itemChanged.connect(self._on_item_changed)
-        self.list.itemDoubleClicked.connect(self._on_double_click)
-        self.list.drag_started.connect(self._on_drag_started)
-        # Queued so a rebuild of the rows waits until the drag's mouse
-        # handling has returned, not while Qt is still inside it.
-        self.list.drag_finished.connect(self._on_drag_finished, Qt.ConnectionType.QueuedConnection)
-        layout.addWidget(self.list, 1)
+        layout.addWidget(self.list, 3)
 
-        buttons = QHBoxLayout()
-        self._add_button(buttons, "New", self._page_action(self.session.add_blank_layer), icon="layer-new")
-        self._add_button(buttons, "Copy", self._page_action(self.session.duplicate_active), icon="layer-copy")
-        self._add_button(
-            buttons,
-            "Delete",
-            self._page_action(self._delete_selection),
-            "Delete the selected layer. If page rows are selected, delete those pages. "
-            "If group rows are selected, delete those groups.",
-            icon="layer-delete",
+        groups_title = QLabel("Tags")
+        groups_title.setObjectName("section")
+        layout.addWidget(groups_title)
+        self._groups_empty = QLabel("No tags yet.")
+        self._groups_empty.setObjectName("hint")
+        layout.addWidget(self._groups_empty)
+        self.groups = self._make_tree(
+            "A tag's layers are drawn on every page that has it. "
+            "Double-click a tag or a layer to rename it. "
+            "Drag a layer here from a page, or drag layers to restack them. "
+            "Shift-click selects a range inside one tag. "
+            "Delete or Backspace removes the highlighted row."
         )
+        self.groups.setMinimumHeight(72)
+        # Hidden until a tag exists. The empty line is the list until then.
+        self.groups.setVisible(False)
+        layout.addWidget(self.groups, 1)
+        group_buttons = QHBoxLayout()
         self._add_button(
-            buttons,
-            "Visibility",
-            self._page_action(self.session.toggle_selected_visibility),
-            "Toggle visibility of every selected layer. Click again to put them back.",
-            icon="layer-visibility",
-        )
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        buttons2 = QHBoxLayout()
-        self._add_button(buttons2, "Up", self._page_action(lambda: self.session.move_active(1)), icon="layer-up")
-        self._add_button(buttons2, "Down", self._page_action(lambda: self.session.move_active(-1)), icon="layer-down")
-        self._add_button(
-            buttons2,
+            group_buttons,
             "Page",
             self._page_action(self.session.add_group),
             "New page. It has its own canvas and does not mix with the other pages.",
             icon="new",
         )
         self._add_button(
-            buttons2,
-            "Group",
+            group_buttons,
+            "New tag",
             self._page_action(self._add_shared_group),
-            "New group, tagged on the page you are viewing. Its layers are drawn on every tagged page.",
-            icon="folder",
+            "New tag, on the page you are viewing. Its layers are drawn on every page that has this tag.",
+            icon="tag-new",
         )
         self._add_button(
-            buttons2,
-            "Tag",
+            group_buttons,
+            "Tag pages",
             self._page_action(self.tag_selection),
-            "Tag the selected pages with the selected group. The last tag paints on top. Tag again to remove it.",
+            "Tag the highlighted pages with the tag you last chose. The last tag paints on top. Tag again to remove it.",
             icon="tag",
         )
         self._add_button(
-            buttons2,
+            group_buttons,
             "Merge down",
             self._page_action(self.session.merge_down_active),
-            "Bake this layer into the one below it. A mask bakes into the layer it belongs to. "
-            "Flatten image, in the Layer menu, collapses the group you are viewing (Ctrl+Shift+E).",
+            "One layer bakes into the layer below it. Several selected layers bake together. A mask bakes into the layer it belongs to (Ctrl+Shift+E).",
             icon="layer-merge-down",
         )
-        buttons2.addStretch(1)
-        layout.addLayout(buttons2)
+        group_buttons.addStretch(1)
+        layout.addLayout(group_buttons)
 
         self.opacity = QSlider(Qt.Orientation.Horizontal)
         self.opacity.setRange(0, 100)
@@ -482,6 +686,33 @@ class LayerPanel(QWidget):
 
         return run
 
+    def _make_tree(self, tip: str) -> LayerTree:
+        tree = LayerTree()
+        tree.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tree.setItemDelegate(LayerRowDelegate(tree))
+        tree.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        tree.setDefaultDropAction(Qt.DropAction.MoveAction)
+        tree.setDropIndicatorShown(True)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setRootIsDecorated(True)
+        tree.setItemsExpandable(True)
+        # Double-click renames the row. The arrow still folds it on a single click.
+        tree.setExpandsOnDoubleClick(False)
+        tree.setToolTip(tip)
+        tree.itemCollapsed.connect(self._on_group_folded)
+        tree.itemExpanded.connect(self._on_group_folded)
+        tree.itemSelectionChanged.connect(self._on_selection)
+        tree.itemChanged.connect(self._on_item_changed)
+        tree.itemDoubleClicked.connect(self._on_double_click)
+        tree.drag_started.connect(self._on_drag_started)
+        # Queued so a rebuild of the rows waits until the drag's mouse
+        # handling has returned, not while Qt is still inside it.
+        tree.drag_finished.connect(self._on_drag_finished, Qt.ConnectionType.QueuedConnection)
+        tree.delete_pressed.connect(self._page_action(self._delete_selection))
+        return tree
+
     def _add_button(self, layout: QHBoxLayout, text: str, callback, tip: str = "", icon: str = "") -> None:
         if icon:
             button = _icon_button(text, icon, tip, side=_ACTION_SIDE, icon_px=_ACTION_ICON)
@@ -496,16 +727,49 @@ class LayerPanel(QWidget):
         button.clicked.connect(callback)
         layout.addWidget(button)
 
+    @contextmanager
+    def _item_event(self):
+        """Hold the refresh guard for one tree callback."""
+        self._item_event_depth += 1
+        try:
+            yield
+        finally:
+            self._item_event_depth -= 1
+
+    def _defer_refresh(self) -> None:
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self._run_deferred_refresh)
+
+    def _run_deferred_refresh(self) -> None:
+        self._refresh_pending = False
+        # processEvents inside a click can deliver this timer early.
+        # Wait until that click has returned as well.
+        if self._item_event_depth:
+            self._defer_refresh()
+            return
+        self.refresh()
+
     def refresh(self) -> None:
+        # A checkbox click emits itemChanged from inside QTreeWidgetItem::setData.
+        # A row click emits itemSelectionChanged while Qt still holds that row.
+        # Both notify the session, and the window rebuilds this list on every change.
+        # clear() here deletes the row Qt is updating, and the process segfaults.
+        # One timer rebuilds after the mouse event has returned.
+        if self._item_event_depth:
+            self._defer_refresh()
+            return
         self._building = True
-        # Block the tree, not its model.
+        # Block the trees, not their models.
         # 1. clear() and addTopLevelItem() would otherwise emit itemSelectionChanged
         #    and itemChanged, which this panel treats as a click or a visibility toggle.
         # 2. The view lays rows out only from the model's reset and insert
         #    signals. Blocking those leaves the default Background row, and
         #    every layer opened later, in the model but not on screen.
-        self.list.blockSignals(True)
-        self.list.clear()
+        for tree in (self.list, self.groups):
+            tree.blockSignals(True)
+            tree.clear()
         document = self.session.document
         active_group_id = document.active_group_id
         active_shared_id = self.session._shared_id
@@ -518,18 +782,7 @@ class LayerPanel(QWidget):
         # Pages run top to bottom in export order. Inside a page the front
         # layer is the first row, matching the old flat list.
         for group in document.groups:
-            group_name, group_meta = self._group_label(group)
-            header = QTreeWidgetItem([f"{group_name}    {group_meta}"])
-            header.setData(0, _ITEM_ID, group.id)
-            header.setData(0, _ITEM_KIND, "group")
-            header.setData(0, _ITEM_NAME, group_name)
-            header.setData(0, _ITEM_META, group_meta)
-            header.setFlags(
-                Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsDragEnabled
-                | Qt.ItemFlag.ItemIsDropEnabled
-            )
+            header = self._header_item("group", group.id, *self._group_label(group))
             if group.id == active_group_id:
                 font = QFont()
                 font.setBold(True)
@@ -537,23 +790,7 @@ class LayerPanel(QWidget):
                 header.setBackground(0, QBrush(QColor("#1c3a4a")))
             self.list.addTopLevelItem(header)
             for layer in reversed(group.layers):
-                layer_name, detail = self._label(layer, group.layers)
-                item = QTreeWidgetItem([f"{layer_name}\n{detail}"])
-                item.setData(0, _ITEM_ID, layer.id)
-                item.setData(0, _ITEM_KIND, "layer")
-                item.setData(0, _ITEM_NAME, layer_name)
-                item.setData(0, _ITEM_META, detail)
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsDragEnabled
-                    | Qt.ItemFlag.ItemIsDropEnabled
-                )
-                item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
-                item.setIcon(0, self._thumb_icon(layer))
-                if layer.kind == "text" and layer.text is not None and layer.text.text.strip():
-                    item.setToolTip(0, layer.text.text)
+                item = self._layer_item(layer, group.layers)
                 header.addChild(item)
                 rows.append((item, layer.id, group.id))
                 if active_shared_id is None and group.id == active_group_id and layer.id == active_layer_id:
@@ -568,36 +805,10 @@ class LayerPanel(QWidget):
             else:
                 shared_meta = f"{tagged} pages"
             shared_name = shared.name.replace("\r", " ").replace("\n", " ").strip()
-            header = QTreeWidgetItem([f"{shared_name}    {shared_meta}"])
-            header.setData(0, _ITEM_ID, shared.id)
-            header.setData(0, _ITEM_KIND, "shared")
-            header.setData(0, _ITEM_NAME, shared_name)
-            header.setData(0, _ITEM_META, shared_meta)
-            header.setFlags(
-                Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsDragEnabled
-                | Qt.ItemFlag.ItemIsDropEnabled
-            )
-            self.list.addTopLevelItem(header)
+            header = self._header_item("shared", shared.id, shared_name, shared_meta)
+            self.groups.addTopLevelItem(header)
             for layer in reversed(shared.layers):
-                layer_name, detail = self._label(layer, shared.layers)
-                item = QTreeWidgetItem([f"{layer_name}\n{detail}"])
-                item.setData(0, _ITEM_ID, layer.id)
-                item.setData(0, _ITEM_KIND, "layer")
-                item.setData(0, _ITEM_NAME, layer_name)
-                item.setData(0, _ITEM_META, detail)
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsUserCheckable
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsDragEnabled
-                    | Qt.ItemFlag.ItemIsDropEnabled
-                )
-                item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
-                item.setIcon(0, self._thumb_icon(layer))
-                if layer.kind == "text" and layer.text is not None and layer.text.text.strip():
-                    item.setToolTip(0, layer.text.text)
+                item = self._layer_item(layer, shared.layers)
                 header.addChild(item)
                 shared_rows.append((item, layer.id, shared.id))
                 if shared.id == active_shared_id and layer.id == active_layer_id:
@@ -612,38 +823,14 @@ class LayerPanel(QWidget):
         if self._tag_group_id and document.shared_by_id(self._tag_group_id) is None:
             self._tag_group_id = None
         if page_ids:
-            current_group = active_group_id if active_group_id in page_ids else page_ids[-1]
-            chosen_header = None
-            headers = []
-            for index in range(self.list.topLevelItemCount()):
-                header = self.list.topLevelItem(index)
-                if header is None:
-                    continue
-                headers.append(header)
-                if header.data(0, _ITEM_ID) == current_group:
-                    chosen_header = header
-            if chosen_header is not None:
-                self.list.setCurrentItem(chosen_header)
-            for header in headers:
-                header.setSelected(header.data(0, _ITEM_KIND) == "group" and header.data(0, _ITEM_ID) in page_ids)
+            current_page = active_group_id if active_group_id in page_ids else page_ids[-1]
+            self._select_headers(self.list, "group", page_ids, current_page)
         elif shared_ids:
-            chosen_header = None
-            headers = []
-            current_shared = shared_ids[-1]
-            for index in range(self.list.topLevelItemCount()):
-                header = self.list.topLevelItem(index)
-                if header is None or header.data(0, _ITEM_KIND) != "shared":
-                    continue
-                headers.append(header)
-                if header.data(0, _ITEM_ID) == current_shared:
-                    chosen_header = header
-            if chosen_header is not None:
-                self.list.setCurrentItem(chosen_header)
-            for header in headers:
-                header.setSelected(header.data(0, _ITEM_ID) in shared_ids)
+            self._select_headers(self.groups, "shared", shared_ids, shared_ids[-1])
         else:
             if current_item is not None:
-                self.list.setCurrentItem(current_item)
+                tree = self.groups if active_shared_id else self.list
+                tree.setCurrentItem(current_item)
             if active_shared_id:
                 for item, layer_id, group_id in shared_rows:
                     item.setSelected(group_id == active_shared_id and layer_id in chosen)
@@ -652,26 +839,99 @@ class LayerPanel(QWidget):
                     item.setSelected(group_id == active_group_id and layer_id in chosen)
         # Selecting a layer scrolls its row into view and opens the page.
         # Put the arrows back so a folded page stays folded.
-        for index in range(self.list.topLevelItemCount()):
-            header = self.list.topLevelItem(index)
-            if header is not None:
-                header.setExpanded(header.data(0, _ITEM_ID) not in self._collapsed)
-        self.list.blockSignals(False)
+        for tree in (self.list, self.groups):
+            for index in range(tree.topLevelItemCount()):
+                header = tree.topLevelItem(index)
+                if header is not None:
+                    header.setExpanded(header.data(0, _ITEM_ID) not in self._collapsed)
+        has_groups = bool(document.shared_groups)
+        self.groups.setVisible(has_groups)
+        self._groups_empty.setVisible(not has_groups)
+        for tree in (self.list, self.groups):
+            tree.blockSignals(False)
         self._sync_controls()
         self._building = False
 
-    def _group_label(self, group) -> tuple[str, str]:
-        """The page name, and its pixel size, kept apart so they can paint differently."""
+    def _header_item(
+        self,
+        kind: str,
+        row_id: str,
+        name: str,
+        meta: str,
+        tags: list[str] | None = None,
+    ) -> QTreeWidgetItem:
+        tag_names = [tag for tag in tags or [] if tag]
+        text = f"{name}    {meta}"
+        if tag_names:
+            text = "\n".join([text, *tag_names])
+        header = QTreeWidgetItem([text])
+        header.setData(0, _ITEM_ID, row_id)
+        header.setData(0, _ITEM_KIND, kind)
+        header.setData(0, _ITEM_NAME, name)
+        header.setData(0, _ITEM_META, meta)
+        header.setData(0, _ITEM_TAGS, tag_names)
+        if tag_names:
+            header.setToolTip(0, "\n".join(tag_names))
+        header.setFlags(
+            Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
+        return header
+
+    def _layer_item(self, layer, layers) -> QTreeWidgetItem:
+        layer_name, detail = self._label(layer, layers)
+        item = QTreeWidgetItem([f"{layer_name}\n{detail}"])
+        item.setData(0, _ITEM_ID, layer.id)
+        item.setData(0, _ITEM_KIND, "layer")
+        item.setData(0, _ITEM_NAME, layer_name)
+        item.setData(0, _ITEM_META, detail)
+        item.setFlags(
+            Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
+        item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
+        item.setIcon(0, self._thumb_icon(layer))
+        if layer.kind == "text" and layer.text is not None and layer.text.text.strip():
+            item.setToolTip(0, layer.text.text)
+        return item
+
+    def _select_headers(self, tree: LayerTree, kind: str, row_ids: list[str], current_id: str) -> None:
+        chosen_header = None
+        headers = []
+        for index in range(tree.topLevelItemCount()):
+            header = tree.topLevelItem(index)
+            if header is None or header.data(0, _ITEM_KIND) != kind:
+                continue
+            headers.append(header)
+            if header.data(0, _ITEM_ID) == current_id:
+                chosen_header = header
+        if chosen_header is not None:
+            tree.setCurrentItem(chosen_header)
+        for header in headers:
+            header.setSelected(header.data(0, _ITEM_ID) in row_ids)
+
+    def _group_label(self, group) -> tuple[str, str, list[str]]:
+        """The page name, its pixel size, and the tag names in paint order.
+
+        The size stays off the tag lines so a long list of tags grows downward
+        instead of making the page line longer.
+        """
         name = group.name.replace("\r", " ").replace("\n", " ").strip()
         meta = f"{group.width} × {group.height}"
         tags = []
         for shared_id in group.shared_ids:
             shared = self.session.document.shared_by_id(shared_id)
-            if shared is not None:
-                tags.append(shared.name.replace("\r", " ").replace("\n", " ").strip())
-        if tags:
-            meta = f"{meta}  ·  {', '.join(tags)}"
-        return name, meta
+            if shared is None:
+                continue
+            tag = shared.name.replace("\r", " ").replace("\n", " ").strip()
+            if tag:
+                tags.append(tag)
+        return name, meta, tags
 
     def _label(self, layer, layers) -> tuple[str, str]:
         """The layer name, and the caption under it.
@@ -723,55 +983,42 @@ class LayerPanel(QWidget):
 
     def _on_drag_started(self) -> None:
         self._reordering = True
+        self._pending_cross = None
         self._drag_groups = []
         self._drag_shared = []
         self._drag_current = None
-        selected = self.list.selectedItems()
+        tree = self._event_tree()
+        selected = tree.selectedItems()
         # Folded pages are the rows. Several of them move as one block.
         # A layer multi-selection still drags only the current row, because
         # restack records one layer move.
         if selected and all(item.data(0, _ITEM_KIND) == "shared" for item in selected):
-            chosen = {
-                item.data(0, _ITEM_ID)
-                for item in selected
-                if isinstance(item.data(0, _ITEM_ID), str)
-            }
-            self._drag_shared = [
-                item.data(0, _ITEM_ID)
-                for index in range(self.list.topLevelItemCount())
-                if (item := self.list.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
-            ]
-            current = self.list.currentItem()
-            if current is not None and current.data(0, _ITEM_ID) in chosen:
-                self._drag_current = current.data(0, _ITEM_ID)
-            elif self._drag_shared:
-                self._drag_current = self._drag_shared[-1]
+            self._drag_shared, self._drag_current = self._drag_block(tree, selected)
             return
         if selected and all(item.data(0, _ITEM_KIND) == "group" for item in selected):
-            chosen = {
-                item.data(0, _ITEM_ID)
-                for item in selected
-                if isinstance(item.data(0, _ITEM_ID), str)
-            }
-            self._drag_groups = [
-                item.data(0, _ITEM_ID)
-                for index in range(self.list.topLevelItemCount())
-                if (item := self.list.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
-            ]
-            current = self.list.currentItem()
-            if current is not None and current.data(0, _ITEM_ID) in chosen:
-                self._drag_current = current.data(0, _ITEM_ID)
-            elif self._drag_groups:
-                self._drag_current = self._drag_groups[-1]
+            self._drag_groups, self._drag_current = self._drag_block(tree, selected)
             return
-        current = self.list.currentItem()
+        current = tree.currentItem()
         if current is None or len(selected) <= 1:
             return
-        self.list.blockSignals(True)
+        tree.blockSignals(True)
         for item in selected:
             if item is not current:
                 item.setSelected(False)
-        self.list.blockSignals(False)
+        tree.blockSignals(False)
+
+    def _drag_block(self, tree: LayerTree, selected: list[QTreeWidgetItem]) -> tuple[list[str], str | None]:
+        chosen = {item.data(0, _ITEM_ID) for item in selected if isinstance(item.data(0, _ITEM_ID), str)}
+        ordered = [
+            item.data(0, _ITEM_ID)
+            for index in range(tree.topLevelItemCount())
+            if (item := tree.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
+        ]
+        current = tree.currentItem()
+        current_id = current.data(0, _ITEM_ID) if current is not None else None
+        if current_id not in chosen:
+            current_id = ordered[-1] if ordered else None
+        return ordered, current_id if isinstance(current_id, str) else None
 
     def _on_drag_finished(self) -> None:
         if self._building:
@@ -782,30 +1029,23 @@ class LayerPanel(QWidget):
         self._reordering = True
         self._apply_pending_drop()
 
-    def _read_visual(self) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]]] | None:
-        """Page rows and group rows, each ``(id, layer ids front-first)``.
+    def _read_rows(
+        self, tree: LayerTree, kind: str, seen_layers: list[str]
+    ) -> list[tuple[str, list[str]]] | None:
+        """Top-level rows in one list, each ``(id, layer ids front-first)``.
 
         None when a row is nested badly or an id is repeated.
         """
-        seen_pages: list[str] = []
-        seen_shared: list[str] = []
-        seen_layers: list[str] = []
-        pages: list[tuple[str, list[str]]] = []
-        shared: list[tuple[str, list[str]]] = []
-        for index in range(self.list.topLevelItemCount()):
-            item = self.list.topLevelItem(index)
-            if item is None:
-                return None
-            kind = item.data(0, _ITEM_KIND)
-            if kind not in ("group", "shared"):
+        rows: list[tuple[str, list[str]]] = []
+        seen_rows: list[str] = []
+        for index in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(index)
+            if item is None or item.data(0, _ITEM_KIND) != kind:
                 return None
             row_id = item.data(0, _ITEM_ID)
-            if not isinstance(row_id, str):
+            if not isinstance(row_id, str) or row_id in seen_rows:
                 return None
-            seen = seen_pages if kind == "group" else seen_shared
-            if row_id in seen:
-                return None
-            seen.append(row_id)
+            seen_rows.append(row_id)
             layer_ids: list[str] = []
             for child_index in range(item.childCount()):
                 child = item.child(child_index)
@@ -816,17 +1056,87 @@ class LayerPanel(QWidget):
                     return None
                 seen_layers.append(layer_id)
                 layer_ids.append(layer_id)
-            (pages if kind == "group" else shared).append((row_id, layer_ids))
+            rows.append((row_id, layer_ids))
+        return rows
+
+    def _read_visual(self) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]]] | None:
+        """Page rows and group rows, each ``(id, layer ids front-first)``."""
+        seen_layers: list[str] = []
+        pages = self._read_rows(self.list, "group", seen_layers)
+        if pages is None:
+            return None
+        shared = self._read_rows(self.groups, "shared", seen_layers)
+        if shared is None:
+            return None
         return pages, shared
 
+    def prepare_cross_drop(self, source: LayerTree, dest_header: QTreeWidgetItem, child_index: int) -> bool:
+        """Remember a layer dragged from one list onto a header in the other.
+
+        The rows stay where they are until the drag ends. ``child_index`` is
+        the front-first slot under ``dest_header``. The stored index is the
+        matching slot in that header's bottom-to-top stack.
+        """
+        selected = [item for item in source.selectedItems() if item.data(0, _ITEM_KIND) == "layer"]
+        if not selected or len(selected) != len(source.selectedItems()):
+            return False
+        parent = selected[0].parent()
+        if parent is None or any(item.parent() is not parent for item in selected):
+            return False
+        kind = dest_header.data(0, _ITEM_KIND)
+        if kind == "group":
+            dest_kind = "page"
+        elif kind == "shared":
+            dest_kind = "shared"
+        else:
+            return False
+        dest_id = dest_header.data(0, _ITEM_ID)
+        if not isinstance(dest_id, str) or parent.data(0, _ITEM_ID) == dest_id:
+            return False
+        layer_ids = [item.data(0, _ITEM_ID) for item in selected if isinstance(item.data(0, _ITEM_ID), str)]
+        if not layer_ids:
+            return False
+        dest_index = max(0, dest_header.childCount() - int(child_index))
+        self._pending_cross = (layer_ids, dest_kind, dest_id, dest_index)
+        return True
+
+    def _commit_cross(self, layer_ids: list[str], dest_kind: str, dest_id: str, dest_index: int) -> None:
+        """Move the dragged pictures onto the page or group recorded at the drop."""
+        if not layer_ids:
+            return
+        document = self.session.document
+        source_kind = None
+        source_id = None
+        for page in document.groups:
+            if any(layer.id == layer_ids[0] for layer in page.layers):
+                source_kind, source_id = "page", page.id
+                break
+        if source_id is None:
+            for group in document.shared_groups:
+                if any(layer.id == layer_ids[0] for layer in group.layers):
+                    source_kind, source_id = "shared", group.id
+                    break
+        if source_kind is None or source_id is None or source_id == dest_id:
+            return
+        if source_kind == "page" and dest_kind == "page":
+            self.session.move_layers_to_group(layer_ids, dest_id, dest_index)
+            return
+        self.session.transfer_layers(layer_ids, source_kind, source_id, dest_kind, dest_id, dest_index)
+
     def _apply_pending_drop(self) -> None:
-        # One drag does one thing, then the tree is rebuilt from the document.
-        # 1. Page headers reordered, layers unmoved: that becomes the page order.
-        # 2. Group headers reordered: catalog order only. Paint order stays on each page.
-        # 3. One layer moved inside its page or its group: restack.
-        # 4. A picture dropped on another page, or between a page and a group.
+        # One drag does one thing, then the lists are rebuilt from the document.
+        # 1. A layer dropped into the other list: that move was recorded at the drop.
+        # 2. Page headers reordered, layers unmoved: that becomes the page order.
+        # 3. Group headers reordered: catalog order only. Paint order stays on each page.
+        # 4. One layer moved inside its page or its group: restack.
+        # 5. A picture dropped on another page.
         # A mask dropped without its picture snaps back.
         try:
+            pending = self._pending_cross
+            self._pending_cross = None
+            if pending is not None:
+                self._commit_cross(*pending)
+                return
             visual = self._read_visual()
             document = self.session.document
             if visual is None:
@@ -965,7 +1275,12 @@ class LayerPanel(QWidget):
             self.refresh()
 
     def _delete_selection(self) -> None:
-        """Delete the highlighted pages or groups, or the active layer."""
+        """Delete the highlighted pages or groups, or the selected layers.
+
+        A page row removes those pages. A group row removes those groups and
+        leaves the pages. Layer rows remove every selected layer, and a picture
+        takes its masks with it.
+        """
         if self._selected_groups and not self._selected_shared:
             self.session.delete_groups(self._selected_groups)
             return
@@ -973,13 +1288,12 @@ class LayerPanel(QWidget):
             self.session.delete_shared_groups(self._selected_shared)
             return
         if self._selected_groups and self._selected_shared:
-            current = self.list.currentItem()
-            if current is not None and current.data(0, _ITEM_KIND) == "shared":
+            if self._event_tree() is self.groups:
                 self.session.delete_shared_groups(self._selected_shared)
             else:
                 self.session.delete_groups(self._selected_groups)
             return
-        self.session.delete_active()
+        self.session.delete_selected()
 
     def _add_shared_group(self) -> None:
         """Add a group, tag the page on screen, and leave that group selected."""
@@ -1003,7 +1317,7 @@ class LayerPanel(QWidget):
         elif self.session._shared_id:
             shared_id = self.session._shared_id
         if not isinstance(shared_id, str) or self.session.document.shared_by_id(shared_id) is None:
-            self.session.show_message("Select a group, then tag the pages.")
+            self.session.show_message("Select a tag, then tag the pages.")
             return
         page_ids = list(self._selected_groups)
         if not page_ids and self.session.document.groups:
@@ -1049,7 +1363,7 @@ class LayerPanel(QWidget):
         self.session.rename_group(group.id, name)
 
     def _selected_shared_id(self) -> str | None:
-        current = self.list.currentItem()
+        current = self.groups.currentItem()
         if current is not None and current.data(0, _ITEM_KIND) == "shared":
             group_id = current.data(0, _ITEM_ID)
             if isinstance(group_id, str) and group_id in self._selected_shared:
@@ -1064,7 +1378,7 @@ class LayerPanel(QWidget):
         group = self.session.document.shared_by_id(group_id)
         if group is None:
             return
-        name = self._prompt_name("Rename group", group.name)
+        name = self._prompt_name("Rename tag", group.name)
         if name is None:
             return
         self.session.rename_shared_group(group.id, name)
@@ -1096,10 +1410,38 @@ class LayerPanel(QWidget):
             return
         self._rename_active_layer()
 
+    def _event_tree(self) -> LayerTree:
+        """The list that sent the current signal, or the one that has a selection."""
+        sender = self.sender()
+        if isinstance(sender, LayerTree):
+            return sender
+        focus = QApplication.focusWidget()
+        if focus is self.groups:
+            return self.groups
+        if self.groups.selectedItems() and not self.list.selectedItems():
+            return self.groups
+        return self.list
+
+    def _selected_row_ids(self, tree: LayerTree, kind: str) -> list[str]:
+        ids = []
+        for index in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(index)
+            if item is None or item.data(0, _ITEM_KIND) != kind or not item.isSelected():
+                continue
+            group_id = item.data(0, _ITEM_ID)
+            if isinstance(group_id, str):
+                ids.append(group_id)
+        return ids
+
     def _on_selection(self) -> None:
+        with self._item_event():
+            self._apply_selection()
+
+    def _apply_selection(self) -> None:
         if self._building or self._reordering:
             return
-        items = self.list.selectedItems()
+        tree = self._event_tree()
+        items = tree.selectedItems()
         if not items:
             # The active layer always stays selected. Rebuild from the session
             # so a toggle of the last row does not leave the list empty.
@@ -1107,19 +1449,12 @@ class LayerPanel(QWidget):
             self._selected_shared = []
             self.refresh()
             return
-        current = self.list.currentItem()
+        current = tree.currentItem()
         if current is None or not current.isSelected():
             current = items[-1]
         if all(item.data(0, _ITEM_KIND) == "shared" for item in items):
             self._selected_groups = []
-            self._selected_shared = [
-                group_id
-                for index in range(self.list.topLevelItemCount())
-                if (item := self.list.topLevelItem(index)) is not None
-                and item.data(0, _ITEM_KIND) == "shared"
-                and item.isSelected()
-                and isinstance(group_id := item.data(0, _ITEM_ID), str)
-            ]
+            self._selected_shared = self._selected_row_ids(tree, "shared")
             group_id = current.data(0, _ITEM_ID)
             if isinstance(group_id, str):
                 self._tag_group_id = group_id
@@ -1136,14 +1471,7 @@ class LayerPanel(QWidget):
             # 3. Keep the page rows highlighted. An open page used to hand the
             #    highlight to its layer, which made Delete remove that layer.
             self._selected_shared = []
-            self._selected_groups = [
-                group_id
-                for index in range(self.list.topLevelItemCount())
-                if (item := self.list.topLevelItem(index)) is not None
-                and item.data(0, _ITEM_KIND) == "group"
-                and item.isSelected()
-                and isinstance(group_id := item.data(0, _ITEM_ID), str)
-            ]
+            self._selected_groups = self._selected_row_ids(tree, "group")
             group_id = current.data(0, _ITEM_ID)
             if isinstance(group_id, str) and group_id != self.session.document.active_group_id:
                 self.session.activate_group(group_id)
@@ -1183,6 +1511,10 @@ class LayerPanel(QWidget):
         self.session.preview()
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        with self._item_event():
+            self._apply_item_changed(item, column)
+
+    def _apply_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if self._building or column != 0:
             return
         if item.data(0, _ITEM_KIND) != "layer":
@@ -1203,6 +1535,12 @@ class LayerPanel(QWidget):
         if layer is None:
             return
         visible = item.checkState(0) == Qt.CheckState.Checked
+        # A check on one row of a multi-selection sets every selected layer
+        # to that state. A row outside the selection changes only itself.
+        selected = self.session.selected_layers()
+        if len(selected) > 1 and any(chosen.id == layer.id for chosen in selected):
+            self.session.set_selected_visibility(visible)
+            return
         if layer.visible != visible:
             self.session.set_visibility(layer, visible)
 

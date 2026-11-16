@@ -276,7 +276,7 @@ class MainWindow(QMainWindow):
             "New…",
             "New",
             self._new,
-            QKeySequence.StandardKey.New,
+            QKeySequence("Ctrl+Shift+N"),
             "new",
             "Start a blank document",
         )
@@ -357,12 +357,20 @@ class MainWindow(QMainWindow):
         self._update_history_actions()
 
         edit_menu.addSeparator()
-        # One action shared by Edit, Select, and Layer so Ctrl+X / Ctrl+C fire once.
-        # Line edits accept the shortcut override and still cut or copy text.
-        self._cut_action = self._make_action(
-            "Cut selection to new layer", self.session.cut_selection_to_layer, QKeySequence("Ctrl+X")
+        # One action shared by Edit, Select, and Layer so Ctrl+X / Ctrl+C / Ctrl+V
+        # fire once. The names start as the layer commands. _sync_clipboard_labels
+        # switches Cut and Copy while Select has a drawn selection.
+        # NoRole keeps the Mac from treating these as system text commands.
+        # A name of exactly Copy or Paste would be sent to the text responder
+        # and would never reach the layer. A focused text field is forwarded
+        # in the handlers below, so it still cuts, copies, and pastes its text.
+        self._cut_action = self._make_action("Cut layer", self._cut_shortcut, QKeySequence("Ctrl+X"))
+        self._copy_action = self._make_action("Copy layer", self._copy_shortcut, QKeySequence("Ctrl+C"))
+        self._paste_action = self._make_action(
+            "Paste layer", self._paste_from_clipboard, QKeySequence.StandardKey.Paste
         )
-        self._copy_action = self._make_action("Copy", self._copy_shortcut, QKeySequence("Ctrl+C"))
+        for action in (self._cut_action, self._copy_action, self._paste_action):
+            action.setMenuRole(QAction.MenuRole.NoRole)
         self._deselect_action = self._make_action("Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
         # Shared by Edit, Select, and Layer. The icon is set once on the action.
         self._cut_action.setIcon(icon_named("cut-to-layer"))
@@ -370,6 +378,7 @@ class MainWindow(QMainWindow):
         self._deselect_action.setIcon(icon_named("deselect"))
         edit_menu.addAction(self._cut_action)
         edit_menu.addAction(self._copy_action)
+        edit_menu.addAction(self._paste_action)
         edit_menu.addAction(self._deselect_action)
         # WidgetShortcut displays Delete in the menu. It only fires when the
         # window itself has focus, so a line edit still receives the key.
@@ -380,11 +389,8 @@ class MainWindow(QMainWindow):
         clear_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
         clear_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         edit_menu.addSeparator()
-        # Ctrl+C copies the active layer, or the marching-ants selection when
-        # one exists. Clipboard copy is a different action, so it takes Shift.
-        # Paste is the standard key. A focused text field still receives Ctrl+V.
+        # Clipboard copy is a different action from Copy layer, so it takes Shift.
         self._action(edit_menu, "Copy to clipboard", self._copy_to_clipboard, QKeySequence("Ctrl+Shift+C"))
-        self._action(edit_menu, "Paste", self._paste_from_clipboard, QKeySequence.StandardKey.Paste)
 
         self._action(image_menu, "Crop to selection", self._crop_selection, icon="crop-to-selection")
         self._action(image_menu, "Trim transparent edges", self.session.trim)
@@ -425,19 +431,20 @@ class MainWindow(QMainWindow):
         self._action(image_menu, "Desaturate", lambda: self.session.run_filter("Desaturate", desaturate))
         self._action(image_menu, "Invert", lambda: self.session.run_filter("Invert", invert))
 
-        self._action(layer_menu, "New layer", self.session.add_blank_layer, QKeySequence("Ctrl+Shift+N"))
-        self._action(layer_menu, "New page", self.session.add_group)
-        self._action(layer_menu, "Delete page", self.session.delete_active_group)
-        self._action(layer_menu, "New group", self.session.add_shared_group)
-        self._action(layer_menu, "Delete group", self._delete_shared_group)
-        self._action(layer_menu, "Tag pages", self._tag_pages)
-        self._action(layer_menu, "Place image…", self._place)
-        self._action(layer_menu, "Duplicate", self.session.duplicate_active, QKeySequence("Ctrl+J"))
-        self._action(layer_menu, "Delete", self.session.delete_active)
-        self._action(layer_menu, "Rename…", self._rename_layer)
-        layer_menu.addSeparator()
+        self._action(layer_menu, "New layer", self.session.add_blank_layer, QKeySequence("Ctrl+N"))
         layer_menu.addAction(self._cut_action)
         layer_menu.addAction(self._copy_action)
+        layer_menu.addAction(self._paste_action)
+        self._action(layer_menu, "Duplicate", self.session.duplicate_active, QKeySequence("Ctrl+J"))
+        self._action(layer_menu, "Delete", self.session.delete_selected)
+        self._action(layer_menu, "Rename…", self._rename_layer)
+        layer_menu.addSeparator()
+        self._action(layer_menu, "New page", self.session.add_group)
+        self._action(layer_menu, "Delete page", self.session.delete_active_group)
+        self._action(layer_menu, "New tag", self.session.add_shared_group)
+        self._action(layer_menu, "Delete tag", self._delete_shared_group)
+        self._action(layer_menu, "Tag pages", self._tag_pages)
+        self._action(layer_menu, "Place image…", self._place)
         layer_menu.addSeparator()
         self._action(layer_menu, "Apply mask", self.session.apply_active_mask)
         self._action(
@@ -445,10 +452,24 @@ class MainWindow(QMainWindow):
         )
         self._action(layer_menu, "Flatten image", self.session.flatten)
         layer_menu.addSeparator()
-        self._action(layer_menu, "Bring forward", lambda: self.session.move_active(1))
-        self._action(layer_menu, "Send backward", lambda: self.session.move_active(-1))
+        self._action(layer_menu, "Bring forward", lambda: self.session.move_active(1), QKeySequence("Ctrl+Up"))
+        self._action(layer_menu, "Send backward", lambda: self.session.move_active(-1), QKeySequence("Ctrl+Down"))
         layer_menu.addSeparator()
         self._action(layer_menu, "Scale…", self._scale_layer, icon="scale")
+        self._action(
+            layer_menu,
+            "Rotate 90° clockwise",
+            self.session.rotate_active_cw,
+            QKeySequence("Ctrl+R"),
+            icon="rotate-cw",
+        )
+        self._action(
+            layer_menu,
+            "Rotate 90° counter-clockwise",
+            self.session.rotate_active_ccw,
+            QKeySequence("Ctrl+Shift+R"),
+            icon="rotate-ccw",
+        )
         self._action(layer_menu, "Rotate…", self._rotate_layer, icon="rotate")
         self._action(layer_menu, "Flip horizontal", self.session.flip_active_horizontal, icon="flip-h")
         self._action(layer_menu, "Flip vertical", self.session.flip_active_vertical, icon="flip-v")
@@ -525,6 +546,7 @@ class MainWindow(QMainWindow):
         self._about_action.setIconText("About")
         self._about_action.setToolTip("About PixEdit")
         self._about_action.setStatusTip("About PixEdit")
+        self._sync_clipboard_labels()
         self._populate_file_toolbar()
 
     def _file_action(self, menu, label: str, short_label: str, slot, shortcut, icon_name: str, summary: str) -> QAction:
@@ -664,6 +686,8 @@ class MainWindow(QMainWindow):
             focus is not None and self.options.isAncestorOf(focus)
         )
         self.current = tool
+        # Cut and Copy name the selection only while this tool has one drawn.
+        self._sync_clipboard_labels()
         button = self._buttons.get(tool.id)
         if button is not None:
             button.setChecked(True)
@@ -708,6 +732,8 @@ class MainWindow(QMainWindow):
         if self.current is not None and self.current.id == "color":
             self.options.reload_from_session()
             self.options.update_actions()
+        # A new or cleared selection changes what Ctrl+X and Ctrl+C will do.
+        self._sync_clipboard_labels()
 
     def _update_history_actions(self) -> None:
         if hasattr(self, "undo_action"):
@@ -868,16 +894,65 @@ class MainWindow(QMainWindow):
         """A system-clipboard change wins over the layer copied with Ctrl+C."""
         self._layer_paste_armed = False
 
-    def _copy_shortcut(self) -> None:
-        """Ctrl+C. A marching-ants selection becomes a new layer immediately.
+    def _selection_keys_active(self) -> bool:
+        """Ctrl+X and Ctrl+C act on the selection only in this state.
 
-        Otherwise the active layer is remembered and Ctrl+V pastes it. This
-        does not write the system clipboard, so an older screenshot stays
-        there and does not become the paste. A line edit accepts the shortcut
-        first and still copies its own text.
+        Both have to be true. Select with nothing drawn, or a selection left
+        up while another tool is active, still cuts or copies the active layer.
         """
-        if self.session.document.selection is not None:
+        tool = self.current
+        return tool is not None and tool.id == "select" and self.session.document.selection is not None
+
+    def _sync_clipboard_labels(self) -> None:
+        """Name Cut and Copy for what the key will do right now.
+
+        The same actions sit in Edit, Select, and Layer, so one text change
+        updates every menu. Paste stays a layer paste in every state.
+        """
+        cut = getattr(self, "_cut_action", None)
+        copy = getattr(self, "_copy_action", None)
+        if cut is None or copy is None:
+            return
+        if self._selection_keys_active():
+            cut.setText("Cut selection to new layer")
+            copy.setText("Copy selection to new layer")
+        else:
+            cut.setText("Cut layer")
+            copy.setText("Copy layer")
+
+    def _cut_shortcut(self) -> None:
+        """Ctrl+X. A text field cuts its own text.
+
+        Otherwise, Select plus a drawn selection moves those pixels onto a
+        new layer and does not arm Paste. Any other tool cuts the active
+        layer, masks included, so Ctrl+V can put it back.
+        """
+        editor = _focused_text_editor()
+        if editor is not None:
+            editor.cut()
+            return
+        if self._selection_keys_active():
+            self.session.cut_selection_to_layer()
+            self._layer_paste_armed = False
+            return
+        if self.session.cut_active_layer():
+            self._layer_paste_armed = True
+
+    def _copy_shortcut(self) -> None:
+        """Ctrl+C. A text field copies its own text.
+
+        Otherwise, Select plus a drawn selection copies those pixels onto a
+        new layer immediately and does not arm Paste. Any other tool remembers
+        the active layer. This does not write the system clipboard, so an
+        older screenshot stays there and does not become the paste.
+        """
+        editor = _focused_text_editor()
+        if editor is not None:
+            editor.copy()
+            return
+        if self._selection_keys_active():
             self.session.copy_selection_to_layer()
+            self._layer_paste_armed = False
             return
         if self.session.copy_active_layer():
             self._layer_paste_armed = True
@@ -1037,9 +1112,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
-        # A PDF is one page per PDF page, including a single page, and those
-        # pages bring their shared group. A multi-frame GIF, WebP, or TIFF
-        # has that same shape. A still image stays layers on the open page.
+        # A PDF is one page per PDF page, including a single page, and it does
+        # not add a group. A multi-frame GIF, WebP, or TIFF is one page per
+        # frame and brings the group that tags those frames. A still image
+        # stays layers on the open page.
         if Path(path).suffix.lower() == ".pdf" or len(incoming.groups) > 1:
             self.session.place_groups(incoming.groups, incoming.shared_groups)
         else:
@@ -1141,7 +1217,7 @@ class MainWindow(QMainWindow):
         if not selected and self.session._shared_id:
             selected = [self.session._shared_id]
         if not selected:
-            self.session.show_message("Select a group to delete.")
+            self.session.show_message("Select a tag to delete.")
             return
         self.session.delete_shared_groups(selected)
 
@@ -1466,9 +1542,15 @@ class _VersionLabel(QLabel):
 
 
 def _focused_text_editor():
-    """The focused line, text, or spin box, when it should keep Ctrl+V."""
+    """The focused line or text editor, when it should keep Ctrl+X, Ctrl+C, and Ctrl+V.
+
+    A spin box keeps the keyboard on itself. Its line edit is the field that
+    cuts, copies, and pastes the number.
+    """
     widget = QApplication.focusWidget()
-    if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+    if isinstance(widget, QAbstractSpinBox):
+        widget = widget.lineEdit()
+    if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
         return widget
     return None
 

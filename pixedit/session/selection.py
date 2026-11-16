@@ -106,8 +106,8 @@ class SelectionMixin:
         if introducing:
             self.show_message(
                 "Selection clips brush, fill, shapes, and filters. "
-                "Ctrl+X cuts it to a new layer · Ctrl+C copies it · Delete clears pixels · "
-                "Ctrl+D or Esc deselects."
+                "While Select is active, Ctrl+X cuts it to a new layer and Ctrl+C copies it. "
+                "Delete clears pixels. Ctrl+D or Esc deselects."
             )
 
     def clear_selection_contents(self) -> None:
@@ -181,7 +181,7 @@ class SelectionMixin:
         if not self.require_page():
             return
         if self.document.selection is None:
-            self.show_message("Draw a selection first. Select (S), then Ctrl+C copies it to a new layer.")
+            self.show_message("Draw a selection first. Select (S), then Cut to layer or Copy to layer.")
             return
         layer = self.active_layer()
         if not self._can_copy_pixels(layer):

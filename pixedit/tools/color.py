@@ -15,10 +15,14 @@ class ColorTool(Tool):
     label = "Image & Eyedrop"
     shortcut = "I"
     cursor = "eyedrop"
-    hint = "Click to pick a color. Sliders adjust the active layer; Apply keeps the change."
+    hint = (
+        "Click to pick a color. Sliders adjust the selected layers; Apply keeps the change. "
+        "Colorize sets the hue outright: Saturation is how strong that color is, and a black shape needs Brightness above zero."
+    )
 
     def option_schema(self):
         return [
+            {"key": "color_colorize", "label": "Colorize", "type": "bool", "default": False, "live": "color"},
             {"key": "color_hue", "label": "Hue", "type": "int", "min": -180, "max": 180, "default": 0, "suffix": "°", "live": "color"},
             {"key": "color_saturation", "label": "Saturation", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},
             {"key": "color_brightness", "label": "Brightness", "type": "int", "min": -100, "max": 100, "default": 0, "live": "color"},

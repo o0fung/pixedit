@@ -491,22 +491,32 @@ def composite_view(
     document: Document,
     box: tuple[float, float, float, float],
     scale: float,
+    *,
+    size: tuple[int, int] | None = None,
 ) -> Image.Image:
     """Flatten ``box`` at ``scale`` screen pixels per document pixel.
 
-    ``box`` is ``(x0, y0, x1, y1)`` in document pixels. The result is only as
-    large as that rectangle on screen, and never larger than the rectangle in
-    document pixels. Redaction layers are skipped: blur and noise read outside
-    a downscaled box, so the caller uses ``composite`` when a mask is visible.
-    Export and the eyedropper stay on ``composite``.
+    ``box`` is ``(x0, y0, x1, y1)`` in document pixels. Without ``size``, the
+    result is only as large as that rectangle on screen, and never larger than
+    the rectangle in document pixels. ``size`` is an exact ``(width, height)``
+    for a tile that must replace view pixels one for one. Redaction layers are
+    skipped: blur and noise read outside a downscaled box, so the caller uses
+    ``composite`` when a mask is visible. Export and the eyedropper stay on
+    ``composite``.
     """
     x0, y0, x1, y1 = (float(value) for value in box)
     span_x = x1 - x0
     span_y = y1 - y0
     if span_x <= 0 or span_y <= 0:
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-    out_w = _view_size(span_x, scale)
-    out_h = _view_size(span_y, scale)
+    if size is None:
+        out_w = _view_size(span_x, scale)
+        out_h = _view_size(span_y, scale)
+    else:
+        # The brush patch asks for the view pixels it will overwrite. Scaling
+        # that tile to fit would smear the stroke, so the size is exact.
+        out_w = max(1, int(size[0]))
+        out_h = max(1, int(size[1]))
     canvas = np.zeros((out_h, out_w, 4), dtype=np.float32)
     for layer in _stack(document):
         if not layer.visible or layer.opacity <= 0 or layer.kind == "redaction":
@@ -633,27 +643,43 @@ def merge_pair(lower: Layer, upper: Layer) -> Layer:
     layers: the mask still samples only ``lower``, which is the whole stack
     below the redaction *within this pair*.
     """
+    return merge_layers([lower, upper])
+
+
+def merge_layers(layers: list[Layer]) -> Layer:
+    """Bake ``layers`` into one Normal raster, back to front.
+
+    The temporary canvas covers the union of the bitmaps, including pixels
+    outside the document. A mask still filters the picture it names when that
+    picture is in this list. The result keeps the back layer's name and
+    visibility. The caller renames it when a different layer should win.
+    """
     from pixedit.model import Layer as LayerCls
     from pixedit.model import new_id
+
+    if not layers:
+        raise ValueError("nothing to merge")
 
     def extent(layer: Layer) -> tuple[int, int, int, int]:
         image = layer.bitmap()
         return layer.x, layer.y, layer.x + image.width, layer.y + image.height
 
-    boxes = [extent(lower), extent(upper)]
+    # Clones get new ids. Point each mask at the copy of its picture so the
+    # effect still finds that picture inside this temporary stack.
+    clones = [layer.clone() for layer in layers]
+    id_map = {original.id: copy.id for original, copy in zip(layers, clones)}
+    for copy in clones:
+        if copy.target_id in id_map:
+            copy.target_id = id_map[copy.target_id]
+    boxes = [extent(layer) for layer in clones]
     min_x = min(box[0] for box in boxes)
     min_y = min(box[1] for box in boxes)
     max_x = max(box[2] for box in boxes)
     max_y = max(box[3] for box in boxes)
-    width = max(1, max_x - min_x)
-    height = max(1, max_y - min_y)
-    a = lower.clone()
-    b = upper.clone()
-    a.x -= min_x
-    a.y -= min_y
-    b.x -= min_x
-    b.y -= min_y
-    temp = Document(width=width, height=height, layers=[a, b])
+    for copy in clones:
+        copy.x -= min_x
+        copy.y -= min_y
+    temp = Document(width=max(1, max_x - min_x), height=max(1, max_y - min_y), layers=clones)
     flat = composite(temp)
     alpha = np.asarray(flat)[..., 3]
     ys, xs = np.nonzero(alpha > 0)
@@ -665,11 +691,12 @@ def merge_pair(lower: Layer, upper: Layer) -> Layer:
         image = flat.crop((left, top, right, bottom))
         x = min_x + left
         y = min_y + top
+    back = layers[0]
     return LayerCls(
         id=new_id(),
-        name=lower.name,
+        name=back.name,
         kind="raster",
-        visible=lower.visible,
+        visible=back.visible,
         opacity=1.0,
         blend_mode="normal",
         image=image,

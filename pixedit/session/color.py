@@ -15,7 +15,17 @@ from pixedit.geom import placed_box, selection_for_layer
 from pixedit.model import Layer, MutateLayerCommand, apply_visual, visual_state
 from pixedit.proxy import downscale, preview_scale, set_preview_source
 
+def _union_box(left, right):
+    """The rectangle covering both boxes. Either may be missing."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return (min(left[0], right[0]), min(left[1], right[1]), max(left[2], right[2]), max(left[3], right[3]))
+
+
 _COLOR_OPTION_KEYS = (
+    "color_colorize",
     "color_hue",
     "color_saturation",
     "color_brightness",
@@ -32,7 +42,22 @@ class ColorMixin:
         return {key: float(self.option(key, 0)) for key in _COLOR_OPTION_KEYS}
 
     def color_adjust_active(self) -> bool:
-        return self._color_before is not None
+        return bool(self._color_grades) or self._color_before is not None
+
+    def _color_grade_targets(self) -> list[Layer]:
+        """Pictures and text layers the sliders should grade.
+
+        One selected layer is that layer, unless it is a mask. Two or more
+        skip masks and grade the rest. An empty result means the status line
+        should ask for a picture or text layer.
+        """
+        selected = self.selected_layers()
+        if len(selected) > 1:
+            return [layer for layer in selected if layer.kind in ("raster", "text")]
+        layer = self.active_layer()
+        if layer is None or layer.kind == "redaction":
+            return []
+        return [layer]
 
     def _color_is_neutral(self, values: dict[str, float] | None = None) -> bool:
         data = self.color_adjust_values() if values is None else values
@@ -43,16 +68,18 @@ class ColorMixin:
             self.options[key] = 0
 
     def _restore_color_snapshot(self) -> bool:
-        before = self._color_before
-        layer = self._color_layer
+        grades = list(self._color_grades)
+        self._color_grades = []
         self._color_before = None
         self._color_layer = None
-        if layer is not None:
+        restored = False
+        for layer, before in grades:
             set_preview_source(layer, None)
-        if before is None or layer is None:
-            return False
-        apply_visual(layer, before)
-        return True
+            if before is None:
+                continue
+            apply_visual(layer, before)
+            restored = True
+        return restored
 
     def _discard_color_preview(self) -> None:
         """Put the snapshot back and zero the sliders. The caller notifies."""
@@ -80,40 +107,44 @@ class ColorMixin:
             self._ending_color = False
 
     def preview_color_adjust(self) -> None:
-        """Redraw the active layer from the sliders without writing history.
+        """Redraw the selected layers from the sliders without writing history.
 
         Flow:
-        1. A mask layer is refused. The sliders return to zero.
-        2. All sliders at zero put the snapshot back, if a drag had started.
-        3. The first non-zero value snapshots the layer, including text.
-        4. Later values recompute from that snapshot so the sliders combine
-           into one grade. The selection, when there is one, limits the grade.
+        1. A mask, or a selection of only masks, is refused. The sliders return
+           to zero.
+        2. A different set of layers than the one already previewing cancels
+           that preview. Moving the active layer inside the same set does not.
+        3. All sliders at zero, with Colorize off, put every snapshot back.
+        4. The first non-zero value, or Colorize, snapshots each picture and text layer.
+        5. Later values recompute from those snapshots so the sliders combine
+           into one grade. A marching-ants selection limits each layer.
         """
-        layer = self.active_layer()
-        if layer is None or layer.kind == "redaction":
+        targets = self._color_grade_targets()
+        if not targets:
             self.cancel_color_adjust()
             self.show_message("Choose a raster or text layer for this filter.")
             return
-        if self._color_layer is not None and layer is not self._color_layer:
+        stored = [layer for layer, _before in self._color_grades]
+        if stored and [layer.id for layer in stored] != [layer.id for layer in targets]:
             self.cancel_color_adjust()
             return
         values = self.color_adjust_values()
         if self._color_is_neutral(values):
-            if self._color_before is not None and self._color_layer is layer:
-                set_preview_source(layer, None)
-                apply_visual(layer, self._color_before)
-                self._color_before = None
-                self._color_layer = None
+            if self._color_grades:
+                self._restore_color_snapshot()
                 self.preview()
             return
-        if self._color_before is None:
-            self._color_before = visual_state(layer)
-            self._color_layer = layer
-        self._paint_color_preview(layer, final=False)
-        self.preview(placed_box(layer, self.document.width, self.document.height))
+        if not self._color_grades:
+            self._color_grades = [(layer, visual_state(layer)) for layer in targets]
+            self._color_layer = targets[0]
+            self._color_before = self._color_grades[0][1]
+        bounds = None
+        for layer, before in self._color_grades:
+            self._paint_color_preview(layer, before, final=False)
+            bounds = _union_box(bounds, placed_box(layer, self.document.width, self.document.height))
+        self.preview(bounds)
 
-    def _paint_color_preview(self, layer: Layer, *, final: bool) -> None:
-        before = self._color_before
+    def _paint_color_preview(self, layer: Layer, before: dict | None, *, final: bool) -> None:
         if before is None:
             return
         values = self.color_adjust_values()
@@ -131,6 +162,7 @@ class ColorMixin:
                 contrast=values["color_contrast"],
                 highlight=values["color_highlight"],
                 shade=values["color_shade"],
+                colorize=bool(values["color_colorize"]),
             )
 
         if scale >= 1.0:
@@ -148,20 +180,22 @@ class ColorMixin:
 
     def commit_color_adjust(self) -> None:
         """Keep the preview as one undo step and return the sliders to zero."""
-        layer = self._color_layer
-        before = self._color_before
-        if layer is None or before is None or self._color_is_neutral():
+        grades = list(self._color_grades)
+        if not grades or self._color_is_neutral():
             self.cancel_color_adjust()
             return
-        self._paint_color_preview(layer, final=True)
-        new_state = visual_state(layer)
-        new_state["kind"] = "raster"
-        new_state["text"] = None
-        apply_visual(layer, before)
+        edits = []
+        for layer, before in grades:
+            self._paint_color_preview(layer, before, final=True)
+            new_state = visual_state(layer)
+            new_state["kind"] = "raster"
+            new_state["text"] = None
+            edits.append((layer, new_state, before))
+        self._color_grades = []
         self._color_before = None
         self._color_layer = None
         self._zero_color_options()
-        self.commit(MutateLayerCommand(layer, new_state, name="Color"))
+        self.commit_layer_visuals(edits, "Color")
 
     def run_filter(self, name: str, function: Callable[[Image.Image], Image.Image]) -> None:
         """Apply a pixel function to the active raster or text layer, honoring the selection."""

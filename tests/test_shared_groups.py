@@ -180,8 +180,11 @@ def test_group_and_tag_buttons_add_and_remove_a_tag():
     panel.show()
     app.processEvents()
     icons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
-    icons["Group"].click()
+    assert panel._groups_empty.isVisibleTo(panel)
+    icons["New tag"].click()
     app.processEvents()
+    assert not panel._groups_empty.isVisibleTo(panel)
+    assert panel.groups.topLevelItemCount() == 1
     assert len(session.document.shared_groups) == 1
     group_id = session.document.shared_groups[0].id
     assert session.document.group.shared_ids == [group_id]
@@ -191,9 +194,38 @@ def test_group_and_tag_buttons_add_and_remove_a_tag():
     app.processEvents()
     assert len(session.document.groups) == 2
     assert session.document.group.shared_ids == [group_id]
-    icons["Tag"].click()
+    icons["Tag pages"].click()
     app.processEvents()
     assert session.document.group.shared_ids == []
     assert session.document.groups[0].shared_ids == [group_id]
+
+    photo = session.document.groups[0].layers[0]
+    page = panel.list.topLevelItem(0)
+    assert page is not None and page.childCount() >= 1
+    layer_row = page.child(0)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(layer_row)
+    layer_row.setSelected(True)
+    panel.list.blockSignals(False)
+    header = panel.groups.topLevelItem(0)
+    assert header is not None
+    assert panel.prepare_cross_drop(panel.list, header, 0)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(page)
+    page.setSelected(True)
+    panel.list.blockSignals(False)
+    assert panel.prepare_cross_drop(panel.list, header, 0) is False
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(layer_row)
+    layer_row.setSelected(True)
+    panel.list.blockSignals(False)
+    assert panel.prepare_cross_drop(panel.list, header, 0)
+    panel._apply_pending_drop()
+    app.processEvents()
+    assert all(layer.id != photo.id for layer in session.document.groups[0].layers)
+    assert any(layer.id == photo.id for layer in session.document.shared_groups[0].layers)
     panel.close()
     app.processEvents()

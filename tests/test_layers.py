@@ -78,6 +78,75 @@ def test_merge_down_bakes_upper_layer():
     assert composite(session.document).getpixel((0, 0))[0] > 250
 
 
+def test_merge_selected_layers_leaves_the_one_between_them():
+    """Several selected layers bake together. A layer between them stays put."""
+    session = Session(new_document(4, 4, "white"))
+    back = session.document.layers[0]
+    back.name = "Back"
+    back.image = Image.new("RGBA", (4, 4), (255, 0, 0, 255))
+    session.add_layer(raster_layer("Mid", Image.new("RGBA", (4, 4), (0, 255, 0, 255))))
+    front_image = Image.new("RGBA", (4, 4), (0, 0, 255, 255))
+    front_image.putpixel((0, 0), (0, 0, 0, 0))
+    front = raster_layer("Front", front_image)
+    session.add_layer(front)
+    session.select_layers([back.id, front.id], active_id=front.id)
+    session.merge_down_active()
+    assert [layer.name for layer in session.document.layers] == ["Mid", "Front"]
+    merged = session.document.layers[1]
+    assert merged.id == front.id
+    # The clear corner of Front still shows Back. Mid was not part of the plate.
+    assert merged.image.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert merged.image.getpixel((1, 1))[:3] == (0, 0, 255)
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (0, 255, 0)
+    assert session.history.undo_stack[-1].name == "Merge layers"
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Back", "Mid", "Front"]
+
+
+def test_selected_mask_merges_into_its_picture_not_the_layer_below():
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(4, 4, "white"))
+    below = session.document.layers[0]
+    below.name = "Below"
+    below.image = Image.new("RGBA", (4, 4), (0, 0, 255, 255))
+    picture = raster_layer("Picture", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    session.add_layer(picture)
+    cover = redaction_layer(
+        "Cover",
+        Image.new("L", (4, 4), 255),
+        "solid",
+        1,
+        color=(0, 255, 0, 255),
+        target_id=picture.id,
+    )
+    session.add_layer(cover)
+    session.select_layers([picture.id, cover.id], active_id=cover.id)
+    session.merge_down_active()
+    assert [layer.name for layer in session.document.layers] == ["Below", "Cover"]
+    assert session.document.layers[0].image.getpixel((0, 0))[:3] == (0, 0, 255)
+    assert session.document.layers[1].image.getpixel((0, 0))[:3] == (0, 255, 0)
+    assert session.history.undo_stack[-1].name == "Merge layers"
+
+
+def test_merge_of_only_masks_asks_for_layers():
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(4, 4, "white"))
+    picture = session.document.layers[0]
+    one = redaction_layer("One", Image.new("L", (4, 4), 255), "solid", 1, color=(0, 0, 0, 255), target_id=picture.id)
+    two = redaction_layer("Two", Image.new("L", (4, 4), 255), "solid", 1, color=(0, 0, 0, 255), target_id=picture.id)
+    session.add_layer(one)
+    session.add_layer(two)
+    session.select_layers([one.id, two.id], active_id=two.id)
+    messages = []
+    session.set_message_handler(messages.append)
+    before = [layer.id for layer in session.document.layers]
+    session.merge_down_active()
+    assert [layer.id for layer in session.document.layers] == before
+    assert messages == ["Select the layers to merge."]
+
+
 def test_layer_list_drop_reorders_the_document():
     from PyQt6.QtWidgets import QApplication, QToolButton
 
@@ -91,23 +160,21 @@ def test_layer_list_drop_reorders_the_document():
     panel = LayerPanel(session)
     panel.refresh()
     icons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
-    assert {"New", "Copy", "Delete", "Up", "Down", "Visibility", "Page", "Group", "Tag", "Merge down"} <= set(icons)
+    assert {"Merge down", "Page", "New tag", "Tag pages"} <= set(icons)
+    assert "Visibility" not in icons and "New" not in icons and "Up" not in icons and "Down" not in icons
+    assert panel._groups_empty.text() == "No tags yet."
+    assert panel._groups_empty.isVisibleTo(panel)
+    assert not panel.groups.isVisibleTo(panel)
     for name, button in icons.items():
         assert not button.icon().isNull(), name
-        if name == "Visibility":
-            assert "selected layer" in button.toolTip()
-        elif name == "Delete":
-            assert "selected layer" in button.toolTip()
-            assert "group" in button.toolTip()
-        elif name == "Page":
+        if name == "Page":
             assert "own canvas" in button.toolTip()
-        elif name == "Group":
-            assert "tagged" in button.toolTip()
-        elif name == "Tag":
+        elif name == "New tag":
+            assert "tag" in button.toolTip().lower()
+        elif name == "Tag pages":
             assert "tag" in button.toolTip().lower()
         elif name == "Merge down":
             assert "below" in button.toolTip()
-            assert "Flatten" in button.toolTip()
             assert "Ctrl+Shift+E" in button.toolTip()
         else:
             assert button.toolTip() == name
@@ -314,19 +381,97 @@ def test_row_paint_keeps_the_name_brighter_than_the_caption():
     panel.close()
 
 
-def _row_pixels(panel, item, selected: bool):
+def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
+    import numpy as np
+    from PyQt6.QtGui import QFontMetrics
+    from PyQt6.QtWidgets import QApplication, QLabel, QToolButton
+
+    from pixedit.ui.icons import icon_named
+    from pixedit.ui.layers_panel import (
+        _CAPTION_COLOR,
+        _ITEM_META,
+        _ITEM_TAGS,
+        _NAME_COLOR,
+        _caption_font,
+        LayerPanel,
+        branch_line_rect,
+    )
+
+    assert not icon_named("tag-new").isNull()
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(16, 16, "white"))
+    session.add_shared_group()
+    session.add_shared_group()
+    session.add_shared_group()
+    assert [group.name for group in session.document.shared_groups] == ["Tag 1", "Tag 2", "Tag 3"]
+    session.add_group()
+    session.document.group.shared_ids = []
+    panel = LayerPanel(session)
+    panel.resize(320, 640)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+
+    sections = [label.text() for label in panel.findChildren(QLabel) if label.objectName() == "section"]
+    assert sections == ["Pages", "Tags"]
+    buttons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
+    row = buttons["Page"].y()
+    assert buttons["New tag"].y() == row
+    assert buttons["Tag pages"].y() == row
+    assert buttons["Merge down"].y() == row
+    assert buttons["Page"].x() < buttons["New tag"].x() < buttons["Tag pages"].x() < buttons["Merge down"].x()
+
+    tagged = panel.list.topLevelItem(0)
+    bare = panel.list.topLevelItem(1)
+    assert tagged.data(0, _ITEM_META) == "16 × 16"
+    assert list(tagged.data(0, _ITEM_TAGS)) == ["Tag 1", "Tag 2", "Tag 3"]
+    assert tagged.toolTip(0) == "Tag 1\nTag 2\nTag 3"
+    assert list(bare.data(0, _ITEM_TAGS) or []) == []
+    assert bare.data(0, _ITEM_META) == "16 × 16"
+
+    caption_h = QFontMetrics(_caption_font(panel.font())).height()
+    delta = panel.list.visualItemRect(tagged).height() - panel.list.visualItemRect(bare).height()
+    # Three tag names, plus the blank line the fold arrow sits on.
+    assert abs(delta - 4 * caption_h) <= caption_h
+    tagged_row = panel.list.visualItemRect(tagged)
+    branch = branch_line_rect(tagged_row, caption_h)
+    assert branch.bottom() == tagged_row.bottom()
+    assert branch.top() > tagged_row.top()
+    layer = tagged.child(0)
+    assert panel.list.visualItemRect(layer).top() > panel.list.visualItemRect(tagged).bottom()
+
+    page = _row_pixels(panel, tagged, selected=False, height=280)
+    name = _nearest_mask(page, _NAME_COLOR, _CAPTION_COLOR)
+    caption = _nearest_mask(page, _CAPTION_COLOR, _NAME_COLOR)
+    name_rows = np.nonzero(name.any(axis=1))[0]
+    bands = _pixel_bands(caption)
+    assert len(bands) == 4
+    size_top, size_bottom = bands[0]
+    assert size_top <= int(name_rows.mean()) <= size_bottom
+    size_cols = caption[size_top : size_bottom + 1].any(axis=0).nonzero()[0]
+    name_cols = name.any(axis=0).nonzero()[0]
+    assert float(name_cols.mean()) < float(size_cols.mean())
+    previous_bottom = int(name_rows.max())
+    for top, bottom in bands[1:]:
+        assert top > previous_bottom
+        previous_bottom = bottom
+    panel.close()
+
+
+def _row_pixels(panel, item, selected: bool, height: int = 72, point_size: int = 15):
     """RGB pixels of one row, cropped to the text the delegate paints."""
     import numpy as np
     from PyQt6.QtCore import QRect
     from PyQt6.QtGui import QColor, QImage, QPainter
     from PyQt6.QtWidgets import QStyle, QStyleOptionViewItem
 
-    image = QImage(420, 72, QImage.Format.Format_RGB32)
+    image = QImage(420, height, QImage.Format.Format_RGB32)
     image.fill(QColor("#1a1f26"))
     option = QStyleOptionViewItem()
     option.rect = QRect(0, 0, image.width(), image.height())
     option.font = panel.font()
-    option.font.setPointSize(15)
+    option.font.setPointSize(point_size)
     option.widget = panel.list
     option.decorationSize = panel.list.iconSize()
     option.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Active
@@ -368,6 +513,29 @@ def _color_bands(pixels, name_color, caption_color) -> tuple[float, float]:
     return float(np_rows(name).mean()), float(np_rows(caption).mean())
 
 
+def _pixel_bands(mask) -> list[tuple[int, int]]:
+    """Runs of set rows. A one-pixel hole stays in the run.
+
+    Antialiasing can leave a speck just under a glyph. A real line break is
+    several rows of background, so that speck does not become its own line.
+    """
+    import numpy as np
+
+    rows = np.nonzero(mask.any(axis=1))[0]
+    if len(rows) == 0:
+        return []
+    bands: list[tuple[int, int]] = []
+    start = previous = int(rows[0])
+    for row in rows[1:]:
+        row = int(row)
+        if row > previous + 2:
+            bands.append((start, previous))
+            start = row
+        previous = row
+    bands.append((start, previous))
+    return bands
+
+
 def _color_columns(pixels, name_color, caption_color) -> tuple[float, float]:
     name = _nearest_mask(pixels, name_color, caption_color)
     caption = _nearest_mask(pixels, caption_color, name_color)
@@ -402,37 +570,30 @@ def _icon_has_color(icon, rgb: tuple[int, int, int], tolerance: int = 8) -> bool
     return bool(np.any(np.max(np.abs(pixels.astype(np.int16) - target), axis=-1) <= tolerance))
 
 
-def test_visibility_toggle_flips_every_selected_layer():
+def test_selected_visibility_follows_one_check_state():
     session = Session(new_document(8, 8, "white"))
     session.document.layers[0].name = "Back"
     mid = raster_layer("Mid", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
     front = raster_layer("Front", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
     session.add_layer(mid)
     session.add_layer(front)
-    session.set_visibility(mid, False)
     session.select_layers([front.id, mid.id], active_id=front.id)
-    session.toggle_selected_visibility()
+    session.set_selected_visibility(False)
     assert front.visible is False
-    assert mid.visible is True
+    assert mid.visible is False
     assert session.document.layers[0].visible is True
     assert session.history.undo_stack[-1].name == "Toggle visibility"
     session.undo()
     assert front.visible is True
-    assert mid.visible is False
+    assert mid.visible is True
     session.redo()
     assert front.visible is False
-    assert mid.visible is True
-    # A second toggle restores the mix, still as one step.
-    steps = len(session.history.undo_stack)
-    session.toggle_selected_visibility()
-    assert front.visible is True
     assert mid.visible is False
-    assert len(session.history.undo_stack) == steps + 1
 
 
-def test_visibility_button_toggles_the_selection_and_refreshes_the_checks():
+def test_checkbox_sets_every_selected_layer_and_leaves_the_rest():
     from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import QApplication, QToolButton
+    from PyQt6.QtWidgets import QApplication
 
     from pixedit.ui.layers_panel import LayerPanel
 
@@ -450,15 +611,18 @@ def test_visibility_button_toggles_the_selection_and_refreshes_the_checks():
     app.processEvents()
     session.select_layers([front.id, session.document.layers[0].id], active_id=front.id)
     panel.refresh()
-    button = next(item for item in panel.findChildren(QToolButton) if item.accessibleName() == "Visibility")
-    assert button.geometry().right() < panel.width()
-    button.click()
+    group = panel.list.topLevelItem(0)
+    assert group is not None
+    front_row = next(group.child(row) for row in range(group.childCount()) if group.child(row).text(0).startswith("Front"))
+    front_row.setCheckState(0, Qt.CheckState.Unchecked)
     app.processEvents()
     assert front.visible is False
     assert session.document.layers[0].visible is False
     assert mid.visible is True
+    assert session.history.undo_stack[-1].name == "Toggle visibility"
     panel.refresh()
     group = panel.list.topLevelItem(0)
+    assert group is not None
     checks = {
         group.child(row).text(0).splitlines()[0]: group.child(row).checkState(0)
         for row in range(group.childCount())
@@ -466,10 +630,64 @@ def test_visibility_button_toggles_the_selection_and_refreshes_the_checks():
     assert checks["Front"] == Qt.CheckState.Unchecked
     assert checks["Back"] == Qt.CheckState.Unchecked
     assert checks["Mid"] == Qt.CheckState.Checked
-    button.click()
+    session.undo()
+    assert front.visible is True
+    assert session.document.layers[0].visible is True
+
+    # A row outside the selection changes only itself.
+    session.select_layers([front.id, session.document.layers[0].id], active_id=front.id)
+    panel.refresh()
+    group = panel.list.topLevelItem(0)
+    assert group is not None
+    mid_row = next(group.child(row) for row in range(group.childCount()) if group.child(row).text(0).startswith("Mid"))
+    mid_row.setCheckState(0, Qt.CheckState.Unchecked)
+    app.processEvents()
+    assert mid.visible is False
     assert front.visible is True
     assert session.document.layers[0].visible is True
     panel.close()
+
+
+def test_checkbox_refresh_waits_until_set_data_returns():
+    """A listener that rebuilds the list must not delete the row inside setData.
+
+    The window refreshes on every session change. The checkbox emits that
+    change from inside QTreeWidgetItem::setData, and clearing the list there
+    crashes. The rebuild waits until the click has returned.
+    """
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(8, 8, "white"))
+    layer = session.document.layers[0]
+    layer.name = "Photo"
+    panel = LayerPanel(session)
+    session.add_listener(lambda kind: panel.refresh() if kind == "change" else None)
+    panel.resize(240, 420)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+    group = panel.list.topLevelItem(0)
+    assert group is not None
+    row = group.child(0)
+    assert row is not None
+    row.setCheckState(0, Qt.CheckState.Unchecked)
+    # setData has returned and the row it updated is still in the list.
+    assert row.treeWidget() is panel.list
+    assert layer.visible is False
+    app.processEvents()
+    group = panel.list.topLevelItem(0)
+    assert group is not None
+    rebuilt = group.child(0)
+    assert rebuilt is not None
+    assert rebuilt is not row
+    assert rebuilt.text(0).startswith("Photo")
+    assert rebuilt.checkState(0) == Qt.CheckState.Unchecked
+    panel.close()
+    app.processEvents()
 
 
 def test_layer_index_selects_one_and_edits_keep_a_multi_selection():
@@ -757,10 +975,17 @@ def test_folded_pages_stay_folded_and_drag_as_a_block():
     app.processEvents()
 
 
-def test_delete_icon_removes_a_selected_open_group():
-    from PyQt6.QtWidgets import QApplication, QToolButton
+def test_delete_key_removes_a_selected_open_group():
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtWidgets import QApplication
 
     from pixedit.ui.layers_panel import LayerPanel
+
+    def press(tree, key) -> None:
+        tree.setFocus(Qt.FocusReason.MouseFocusReason)
+        event = QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(tree, event)
 
     app = QApplication.instance() or QApplication([])
     session = Session(new_document(8, 8, "white"))
@@ -793,8 +1018,7 @@ def test_delete_icon_removes_a_selected_open_group():
     assert panel._selected_groups == [second]
     assert session.document.active_group_id == second
 
-    button = next(item for item in panel.findChildren(QToolButton) if item.accessibleName() == "Delete")
-    button.click()
+    press(panel.list, Qt.Key.Key_Delete)
     app.processEvents()
     assert [group.name for group in session.document.groups] == ["One"]
     session.undo()
@@ -815,7 +1039,7 @@ def test_delete_icon_removes_a_selected_open_group():
     panel._on_selection()
     assert panel._selected_groups == []
     layer_count = len(session.document.groups[0].layers)
-    button.click()
+    press(panel.list, Qt.Key.Key_Backspace)
     assert len(session.document.groups) == 2
     assert len(session.document.groups[0].layers) == layer_count - 1
     panel.close()
@@ -1040,7 +1264,8 @@ def test_copy_and_paste_duplicates_the_active_layer():
     assert pasted.blend_mode == "multiply"
     assert pasted.id != photo.id
     names = [layer.name for layer in session.document.layers]
-    assert names.count("Back copy") == 0
+    assert names == ["Background", "Back", "Photo", "Back copy", "Photo copy"]
+    assert {layer.name for layer in session.selected_layers()} == {"Back copy", "Photo copy"}
     # A second paste clones the snapshot again, not the layer just inserted.
     pasted.image.putpixel((0, 0), (0, 0, 255, 255))
     assert session.paste_copied_layer()
@@ -1050,6 +1275,7 @@ def test_copy_and_paste_duplicates_the_active_layer():
     session.undo()
     assert second not in session.document.layers
     assert pasted in session.document.layers
+    assert [layer.name for layer in session.document.layers].count("Back copy") == 1
 
     # A picture copy sits above that picture's masks, same as Duplicate.
     mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
@@ -1064,6 +1290,7 @@ def test_copy_and_paste_duplicates_the_active_layer():
         "Photo",
         "Blur",
         "Photo copy",
+        "Back copy",
         "Photo copy",
     ]
     blur = session.document.layers[3]
@@ -1094,6 +1321,70 @@ def test_copy_and_paste_keeps_text_editable():
     assert pasted.text.text == "Hello"
     assert (pasted.x, pasted.y) == (3, 4)
     assert pasted.id != session.document.layers[1].id
+
+
+def test_cut_and_delete_remove_every_selected_layer():
+    """Several selected layers are cut or deleted together. A picture takes its masks."""
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(8, 8, "white"))
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 1, 2)
+    other = raster_layer("Other", Image.new("RGBA", (4, 4), (0, 255, 0, 255)), 3, 3)
+    session.add_layer(photo)
+    mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
+    session.add_layer(mask)
+    session.add_layer(other)
+    session.select_layers([photo.id, other.id], active_id=other.id)
+    steps = len(session.history.undo_stack)
+    assert session.cut_active_layer()
+    assert len(session.history.undo_stack) == steps + 1
+    assert [layer.name for layer in session.document.layers] == ["Background"]
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Blur", "Other"]
+    photo_copy = next(layer for layer in session.document.layers if layer.name == "Photo")
+    blur = next(layer for layer in session.document.layers if layer.name == "Blur")
+    assert blur.target_id == photo_copy.id
+    assert {layer.name for layer in session.selected_layers()} == {"Photo", "Blur", "Other"}
+    assert session.active_layer().name == "Other"
+
+    session.delete_selected()
+    assert [layer.name for layer in session.document.layers] == ["Background"]
+    assert session.history.undo_stack[-1].name == "Delete layers"
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Blur", "Other"]
+
+
+def test_cut_and_paste_moves_the_layer_and_its_masks():
+    """Ctrl+X removes the picture and its masks. Ctrl+V puts them back with the same names."""
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(8, 8, "white"))
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 1, 2)
+    session.add_layer(photo)
+    mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
+    session.add_layer(mask)
+    session.layer_index = session.document.index_of(photo.id)
+    steps = len(session.history.undo_stack)
+    assert session.cut_active_layer()
+    assert len(session.history.undo_stack) == steps + 1
+    assert [layer.name for layer in session.document.layers] == ["Background"]
+    assert session.paste_copied_layer()
+    names = [layer.name for layer in session.document.layers]
+    assert names == ["Background", "Photo", "Blur"]
+    pasted = session.document.layers[1]
+    blur = session.document.layers[2]
+    assert pasted.id != photo.id
+    assert blur.target_id == pasted.id
+    assert session.active_layer() is pasted
+    # A second paste clones the snapshot again. Undoing both pastes, then the
+    # cut, puts the original picture and mask back.
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers].count("Photo") == 2
+    session.undo()
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background"]
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Blur"]
 
 
 def test_pasted_mask_stays_on_its_picture():

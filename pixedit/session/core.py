@@ -25,6 +25,7 @@ def default_options() -> dict[str, Any]:
         "mask_shape": "rect",
         "mask_kind": "pixelate",
         "mask_amount": 12,
+        "color_colorize": False,
         "color_hue": 0,
         "color_saturation": 0,
         "color_brightness": 0,
@@ -103,19 +104,18 @@ class CoreMixin:
     def _activate(self, index: int, selected_ids: list[str]) -> None:
         """Store the active layer and the selection, then drop a stale color preview.
 
-        The preview belongs to one layer. Selection is stored first so a
-        refresh caused by restoring that preview sees the new set.
+        The grade belongs to the layers that were selected when it started.
+        Selection is stored first so a refresh caused by restoring that preview
+        sees the new set. Moving the active layer inside that same set keeps
+        the preview. A different set cancels it.
         """
-        preview = self._color_layer
         self._layer_index = int(index)
         self._selected_ids = list(selected_ids)
-        if preview is None:
+        graded = [layer for layer, _before in self._color_grades]
+        if not graded:
             return
-        current = None
-        layers = self._stack()
-        if layers and 0 <= self._layer_index < len(layers):
-            current = layers[self._layer_index]
-        if current is not preview:
+        targets = self._color_grade_targets()
+        if [layer.id for layer in targets] != [layer.id for layer in graded]:
             self.cancel_color_adjust()
 
     def selected_ids(self) -> list[str]:

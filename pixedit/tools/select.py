@@ -27,7 +27,8 @@ class SelectTool(Tool):
     shortcut = "S"
     cursor = "select-rect"
     hint = (
-        "Drag a selection. Ctrl+X cuts it to a new layer, Ctrl+C copies it, Delete clears pixels, Esc deselects. "
+        "Drag a selection. While Select is active, Ctrl+X cuts it to a new layer and Ctrl+C copies it. "
+        "Delete clears pixels. Esc deselects. "
         "Wand also selects empty space outside the layer, and stops at the canvas edge."
     )
 

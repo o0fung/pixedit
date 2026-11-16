@@ -223,7 +223,7 @@ class PdfImportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Import PDF")
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Each page is its own canvas, in one group. The canvas shows one page at a time."))
+        layout.addWidget(QLabel("Each page is its own canvas. The canvas shows one page at a time."))
         form = QFormLayout()
         self.dpi = QComboBox()
         self.dpi.addItem("72 DPI  (screen)", 1.0)
@@ -814,16 +814,20 @@ class ShortcutsDialog(QDialog):
         text = QLabel(
             "\n".join(
                 [
-                    "Ctrl+N  New          Ctrl+O  Open          Ctrl+W  Close",
+                    "Ctrl+Shift+N  New document    Ctrl+O  Open    Ctrl+W  Close",
+                    "Ctrl+N  New layer    Ctrl+Up / Ctrl+Down  Move the active layer",
                     "Ctrl+S  Save project Ctrl+Shift+S  Save as",
                     "Ctrl+E  Export flattened image",
                     "Ctrl+Z  Undo         Ctrl+Shift+Z or Ctrl+Y  Redo",
                     "Ctrl+A  Select all   Ctrl+D or Esc  Deselect   Ctrl+Shift+I  Invert",
-                    "Ctrl+X  Cut selection to a new layer",
-                    "Ctrl+C  Copy the active layer. With a selection, copy those pixels to a new layer",
-                    "Ctrl+V  Paste the copied layer, or an image from the clipboard",
+                    "Ctrl+X  While Select is active, cut the selection. Otherwise cut the selected layers",
+                    "Ctrl+C  While Select is active, copy the selection. Otherwise copy the selected layers",
+                    "Ctrl+V  Paste the copied layers, or an image from the clipboard",
+                    "Ctrl+R  Rotate the selected layers 90° clockwise    Ctrl+Shift+R  counter-clockwise",
                     "Ctrl+Shift+C  Copy to the clipboard",
-                    "Delete or Backspace  Clear pixels inside the selection",
+                    "Delete or Backspace  On the canvas, clear pixels inside the selection",
+                    "Delete or Backspace  On highlighted layers, remove every selected layer",
+                    "Delete or Backspace  On a highlighted page or tag, remove that row",
                     "Select options  Feather  Soften the next selection. Select → Feather… uses that radius",
                     "Ctrl+Shift+O  Place an image as new layers (File → Place, Layer → Place image)",
                     "Ctrl+0  Fit          Ctrl+1  100%       Ctrl++ / Ctrl+-  Zoom",

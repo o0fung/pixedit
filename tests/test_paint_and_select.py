@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw
 
 from pixedit.adjust import desaturate
 from pixedit.factory import raster_layer, redaction_layer
+from pixedit.geom import paint_bounds
 from pixedit.model import new_document
 from pixedit.paint import connected_mask, dab, fill_region, interpolate, paint_points, stroke_spacing, wand_mask
 from pixedit.session import Session
@@ -91,6 +92,38 @@ def test_brush_tool_undo():
     assert layer.image.getpixel((12, 12))[0] > 200
     session.undo()
     assert layer.image.getpixel((12, 12))[:3] == (255, 255, 255)
+
+
+def test_eraser_follows_every_selected_layer_and_brush_does_not():
+    """One eraser stroke clears every selected layer. The brush stays on the active one."""
+    session = Session(new_document(24, 24, "white"))
+    session.options["brush_size"] = 4
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    left = raster_layer("Left", Image.new("RGBA", (24, 24), (255, 0, 0, 255)))
+    right = raster_layer("Right", Image.new("RGBA", (24, 24), (0, 0, 255, 255)))
+    session.add_layer(left)
+    session.add_layer(right)
+    session.select_layers([left.id, right.id], active_id=right.id)
+    steps = len(session.history.undo_stack)
+    eraser = EraserTool()
+    eraser.pointer_down(session, PointerEvent(8, 8))
+    eraser.pointer_up(session, PointerEvent(8, 8))
+    assert left.image.getpixel((8, 8))[3] == 0
+    assert right.image.getpixel((8, 8))[3] == 0
+    assert len(session.history.undo_stack) == steps + 1
+    assert session.history.undo_stack[-1].name == "Erase"
+    session.undo()
+    assert left.image.getpixel((8, 8))[3] == 255
+    assert right.image.getpixel((8, 8))[3] == 255
+
+    session.select_layers([left.id, right.id], active_id=right.id)
+    session.foreground = (0, 255, 0, 255)
+    brush = BrushTool()
+    brush.pointer_down(session, PointerEvent(16, 16))
+    brush.pointer_up(session, PointerEvent(16, 16))
+    assert right.image.getpixel((16, 16))[1] > 200
+    assert left.image.getpixel((16, 16))[:3] == (255, 0, 0)
 
 
 def test_eraser_tool_and_fill_and_shape():
@@ -789,6 +822,46 @@ def test_brush_and_shape_on_a_new_layer_stay_content_sized():
     pixel = shaped.image.getpixel((28 - shaped.x, 21 - shaped.y))
     assert pixel[2] > 200
     assert session.document.layers[0].image.size == (80, 60)
+
+
+def test_brush_on_a_new_layer_of_a_large_page_grows_once_then_crops():
+    """A large page is covered on the press. Release stores only the stroke."""
+    # A small page keeps the slack box. It does not jump to the whole canvas.
+    tight = paint_bounds((0, 0), (1, 1), (40, 30, 48, 38), 80, 60, slack=32, empty=True)
+    assert tight == (8, 0, 80, 60)
+    # Off the page entirely: nothing to allocate, even when the page is large.
+    assert paint_bounds((0, 0), (1, 1), (-40, -40, -10, -10), 1600, 1200, slack=32, empty=True) is None
+    # The dab already fits, so a large page is not allocated again.
+    assert paint_bounds((0, 0), (1600, 1200), (400, 300, 420, 320), 1600, 1200, slack=32, empty=False) == (
+        0,
+        0,
+        1600,
+        1200,
+    )
+    # Pixels hanging off the page stay when the buffer grows to cover it.
+    hung = paint_bounds((-10, 5), (20, 200), (400, 300, 420, 320), 1600, 1200, slack=32, empty=False)
+    assert hung == (-10, 0, 1600, 1200)
+
+    session = Session(new_document(1600, 1200, "white"))
+    session.add_blank_layer()
+    session.foreground = (255, 0, 0, 255)
+    session.options["brush_size"] = 8
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    brush = BrushTool()
+    brush.pointer_down(session, PointerEvent(400, 300))
+    layer = session.active_layer()
+    assert (layer.x, layer.y, layer.image.size) == (0, 0, (1600, 1200))
+    brush.pointer_move(session, PointerEvent(900, 700))
+    assert (layer.x, layer.y, layer.image.size) == (0, 0, (1600, 1200))
+    brush.pointer_up(session, PointerEvent(920, 720))
+    finished = session.active_layer()
+    assert finished.image.size != (1600, 1200)
+    assert finished.image.width < 700
+    assert finished.image.height < 600
+    assert _pixel(finished, 400, 300)[0] > 200
+    assert _pixel(finished, 920, 720)[0] > 200
+    assert session.document.layers[0].image.size == (1600, 1200)
 
 
 def test_clear_selection_contents_and_undo():

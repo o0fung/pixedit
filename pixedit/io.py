@@ -158,12 +158,12 @@ def load_raster(path: str, max_edge: int | None = None) -> Document:
 
 
 def load_pdf(path: str, scale: float = 1.0) -> Document:
-    """Render each PDF page as its own page, tagged with one group.
+    """Render each PDF page as its own page.
 
     ``scale`` is the PDFium zoom. 1.0 is about 72 DPI and 2.0 is about 144 DPI.
     Every page stays visible. The canvas shows the first page. Page order is
-    the order PDF export writes. The group starts empty, so a layer added to
-    it is drawn on every page.
+    the order PDF export writes. No tag is created; Layer → New tag adds
+    one when a header or footer should be drawn on tagged pages.
     """
     import pypdfium2 as pdfium
 
@@ -182,7 +182,6 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
         pdf.close()
     if not pages:
         raise ValueError("PDF has no pages")
-    shared = SharedGroup(id=new_id(), name=Path(path).stem or "Document", layers=[])
     groups: list[LayerGroup] = []
     for index, page in enumerate(pages):
         layer = raster_layer(f"Page {index + 1}", page)
@@ -193,7 +192,6 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
                 width=page.width,
                 height=page.height,
                 layers=[layer],
-                shared_ids=[shared.id],
             )
         )
     return Document(
@@ -202,7 +200,6 @@ def load_pdf(path: str, scale: float = 1.0) -> Document:
         dpi=DEFAULT_DPI * float(scale),
         groups=groups,
         active_group_id=groups[0].id,
-        shared_groups=[shared],
     )
 
 
@@ -481,7 +478,7 @@ def _shared_from_entry(archive: zipfile.ZipFile, entry: dict) -> SharedGroup:
     bind_mask_targets(layers)
     return SharedGroup(
         id=str(entry.get("id") or new_id()),
-        name=str(entry.get("name") or "Group"),
+        name=str(entry.get("name") or "Tag"),
         layers=layers,
     )
 

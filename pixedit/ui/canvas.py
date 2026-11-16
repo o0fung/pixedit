@@ -1656,8 +1656,10 @@ class CanvasView(QWidget):
         doc = self.session.document
         if self._dirty or self._pixmap is None or self._pixmap.isNull():
             return False
-        # A zoomed-out cache is screen-sized, so a document-pixel patch would
-        # land in the wrong place. The caller rebuilds that small cache instead.
+        # A zoomed-out cache is screen-sized. Map the dirty document rectangle
+        # onto those pixels instead of resampling the whole photo.
+        if self._pixmap_mode == "view":
+            return self._patch_view_preview(bounds)
         if self._pixmap_mode != "full":
             return False
         if self._pixmap.width() != doc.width or self._pixmap.height() != doc.height:
@@ -1672,6 +1674,66 @@ class CanvasView(QWidget):
         region = composite_region(doc, box)
         painter = QPainter(self._pixmap)
         painter.drawPixmap(box[0], box[1], pil_to_pixmap(region))
+        painter.end()
+        return True
+
+    def _patch_view_preview(self, bounds: tuple[int, int, int, int]) -> bool:
+        """Paste one dirty rectangle into the zoomed-out view.
+
+        Resampling the whole photo on every dab blocks the window, and the
+        pointer positions from that gap are never stored. Flow:
+        1. A stale cache, or a rectangle that misses the view, falls back to
+           a full rebuild.
+        2. Map the dirty document rectangle onto the view's pixel grid and
+           pad one pixel, so a dab sitting on a pixel boundary is covered.
+        3. Composite that document slice at exactly those pixels and draw it
+           with no scaling. A tile of any other size falls back too.
+        """
+        pixmap = self._pixmap
+        view_box = self._view_box
+        if pixmap is None or view_box is None or self._view_key != self._current_view_key():
+            return False
+        x0, y0, x1, y1 = view_box
+        span_x = x1 - x0
+        span_y = y1 - y0
+        out_w = pixmap.width()
+        out_h = pixmap.height()
+        if span_x <= 0 or span_y <= 0 or out_w < 1 or out_h < 1:
+            return False
+
+        def to_px_x(doc_x: float) -> float:
+            return (float(doc_x) - x0) / span_x * out_w
+
+        def to_px_y(doc_y: float) -> float:
+            return (float(doc_y) - y0) / span_y * out_h
+
+        # One view pixel of slack. The dab's edge is shared with the next
+        # sample, and that sample has to be repainted too.
+        ix0 = max(0, math.floor(to_px_x(bounds[0])) - 1)
+        iy0 = max(0, math.floor(to_px_y(bounds[1])) - 1)
+        ix1 = min(out_w, math.ceil(to_px_x(bounds[2])) + 1)
+        iy1 = min(out_h, math.ceil(to_px_y(bounds[3])) + 1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return False
+
+        def to_doc_x(px: int) -> float:
+            return x0 + px / out_w * span_x
+
+        def to_doc_y(py: int) -> float:
+            return y0 + py / out_h * span_y
+
+        tile_w = ix1 - ix0
+        tile_h = iy1 - iy0
+        tile = composite_view(
+            self.session.document,
+            (to_doc_x(ix0), to_doc_y(iy0), to_doc_x(ix1), to_doc_y(iy1)),
+            self._view_scale(),
+            size=(tile_w, tile_h),
+        )
+        if tile.size != (tile_w, tile_h):
+            return False
+        painter = QPainter(pixmap)
+        painter.drawPixmap(ix0, iy0, pil_to_pixmap(tile))
         painter.end()
         return True
 

@@ -30,6 +30,23 @@ from pixedit.model import (
 class RasterMixin:
     """Start and finish a paint stroke, and edit mask settings."""
 
+    def prepare_layer_edit(self, layer: Layer) -> dict[str, Any]:
+        """Snapshot ``layer`` for a stroke that is not the only one in progress.
+
+        Text is rasterized after the snapshot, so undo restores the text. A
+        mask without a bitmap gets an empty document-sized mask. The caller
+        discards a color preview once, before preparing several layers.
+        """
+        before = visual_state(layer)
+        if layer.kind == "text":
+            layer.kind = "raster"
+            layer.text = None
+        if layer.kind == "redaction" and layer.mask is None:
+            layer.mask = Image.new("L", (self.document.width, self.document.height), 0)
+            layer.x = 0
+            layer.y = 0
+        return before
+
     def begin_raster_edit(self, *, paint_redaction: bool = False) -> tuple[Layer, dict[str, Any] | None, bool]:
         """Prepare a layer for a brush, fill, or shape.
 

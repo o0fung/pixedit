@@ -46,6 +46,13 @@ def test_composite_view_matches_a_box_downsample_and_full_scale_blend():
     full = np.array(composite_view(document, (0, 0, 8, 4), 1))
     assert np.array_equal(full, np.array(composite(document)))
 
+    # A brush patch asks for the view pixels it will overwrite, one for one.
+    exact = composite_view(document, (0, 0, 8, 4), 0.5, size=(4, 2))
+    assert exact.size == (4, 2)
+    assert np.array_equal(np.array(exact), view)
+    odd = composite_view(document, (0, 0, 8, 4), 0.25, size=(5, 3))
+    assert odd.size == (5, 3)
+
 
 def test_zoomed_out_paint_skips_full_composite(monkeypatch):
     app = QApplication.instance() or QApplication([])
@@ -166,6 +173,75 @@ def test_brush_patch_matches_full_flatten(monkeypatch):
     assert _rgba(canvas._pixmap).shape == _rgba(flat).shape
     assert np.array_equal(_rgba(canvas._pixmap), _rgba(flat))
     tool.pointer_cancel(session)
+    canvas.close()
+    app.processEvents()
+
+
+def test_zoomed_out_brush_patches_the_dab_and_matches_on_release(monkeypatch):
+    """A stroke on a large page resamples the dab. Release rebuilds the view once."""
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(1600, 1200, "white"))
+    # A mark far from the stroke. The patch must leave those cached pixels alone.
+    session.document.layers[0].image.putpixel((4, 4), (255, 0, 0, 255))
+    canvas = CanvasView(session, lambda: None, lambda *_args: None)
+    canvas.resize(480, 360)
+    canvas.zoom = 0.2
+    canvas.offset_x = 30.0
+    canvas.offset_y = 30.0
+
+    def on_note(kind: str) -> None:
+        if kind == "preview":
+            canvas.invalidate(session.preview_bounds)
+        elif kind == "change":
+            canvas.invalidate()
+
+    session.add_listener(on_note)
+    canvas.show()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+    assert canvas._pixmap is not None
+    before = _rgba(canvas._pixmap).copy()
+    assert int(before[0, 0, 0]) == 255
+
+    calls: list[tuple] = []
+    import pixedit.ui.canvas as canvas_mod
+
+    real_view = canvas_mod.composite_view
+
+    def spy_view(document, box, scale, size=None):
+        calls.append((tuple(box), None if size is None else tuple(size)))
+        return real_view(document, box, scale, size=size)
+
+    monkeypatch.setattr(canvas_mod, "composite_view", spy_view)
+
+    session.foreground = (0, 0, 255, 255)
+    session.options["brush_size"] = 16
+    session.options["brush_hardness"] = 100
+    session.options["brush_opacity"] = 100
+    tool = BrushTool()
+    tool.pointer_down(session, PointerEvent(400, 300))
+    tool.pointer_move(session, PointerEvent(460, 320))
+    assert calls
+    page = max(session.document.width, session.document.height)
+    for box, size in calls:
+        assert max(box[2] - box[0], box[3] - box[1]) < page / 4
+        assert size is not None
+        assert size[0] < canvas._pixmap.width()
+        assert size[1] < canvas._pixmap.height()
+    patched = _rgba(canvas._pixmap)
+    assert patched.shape == before.shape
+    assert np.array_equal(patched[:4, :4], before[:4, :4])
+    assert canvas._pixmap_mode == "view"
+
+    tool.pointer_up(session, PointerEvent(480, 340))
+    canvas.repaint()
+    app.processEvents()
+    assert canvas._pixmap_mode == "view"
+    assert any(size is None for _box, size in calls)
+    visible = canvas._visible_document_box()
+    assert visible is not None
+    expected = pil_to_pixmap(composite_view(session.document, visible, canvas._view_scale()))
+    assert np.array_equal(_rgba(canvas._pixmap), _rgba(expected))
     canvas.close()
     app.processEvents()
 
@@ -816,9 +892,9 @@ def _spy_flatten(monkeypatch):
         calls["composite"] += 1
         return real_composite(document)
 
-    def spy_view(document, box, scale):
+    def spy_view(document, box, scale, size=None):
         calls["view"] += 1
-        return real_view(document, box, scale)
+        return real_view(document, box, scale, size=size)
 
     monkeypatch.setattr(canvas_mod, "composite", spy_composite)
     monkeypatch.setattr(canvas_mod, "composite_view", spy_view)

@@ -63,8 +63,8 @@ class TransformTool(Tool):
         return [
             {"id": "flip_active_horizontal", "label": "Flip horizontal", "icon": "flip-h"},
             {"id": "flip_active_vertical", "label": "Flip vertical", "icon": "flip-v"},
-            {"id": "rotate_active_cw", "label": "Rotate 90° clockwise", "icon": "rotate-cw"},
-            {"id": "rotate_active_ccw", "label": "Rotate 90° counter-clockwise", "icon": "rotate-ccw"},
+            {"id": "rotate_active_cw", "label": "Rotate 90° clockwise", "shortcut": "Ctrl+R", "icon": "rotate-cw"},
+            {"id": "rotate_active_ccw", "label": "Rotate 90° counter-clockwise", "shortcut": "Ctrl+Shift+R", "icon": "rotate-ccw"},
             {"id": "scale_layer", "label": "Scale…", "icon": "scale", "new_row": True},
             {"id": "rotate_layer", "label": "Rotate…", "icon": "rotate"},
         ]

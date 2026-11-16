@@ -143,6 +143,8 @@ def test_pdf_pages_become_groups(tmp_path: Path):
     assert doc.width == doc.groups[0].width
     assert doc.height == doc.groups[0].height
     assert doc.dpi == 72
+    assert doc.shared_groups == []
+    assert all(group.shared_ids == [] for group in doc.groups)
     sharp = load_path(str(pdf_path), pdf_scale=2)
     assert sharp.dpi == 144
     assert sharp.groups[0].width > doc.groups[0].width

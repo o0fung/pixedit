@@ -15,7 +15,7 @@ from pixedit.geom import (
     paint_bounds,
     place_image,
 )
-from pixedit.model import Layer
+from pixedit.model import Layer, visual_state
 from pixedit.paint import (
     BrushFootprint,
     catmull_segment,
@@ -67,6 +67,39 @@ def _local_selection(session, origin: tuple[int, int], shape: tuple[int, int]) -
     return sel
 
 
+class _StrokeSurface:
+    """One layer receiving the stroke. The curve itself is shared.
+
+    The eraser keeps one of these per selected layer. The brush keeps one,
+    for the active layer. Tip and click patches belong to this bitmap, so a
+    provisional dab can be put back without touching the other layers.
+    """
+
+    def __init__(
+        self,
+        layer: Layer,
+        before: dict | None,
+        created: bool,
+        mask_mode: bool,
+        origin: tuple[int, int],
+        array: np.ndarray,
+        selection: np.ndarray | None,
+    ) -> None:
+        self.layer = layer
+        self.before = before
+        self.created = created
+        self.mask_mode = mask_mode
+        self.origin = origin
+        self.array = array
+        self.selection = selection
+        self.tip_patch: np.ndarray | None = None
+        self.tip_rect: tuple[int, int, int, int] | None = None
+        self.tip_canvas: tuple[int, int, int, int] | None = None
+        self.click_patch: np.ndarray | None = None
+        self.click_rect: tuple[int, int, int, int] | None = None
+        self.click_canvas: tuple[int, int, int, int] | None = None
+
+
 class _PaintTool(Tool):
     """Shared stroke loop for the brush and the eraser."""
 
@@ -96,6 +129,7 @@ class _PaintTool(Tool):
         self._click_canvas: tuple[int, int, int, int] | None = None
         self._footprint: BrushFootprint | None = None
         self._footprint_key: tuple[float, float, float] | None = None
+        self._surfaces: list[_StrokeSurface] = []
 
     def wants_stroke_sampling(self, _session) -> bool:
         return True
@@ -111,39 +145,27 @@ class _PaintTool(Tool):
         ]
 
     def pointer_down(self, session, event: PointerEvent) -> None:
-        layer, before, created = session.begin_raster_edit(paint_redaction=True)
-        self._layer = layer
-        self._before = before
-        self._created = created
-        self._mask_mode = layer.kind == "redaction"
-        self._origin = (layer.x, layer.y)
-        if self._mask_mode:
-            if layer.mask is None:
-                layer.mask = Image.new("L", (session.document.width, session.document.height), 0)
-                self._origin = (0, 0)
-                layer.x = 0
-                layer.y = 0
-            self._array = np.array(layer.mask.convert("L"))
-        else:
-            self._array = np.array(layer.image.convert("RGBA"))
-        self._selection = _local_selection(session, self._origin, self._array.shape[:2])
+        surfaces = self._open_surfaces(session)
+        self._reset_stroke_buffers()
+        self._surfaces = surfaces
+        if not surfaces:
+            return
         self._active = True
         self._raw = [(event.x, event.y)]
         self._final_until = 0
-        self._tip_patch = None
-        self._tip_rect = None
-        self._tip_canvas = None
-        self._click_patch = None
-        self._click_rect = None
-        self._click_canvas = None
         self._footprint = None
         self._footprint_key = None
-        self._ensure_cover(session, event.x, event.y)
-        # Full coat, not the thinned stroke stamp, so a click matches the preview.
-        self._remember_click(session, event.x, event.y)
-        rect = self._stamp_points(session, [(event.x, event.y)], gained=False)
-        self._publish(rect)
-        session.preview(rect)
+        dirty = None
+        for surface in surfaces:
+            self._bind(surface)
+            self._ensure_cover(session, event.x, event.y)
+            # Full coat, not the thinned stroke stamp, so a click matches the preview.
+            self._remember_click(session, event.x, event.y)
+            rect = self._stamp_points(session, [(event.x, event.y)], gained=False)
+            self._publish(rect)
+            self._store(surface)
+            dirty = _union_box(dirty, rect)
+        session.preview(dirty)
 
     def pointer_move(self, session, event: PointerEvent) -> None:
         """Paint one new coordinate immediately. Tests and plugins use this."""
@@ -171,21 +193,31 @@ class _PaintTool(Tool):
         translucent brush is not darkened by redrawing the tip. One publish
         and one preview cover the whole batch.
         """
-        if not self._active or self._array is None or not self._take_points(points):
+        if not self._active or not self._surfaces or not self._take_points(points):
             return
-        # Drop the click before any growth. Later moves have nothing saved here.
-        dirty = self._restore_click()
-        dirty = _union_box(dirty, self._restore_tip())
+        # The curve is computed once. Each surface puts back its own click and
+        # tip, then stamps the same canvas points into its own bitmap.
         final_points, tip_points = self._new_curve_points(session)
-        self._cover_points(session, final_points)
-        self._cover_points(session, tip_points)
-        if final_points:
-            dirty = _union_box(dirty, self._stamp_points(session, final_points, gained=True))
-        if tip_points:
-            self._save_tip(session, tip_points)
-            dirty = _union_box(dirty, self._tip_canvas)
-            dirty = _union_box(dirty, self._stamp_points(session, tip_points, gained=True))
-        self._publish(dirty)
+        dirty = None
+        for surface in self._surfaces:
+            self._bind(surface)
+            if self._array is None:
+                self._store(surface)
+                continue
+            # Drop the click before any growth. Later moves have nothing saved here.
+            surface_dirty = self._restore_click()
+            surface_dirty = _union_box(surface_dirty, self._restore_tip())
+            self._cover_points(session, final_points)
+            self._cover_points(session, tip_points)
+            if final_points:
+                surface_dirty = _union_box(surface_dirty, self._stamp_points(session, final_points, gained=True))
+            if tip_points:
+                self._save_tip(session, tip_points)
+                surface_dirty = _union_box(surface_dirty, self._tip_canvas)
+                surface_dirty = _union_box(surface_dirty, self._stamp_points(session, tip_points, gained=True))
+            self._publish(surface_dirty)
+            self._store(surface)
+            dirty = _union_box(dirty, surface_dirty)
         session.preview(dirty)
 
     def commit_stroke(self, session, _event: PointerEvent | None = None) -> None:
@@ -194,33 +226,45 @@ class _PaintTool(Tool):
         The canvas passes the release pointer. The last coordinate was already
         flushed, so the brush does not read it.
         """
-        if not self._active or self._layer is None:
+        if not self._active or not self._surfaces:
             return
-        layer = self._layer
-        before = self._before
-        created = self._created
-        self._reset_stroke_buffers()
+        surfaces = list(self._surfaces)
         name = "Erase" if self.erase else "Brush"
-        session.finish_raster_edit(layer, before, created, name)
+        self._reset_stroke_buffers()
+        if len(surfaces) == 1:
+            surface = surfaces[0]
+            session.finish_raster_edit(surface.layer, surface.before, surface.created, name)
+            return
+        # Several selected layers share one eraser stroke. Fit each bitmap,
+        # then store the results as one undo step.
+        edits = []
+        for surface in surfaces:
+            session._fit_content_unless_full_canvas(surface.layer, surface.before)
+            edits.append((surface.layer, visual_state(surface.layer), surface.before))
+        session.commit_layer_visuals(edits, name)
 
     def pointer_up(self, session, event: PointerEvent) -> None:
-        if not self._active or self._layer is None:
+        if not self._active or not self._surfaces:
             return
         self.extend_points(session, [(event.x, event.y)])
         self.commit_stroke(session)
 
     def pointer_cancel(self, session) -> bool:
-        active = self._layer is not None
-        if active:
-            session.cancel_raster_edit(self._layer, self._before, self._created)
+        surfaces = list(self._surfaces)
         self._reset_stroke_buffers()
-        return active
+        for surface in surfaces:
+            session.cancel_raster_edit(surface.layer, surface.before, surface.created)
+        return bool(surfaces)
 
     def _reset_stroke_buffers(self) -> None:
         self._active = False
         self._array = None
         self._layer = None
         self._before = None
+        self._created = False
+        self._mask_mode = False
+        self._selection = None
+        self._origin = (0, 0)
         self._raw = []
         self._final_until = 0
         self._tip_patch = None
@@ -231,6 +275,78 @@ class _PaintTool(Tool):
         self._click_canvas = None
         self._footprint = None
         self._footprint_key = None
+        self._surfaces = []
+
+    def _open_surfaces(self, session) -> list[_StrokeSurface]:
+        """The layers this stroke paints.
+
+        The eraser with two or more selected layers stamps each of them. The
+        brush, and an eraser with one layer, keep the single-layer stroke.
+        """
+        if self.erase:
+            chosen = [
+                layer
+                for layer in session.selected_layers()
+                if layer.kind in ("raster", "text", "redaction")
+            ]
+            if len(chosen) > 1:
+                session._discard_color_preview()
+                return [
+                    self._surface_for(session, layer, session.prepare_layer_edit(layer), False) for layer in chosen
+                ]
+        layer, before, created = session.begin_raster_edit(paint_redaction=True)
+        return [self._surface_for(session, layer, before, created)]
+
+    def _surface_for(self, session, layer: Layer, before: dict | None, created: bool) -> _StrokeSurface:
+        """A stroke buffer for ``layer``. A mask is edited in place."""
+        mask_mode = layer.kind == "redaction"
+        origin = (layer.x, layer.y)
+        if mask_mode:
+            if layer.mask is None:
+                layer.mask = Image.new("L", (session.document.width, session.document.height), 0)
+                origin = (0, 0)
+                layer.x = 0
+                layer.y = 0
+            array = np.array(layer.mask.convert("L"))
+        else:
+            array = np.array(layer.image.convert("RGBA"))
+        return _StrokeSurface(
+            layer,
+            before,
+            created,
+            mask_mode,
+            origin,
+            array,
+            _local_selection(session, origin, array.shape[:2]),
+        )
+
+    def _bind(self, surface: _StrokeSurface) -> None:
+        """Point the stroke fields at ``surface`` for the existing stamp code."""
+        self._layer = surface.layer
+        self._before = surface.before
+        self._created = surface.created
+        self._mask_mode = surface.mask_mode
+        self._origin = surface.origin
+        self._array = surface.array
+        self._selection = surface.selection
+        self._tip_patch = surface.tip_patch
+        self._tip_rect = surface.tip_rect
+        self._tip_canvas = surface.tip_canvas
+        self._click_patch = surface.click_patch
+        self._click_rect = surface.click_rect
+        self._click_canvas = surface.click_canvas
+
+    def _store(self, surface: _StrokeSurface) -> None:
+        """Keep the buffer changes on ``surface`` before binding the next one."""
+        surface.origin = self._origin
+        surface.array = self._array
+        surface.selection = self._selection
+        surface.tip_patch = self._tip_patch
+        surface.tip_rect = self._tip_rect
+        surface.tip_canvas = self._tip_canvas
+        surface.click_patch = self._click_patch
+        surface.click_rect = self._click_rect
+        surface.click_canvas = self._click_canvas
 
     def _take_points(self, points: list[tuple[float, float]]) -> bool:
         added = False

@@ -48,6 +48,10 @@ class Session(
         # color preview when the active layer changes, and it reads this flag.
         self._color_before: dict[str, Any] | None = None
         self._color_layer: Layer | None = None
+        # Each entry is the layer and the snapshot taken when the grade started.
+        # One selected layer stores one entry. Several store every picture and
+        # text layer in the selection. Masks are left out.
+        self._color_grades: list[tuple[Any, dict[str, Any]]] = []
         self._ending_color = False
         # None means the active layer is on the page. A shared group id means
         # the active layer lives in that group's stack.
@@ -78,8 +82,15 @@ class Session(
         # Ctrl+C snapshot of the active layer. Paste clones it again, so a
         # second paste is independent and later edits to the original stay
         # out of the copy. ``_copied_source_id`` is the layer that was copied;
-        # the snapshot itself has a new id.
+        # the snapshot itself has a new id. A cut stores every layer Delete
+        # would remove, and paste keeps those names.
         self._copied_layer: Layer | None = None
+        self._copied_layers: list[Layer] | None = None
+        self._copied_cut = False
+        # True when the snapshot is a multi-layer selection. Paste then selects
+        # every inserted layer. A one-layer cut that brings its masks along stays
+        # false, so the picture remains the active layer.
+        self._copied_multi = False
         self._copied_source_id: str | None = None
         # Set for the duration of a preview notify. The canvas reads it to
         # repaint one rectangle instead of the whole document.

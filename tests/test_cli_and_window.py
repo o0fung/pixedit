@@ -65,7 +65,7 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
     assert any("Trim" in label for label in labels)
     assert any("Clear selection contents" in label for label in labels)
     assert any(label == "Copy to clipboard" for label in labels)
-    assert any(label == "Paste" for label in labels)
+    assert any(label == "Paste layer" for label in labels)
     assert any(label == "Feather…" for label in labels)
     assert "example.marker" in window.tool_by_id
     assert "mask" in window.tool_by_id
@@ -176,6 +176,46 @@ def test_tool_description_sits_under_the_options():
     app.processEvents()
 
 
+def test_colorize_checkbox_starts_saturation_at_full_strength():
+    """Checking Colorize jumps saturation off zero and previews a real grade."""
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.factory import raster_layer
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    window.session.new_canvas(8, 8, "white")
+    layer = raster_layer("Shape", Image.new("RGBA", (8, 8), (0, 0, 0, 180)))
+    window.session.add_layer(layer)
+    window.session.select_layers([layer.id], active_id=layer.id)
+    window.set_tool(window.tool_by_id["color"])
+    app.processEvents()
+    box = window.options._widgets["color_colorize"]
+    assert not box.isChecked()
+    box.setChecked(True)
+    app.processEvents()
+    assert window.session.option("color_colorize") is True
+    assert window.session.option("color_saturation") == 100
+    assert window.options._widgets["color_saturation"].value() == 100
+    assert window.session.color_adjust_active()
+    # Hue is red and brightness is still zero, so pure black stays black.
+    assert layer.image.getpixel((1, 1)) == (0, 0, 0, 180)
+    window.session.options["color_hue"] = 120
+    window.session.options["color_brightness"] = 50
+    window.session.preview_color_adjust()
+    pixel = layer.image.getpixel((1, 1))
+    assert pixel[1] > 100
+    assert pixel[0] < 10
+    assert pixel[2] < 10
+    assert pixel[3] == 180
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
 def test_canvas_mouse_move_reports_cursor():
     """A hover must report canvas coordinates. Passing ``pos.y`` without calling it aborted the process."""
     from PyQt6.QtCore import QEvent, QPointF, Qt
@@ -236,6 +276,118 @@ def test_delete_clears_selection_pixels():
     assert image.getpixel((6, 6))[3] == 0
     assert image.getpixel((1, 1))[3] == 255
     assert image.size == (24, 24)
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
+def test_delete_on_a_layer_row_removes_that_layer():
+    """Delete on the layer list removes the row. On the canvas it still clears pixels."""
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.tools.base import PointerEvent
+    from pixedit.tools.select import SelectTool
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+    window.session.new_canvas(24, 24, "white")
+    window.session.add_blank_layer()
+    app.processEvents()
+    assert len(window.session.document.layers) == 2
+    kept = window.session.document.layers[0]
+    window.layers.list.setFocus(Qt.FocusReason.MouseFocusReason)
+    app.processEvents()
+    QApplication.sendEvent(
+        window.layers.list,
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
+    )
+    app.processEvents()
+    assert window.session.document.layers == [kept]
+
+    window.session.options["select_mode"] = "rect"
+    tool = SelectTool()
+    tool.pointer_down(window.session, PointerEvent(4, 4))
+    tool.pointer_up(window.session, PointerEvent(12, 12))
+    window.canvas.setFocus()
+    app.processEvents()
+    QApplication.sendEvent(
+        window.canvas,
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier),
+    )
+    app.processEvents()
+    image = window.session.active_layer().image
+    assert image.getpixel((6, 6))[3] == 0
+    assert image.getpixel((1, 1))[3] == 255
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
+def test_cut_layer_paste_and_move_shortcuts():
+    """Ctrl+X with no selection cuts the layer. Ctrl+Up and Ctrl+Down move it."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QKeySequence
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+    assert _shortcut_text(window._new_action, native=False) == "Ctrl+Shift+N"
+    layer_menu = {action.text(): action for action in _menu(window, "Layer").actions()}
+    assert _shortcut_text(layer_menu["New layer"], native=False) == "Ctrl+N"
+    assert _shortcut_text(layer_menu["Bring forward"], native=False) == "Ctrl+Up"
+    assert _shortcut_text(layer_menu["Send backward"], native=False) == "Ctrl+Down"
+    assert _shortcut_text(layer_menu["Rotate 90° clockwise"], native=False) == "Ctrl+R"
+    assert _shortcut_text(layer_menu["Rotate 90° counter-clockwise"], native=False) == "Ctrl+Shift+R"
+    layer_labels = [action.text() for action in _menu(window, "Layer").actions() if action.text()]
+    assert layer_labels[:7] == [
+        "New layer",
+        "Cut layer",
+        "Copy layer",
+        "Paste layer",
+        "Duplicate",
+        "Delete",
+        "Rename…",
+    ]
+
+    window.session.new_canvas(16, 16, "white")
+    window.session.add_blank_layer()
+    app.processEvents()
+    sketch = window.session.active_layer()
+    sketch.name = "Sketch"
+    kept = window.session.document.layers[0]
+    window.canvas.setFocus()
+    app.processEvents()
+    window._cut_shortcut()
+    app.processEvents()
+    assert window.session.document.layers == [kept]
+    assert window._layer_paste_armed
+    window._paste_from_clipboard()
+    app.processEvents()
+    assert [layer.name for layer in window.session.document.layers] == [kept.name, "Sketch"]
+    assert window.session.active_layer().name == "Sketch"
+
+    window.layers.list.setFocus(Qt.FocusReason.MouseFocusReason)
+    app.processEvents()
+    before = [layer.name for layer in window.session.document.layers]
+    QTest.keySequence(window.layers.list, QKeySequence("Ctrl+Down"))
+    app.processEvents()
+    assert [layer.name for layer in window.session.document.layers] == list(reversed(before))
+    QTest.keySequence(window.layers.list, QKeySequence("Ctrl+Up"))
+    app.processEvents()
+    assert [layer.name for layer in window.session.document.layers] == before
+
     window.session.dirty = False
     window.close()
     app.processEvents()
@@ -321,7 +473,7 @@ def test_file_toolbar_and_tool_groups():
     assert window._about_action.toolTip() == "About PixEdit"
     assert window._choose_folder_action not in window.file_toolbar.actions()
     assert folder in window._choose_folder_action.toolTip()
-    assert _shortcut_text(window._new_action, native=False) == "Ctrl+N"
+    assert _shortcut_text(window._new_action, native=False) == "Ctrl+Shift+N"
     assert _shortcut_text(window._open_action, native=False) == "Ctrl+O"
     # Offscreen Qt reports Close as Ctrl+F4. The Mac app uses ⌘W.
     # Either string is StandardKey.Close.
@@ -401,10 +553,12 @@ def test_file_toolbar_and_tool_groups():
     layer_labels = [action.text() for action in _menu(window, "Layer").actions()]
     select_labels = [action.text() for action in _menu(window, "Select").actions()]
     edit_labels = [action.text() for action in _menu(window, "Edit").actions()]
-    for label in ("Cut selection to new layer", "Copy selection to new layer"):
+    for label in ("Cut layer", "Copy layer"):
         assert label in edit_labels
         assert label in select_labels
         assert label in layer_labels
+    assert "Paste layer" in edit_labels
+    assert "Paste layer" in layer_labels
     assert "Deselect" in edit_labels
     assert "Deselect" in select_labels
     assert "Place image…" in layer_labels
@@ -823,7 +977,7 @@ def test_color_code_box_returns_keyboard_to_the_canvas():
 
 
 def test_space_pans_from_the_layer_list_without_hiding_layers():
-    """Space stays the hand tool. It does not flip a layer checkbox or the Visibility button."""
+    """Space stays the hand tool. It does not flip a layer checkbox."""
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QAbstractButton, QApplication
@@ -855,14 +1009,12 @@ def test_space_pans_from_the_layer_list_without_hiding_layers():
     assert window.canvas._space is False
     assert layer.visible is True
 
-    visibility = next(
-        button for button in window.layers.findChildren(QAbstractButton) if button.accessibleName() == "Visibility"
-    )
-    visibility.click()
+    window.session.set_visibility(layer, False)
     app.processEvents()
     assert layer.visible is False
-    assert window.focusWidget() is not visibility
-    QTest.keyPress(window.focusWidget(), Qt.Key.Key_Space)
+    window.layers.list.setFocus(Qt.FocusReason.MouseFocusReason)
+    app.processEvents()
+    QTest.keyPress(window.layers.list, Qt.Key.Key_Space)
     app.processEvents()
     assert layer.visible is False
     assert window.canvas._space is True
@@ -1065,6 +1217,8 @@ def test_transform_color_and_mask_panels():
     assert "Scale…" in labels
     assert "Rotate…" in labels
     buttons = {_button_label(button): button for button in window.options.action_buttons}
+    assert buttons["Rotate 90° clockwise"].toolTip() == "Rotate 90° clockwise (Ctrl+R)"
+    assert buttons["Rotate 90° counter-clockwise"].toolTip() == "Rotate 90° counter-clockwise (Ctrl+Shift+R)"
     for button in window.options.action_buttons:
         assert not button.icon().isNull(), _button_label(button)
     buttons["Flip horizontal"].click()
@@ -1625,8 +1779,19 @@ def test_pictorial_icons_load_and_choices_keep_their_values():
     )
     image_actions = {action.text(): action for action in _menu(window, "Image").actions()}
     assert image_actions["Invert"].icon().isNull()
-    menu_icons("Edit", ["Cut selection to new layer", "Copy selection to new layer", "Deselect", "Clear selection contents"])
-    menu_icons("Layer", ["Merge down", "Scale…", "Rotate…", "Flip horizontal", "Flip vertical"])
+    menu_icons("Edit", ["Cut layer", "Copy layer", "Deselect", "Clear selection contents"])
+    menu_icons(
+        "Layer",
+        [
+            "Merge down",
+            "Scale…",
+            "Rotate 90° clockwise",
+            "Rotate 90° counter-clockwise",
+            "Rotate…",
+            "Flip horizontal",
+            "Flip vertical",
+        ],
+    )
     menu_icons("View", ["Zoom in", "Zoom out", "Fit"])
     menu_icons(
         "Select",
@@ -1634,8 +1799,8 @@ def test_pictorial_icons_load_and_choices_keep_their_values():
             "All",
             "Deselect",
             "Invert",
-            "Cut selection to new layer",
-            "Copy selection to new layer",
+            "Cut layer",
+            "Copy layer",
             "Rectangular",
             "Elliptical",
             "Freehand",
@@ -1764,8 +1929,19 @@ def test_pictorial_icons_load_and_choices_apply():
     )
     image_actions = {action.text(): action for action in _menu(window, "Image").actions()}
     assert image_actions["Invert"].icon().isNull()
-    menu_icons("Edit", ("Cut selection to new layer", "Copy selection to new layer", "Deselect", "Clear selection contents"))
-    menu_icons("Layer", ("Merge down", "Scale…", "Rotate…", "Flip horizontal", "Flip vertical"))
+    menu_icons("Edit", ("Cut layer", "Copy layer", "Deselect", "Clear selection contents"))
+    menu_icons(
+        "Layer",
+        (
+            "Merge down",
+            "Scale…",
+            "Rotate 90° clockwise",
+            "Rotate 90° counter-clockwise",
+            "Rotate…",
+            "Flip horizontal",
+            "Flip vertical",
+        ),
+    )
     menu_icons("View", ("Zoom in", "Zoom out", "Fit"))
     menu_icons(
         "Select",
@@ -1773,8 +1949,8 @@ def test_pictorial_icons_load_and_choices_apply():
             "All",
             "Deselect",
             "Invert",
-            "Cut selection to new layer",
-            "Copy selection to new layer",
+            "Cut layer",
+            "Copy layer",
             "Rectangular",
             "Elliptical",
             "Freehand",
@@ -2035,6 +2211,7 @@ def test_clipboard_round_trip_paste_and_feather_outline():
 def test_layer_copy_paste_beats_the_clipboard_until_it_changes():
     """Ctrl+C / Ctrl+V duplicates the active layer. A later clipboard change wins."""
     from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QAction
     from PyQt6.QtWidgets import QApplication, QLineEdit
 
     from pixedit.factory import raster_layer
@@ -2045,7 +2222,12 @@ def test_layer_copy_paste_beats_the_clipboard_until_it_changes():
     window = MainWindow()
     window.show()
     app.processEvents()
-    assert window._copy_action.text() == "Copy"
+    assert window._copy_action.text() == "Copy layer"
+    assert window._cut_action.text() == "Cut layer"
+    assert window._paste_action.text() == "Paste layer"
+    assert window._copy_action.menuRole() == QAction.MenuRole.NoRole
+    assert window._cut_action.menuRole() == QAction.MenuRole.NoRole
+    assert window._paste_action.menuRole() == QAction.MenuRole.NoRole
 
     app.clipboard().setText("xyz")
     app.processEvents()
@@ -2088,13 +2270,33 @@ def test_layer_copy_paste_beats_the_clipboard_until_it_changes():
     assert external.image.size == (8, 8)
     assert external.image.getpixel((0, 0))[:3] == (0, 0, 255)
 
-    # A marching-ants selection still becomes a new layer on Ctrl+C, with no paste.
+    # A selection under another tool still copies the layer. Select is what
+    # makes Ctrl+C copy the marching ants onto a new layer.
     before = len(window.session.document.layers)
+    kept_name = window.session.active_layer().name
     window.session.select_all()
+    app.processEvents()
+    assert window.current.id != "select"
+    assert window._copy_action.text() == "Copy layer"
+    window._copy_shortcut()
+    assert len(window.session.document.layers) == before
+    assert window._layer_paste_armed
+    assert window.session.active_layer().name == kept_name
+
+    window.set_tool(window.tool_by_id["select"])
+    app.processEvents()
+    assert window._copy_action.text() == "Copy selection to new layer"
+    assert window._cut_action.text() == "Cut selection to new layer"
     window._copy_shortcut()
     assert len(window.session.document.layers) == before + 1
     assert not window._layer_paste_armed
     assert window.session.active_layer().name.endswith("copy")
+
+    window.session.deselect()
+    app.processEvents()
+    assert window._copy_action.text() == "Copy layer"
+    window._copy_shortcut()
+    assert window._layer_paste_armed
 
     window.session.dirty = False
     window.close()

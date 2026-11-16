@@ -975,6 +975,12 @@ def clip_box(
     return x0, y0, x1, y1
 
 
+# A brush buffer on a page at least this long, on its longer side, covers the
+# page in one step. Growing by ``slack`` on a large page recopies the stroke's
+# rectangle on every move, and the pointer positions from that gap are lost.
+PAINT_PAGE_EDGE = 1024
+
+
 def paint_bounds(
     origin: tuple[int, int],
     size: tuple[int, int],
@@ -995,10 +1001,30 @@ def paint_bounds(
     1×1 placeholder (which would union all the way back to the origin). A
     bitmap that already has pixels keeps those pixels, including any that sit
     outside the document because the layer was moved.
+
+    A page whose longer side is at least ``PAINT_PAGE_EDGE`` gets one buffer
+    covering the page when ``dab`` does not already fit. Pixels that already
+    sit outside the page stay. A smaller page keeps the slack padding.
     """
     dab_hit = clip_box(dab, doc_width, doc_height)
     if dab_hit is None:
         return None
+    ox, oy = int(origin[0]), int(origin[1])
+    width, height = int(size[0]), int(size[1])
+    # Already covered. The caller usually skips this case; returning the
+    # current box means a growth step does not allocate again.
+    if dab[0] >= ox and dab[1] >= oy and dab[2] <= ox + width and dab[3] <= oy + height:
+        return ox, oy, ox + width, oy + height
+    if max(int(doc_width), int(doc_height)) >= PAINT_PAGE_EDGE:
+        page = (0, 0, int(doc_width), int(doc_height))
+        if empty:
+            return page
+        return (
+            min(ox, page[0]),
+            min(oy, page[1]),
+            max(ox + width, page[2]),
+            max(oy + height, page[3]),
+        )
     padded = clip_box(
         (dab[0] - slack, dab[1] - slack, dab[2] + slack, dab[3] + slack),
         doc_width,
@@ -1007,8 +1033,6 @@ def paint_bounds(
     target = padded if padded is not None else dab_hit
     if empty:
         return target
-    ox, oy = int(origin[0]), int(origin[1])
-    width, height = int(size[0]), int(size[1])
     return (
         min(ox, target[0]),
         min(oy, target[1]),

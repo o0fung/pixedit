@@ -1165,7 +1165,7 @@ class ReplaceDocumentContent(Command):
 
 
 class RenameGroupCommand(Command):
-    name = "Rename group"
+    name = "Rename page"
 
     def __init__(self, group: LayerGroup, name: str) -> None:
         self.group = group
@@ -1254,7 +1254,7 @@ class ReorderGroupsCommand(Command):
     """Page order is the PDF export order. The page on screen stays on screen."""
 
     document_level = True
-    name = "Reorder groups"
+    name = "Reorder pages"
 
     def __init__(self, document: Document, ordered_ids: list[str]) -> None:
         self.document = document
@@ -1286,7 +1286,7 @@ class MoveLayersToGroupCommand(Command):
     """
 
     document_level = True
-    name = "Move to group"
+    name = "Move to page"
 
     def __init__(
         self,
@@ -1370,7 +1370,7 @@ class InsertSharedGroupCommand(Command):
     """Add a group and, when asked, tag the page that was showing."""
 
     document_level = True
-    name = "New group"
+    name = "New tag"
 
     def __init__(
         self,
@@ -1412,7 +1412,7 @@ class DeleteSharedGroupCommand(Command):
     """Remove a group and strip its tag from every page. The pages stay."""
 
     document_level = True
-    name = "Delete group"
+    name = "Delete tag"
 
     def __init__(self, document: Document, group_id: str) -> None:
         self.document = document
@@ -1449,7 +1449,7 @@ class ReorderSharedGroupsCommand(Command):
     """Catalog order in the layer list. Paint order stays on each page."""
 
     document_level = True
-    name = "Reorder groups"
+    name = "Reorder tags"
 
     def __init__(self, document: Document, ordered_ids: list[str]) -> None:
         self.document = document

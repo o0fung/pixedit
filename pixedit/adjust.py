@@ -98,14 +98,29 @@ def hue_saturation(
     hue_degrees: float = 0.0,
     saturation: float = 0.0,
     lightness: float = 0.0,
+    colorize: bool = False,
 ) -> Image.Image:
-    """Shift hue (degrees), saturation (-100..100), and value (-100..100)."""
+    """Shift hue (degrees), saturation (-100..100), and value (-100..100).
+
+    With ``colorize``, hue is the color itself (0 is red) and saturation is
+    how strong that color is. Zero and below leave the pixel gray. Lightness
+    still lifts the value, which is how black becomes a visible color.
+    """
     arr = _rgba(image).astype(np.float32)
     rgb = arr[..., :3] / 255.0
     hue, sat, val = _rgb_to_hsv(rgb)
-    hue = (hue + float(hue_degrees) / 360.0) % 1.0
-    sat = np.clip(sat * (1.0 + float(saturation) / 100.0), 0.0, 1.0)
-    val = np.clip(val + float(lightness) / 100.0, 0.0, 1.0)
+    if colorize:
+        # Black has no hue to rotate and no saturation to multiply, so a shift
+        # stays gray. Assign the chosen color, then lift its value. Negative
+        # saturation stays gray on purpose.
+        hue = np.full_like(hue, (float(hue_degrees) / 360.0) % 1.0)
+        strength = max(float(saturation), 0.0) / 100.0
+        sat = np.full_like(sat, float(np.clip(strength, 0.0, 1.0)))
+        val = np.clip(val + float(lightness) / 100.0, 0.0, 1.0)
+    else:
+        hue = (hue + float(hue_degrees) / 360.0) % 1.0
+        sat = np.clip(sat * (1.0 + float(saturation) / 100.0), 0.0, 1.0)
+        val = np.clip(val + float(lightness) / 100.0, 0.0, 1.0)
     arr[..., :3] = _hsv_to_rgb(hue, sat, val) * 255.0
     return _from_rgb(arr)
 
@@ -139,12 +154,32 @@ def color_grade(
     contrast: float = 0.0,
     highlight: float = 0.0,
     shade: float = 0.0,
+    colorize: bool = False,
 ) -> Image.Image:
-    """One combined grade: hue and saturation, then brightness and contrast, then highlight and shade."""
-    if all(abs(float(value)) < 1e-9 for value in (hue, saturation, brightness, contrast, highlight, shade)):
+    """One combined grade: hue and saturation, then brightness and contrast, then highlight and shade.
+
+    Colorize assigns the hue and saturation instead of shifting them, and lifts
+    brightness in that same step. The later RGB brightness shift is skipped so
+    it cannot wash the new color back to gray.
+    """
+    if not colorize and all(
+        abs(float(value)) < 1e-9 for value in (hue, saturation, brightness, contrast, highlight, shade)
+    ):
         return image.copy()
-    graded = hue_saturation(image, hue_degrees=hue, saturation=saturation, lightness=0.0)
-    graded = brightness_contrast(graded, brightness, contrast)
+    if colorize:
+        # Brightness here raises the assigned color's value. Adding it as equal
+        # red, green, and blue would turn black into pale gray.
+        graded = hue_saturation(
+            image,
+            hue_degrees=hue,
+            saturation=saturation,
+            lightness=brightness,
+            colorize=True,
+        )
+        graded = brightness_contrast(graded, 0, contrast)
+    else:
+        graded = hue_saturation(image, hue_degrees=hue, saturation=saturation, lightness=0.0)
+        graded = brightness_contrast(graded, brightness, contrast)
     return highlights_shadows(graded, highlight, shade)
 
 

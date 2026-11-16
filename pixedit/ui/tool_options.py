@@ -799,10 +799,18 @@ class ToolOptions(QWidget):
             box = QCheckBox()
             box.setChecked(bool(self.session.option(key, spec.get("default", False))))
 
-            def on_check(checked, key=key):
+            def on_check(checked, key=key, spec=spec):
                 if self._loading:
                     return
                 self.session.options[key] = bool(checked)
+                # Colorize at zero saturation would stay gray. Start it at full
+                # strength so the hue is visible as soon as black is lifted.
+                if key == "color_colorize" and checked and int(self.session.option("color_saturation", 0)) == 0:
+                    self.session.options["color_saturation"] = 100
+                    self.sync("color_saturation", 100)
+                if spec.get("live") == "color":
+                    self.session.preview_color_adjust()
+                    self.update_actions()
 
             box.toggled.connect(on_check)
             return box

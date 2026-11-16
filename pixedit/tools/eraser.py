@@ -10,4 +10,7 @@ class EraserTool(_PaintTool):
     label = "Eraser"
     shortcut = "E"
     erase = True
-    hint = "Erase pixels, or lift a mask when a mask layer is active. The panel shows the hole. [ and ] change the size."
+    hint = (
+        "Erase pixels on the selected layers, or lift a mask when a mask layer is active. "
+        "The panel shows the hole. [ and ] change the size."
+    )
