@@ -1163,8 +1163,92 @@ def test_transform_color_and_mask_panels():
     app.processEvents()
 
 
-def test_close_quits_instead_of_opening_a_canvas():
-    """Close ends the app. A clean picture closes with no dialog and stays as it was."""
+def _menu_action(window, label: str):
+    for action in window.menuBar().actions():
+        menu = action.menu()
+        if menu is None:
+            continue
+        for child in menu.actions():
+            if child.text() == label:
+                return child
+    raise AssertionError(label)
+
+
+def test_close_returns_to_the_startup_page():
+    """Close drops the canvas and shows the startup page. The window stays open."""
+    from PyQt6.QtWidgets import QApplication, QLabel
+
+    from pixedit.session.core import START_HINT
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    assert "return to the start page" in window._close_action.toolTip()
+    # Already on the startup page. Close does not quit.
+    window._close_action.trigger()
+    app.processEvents()
+    assert window.isVisible()
+    assert window.session.document.groups == []
+
+    window.session.new_canvas(17, 19, "white")
+    window.session.path = "/tmp/page.pix"
+    window.session.source_name = "photo.png"
+    document = window.session.document
+    assert not window.session.dirty
+
+    window._close_action.trigger()
+    app.processEvents()
+
+    assert window.isVisible()
+    assert window.session.document is not document
+    assert window.session.document.groups == []
+    assert window.session.path is None
+    assert window.session.source_name is None
+    assert not window.session.dirty
+    assert not window.session.history.can_undo()
+    assert window.windowTitle() == "PixEdit"
+    assert window._status_label.text() == START_HINT
+    title = window.canvas.findChild(QLabel, "welcomeTitle")
+    assert title is not None and title.isVisible() and title.text() == "PixEdit"
+    window.close()
+    app.processEvents()
+
+
+def test_close_discard_clears_unsaved_picture(monkeypatch):
+    """Discard on Close drops the picture and its undo history. The window stays."""
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    from pixedit.ui import main_window as main_window_module
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    window.session.new_canvas(21, 13, "white")
+    window.session.add_blank_layer()
+    assert window.session.dirty
+    assert window.session.history.can_undo()
+
+    def discard(*_args, **_kwargs):
+        return QMessageBox.StandardButton.Discard
+
+    monkeypatch.setattr(main_window_module.QMessageBox, "question", discard)
+    window._close_action.trigger()
+    app.processEvents()
+
+    assert window.isVisible()
+    assert window.session.document.groups == []
+    assert not window.session.dirty
+    assert not window.session.history.can_undo()
+    window.close()
+    app.processEvents()
+
+
+def test_quit_closes_the_window():
+    """Quit still exits. Close is the command that returns to the startup page."""
     from PyQt6.QtWidgets import QApplication
 
     from pixedit.ui.main_window import MainWindow
@@ -1174,16 +1258,46 @@ def test_close_quits_instead_of_opening_a_canvas():
     window.show()
     app.processEvents()
     window.session.new_canvas(17, 19, "white")
-    document = window.session.document
     assert not window.session.dirty
-    assert "Close PixEdit" in window._close_action.toolTip()
-
-    window._close_action.trigger()
+    _menu_action(window, "Quit").trigger()
     app.processEvents()
-
     assert not window.isVisible()
-    assert window.session.document is document
-    assert document.width == 17 and document.height == 19
+
+
+def test_open_and_place_gif_frames_as_pages(tmp_path):
+    """Opening a GIF replaces the document with one page per frame. Place appends those pages."""
+    from PIL import Image
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.main_window import MainWindow
+
+    frames = [Image.new("RGBA", (4, 4), (255, 0, 0, 255)), Image.new("RGBA", (4, 4), (0, 0, 255, 255))]
+    gif = tmp_path / "clip.gif"
+    frames[0].save(gif, save_all=True, append_images=frames[1:], duration=40, disposal=2)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    window.session.dirty = False
+    window.open_path(str(gif))
+    app.processEvents()
+    assert [group.name for group in window.session.document.groups] == ["Page 1", "Page 2"]
+    assert [group.layers[0].name for group in window.session.document.groups] == ["Page 1", "Page 2"]
+    assert window.session.document.groups[0].layers[0].image.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert window.session.document.groups[1].layers[0].image.getpixel((0, 0))[:3] == (0, 0, 255)
+
+    window.session.dirty = False
+    kept = window.session.document.groups[0].id
+    window._place_path(str(gif))
+    app.processEvents()
+    names = [group.name for group in window.session.document.groups]
+    assert names == ["Page 1", "Page 2", "Page 1", "Page 2"]
+    assert window.session.document.groups[0].id == kept
+    assert window.session.document.active_group_id == window.session.document.groups[2].id
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
 
 
 def test_close_cancel_keeps_unsaved_picture(monkeypatch):
@@ -1900,6 +2014,7 @@ def test_clipboard_round_trip_paste_and_feather_outline():
     guide = ShortcutsDialog(window)
     text = guide.layout().itemAt(0).widget().text()
     assert "Ctrl+Shift+C" in text
+    assert "active layer" in text
     assert "Feather" in text
 
     mask = np.zeros((5, 5), np.uint8)
@@ -1911,6 +2026,75 @@ def test_clipboard_round_trip_paste_and_feather_outline():
     assert int(tint[2, 2, 3]) == 70
     assert int(tint[1, 1, 3]) == 220
     assert 0 < int(tint[0, 2, 3]) < 70
+
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
+def test_layer_copy_paste_beats_the_clipboard_until_it_changes():
+    """Ctrl+C / Ctrl+V duplicates the active layer. A later clipboard change wins."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication, QLineEdit
+
+    from pixedit.factory import raster_layer
+    from pixedit.ui.clipboard import copy_image
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    assert window._copy_action.text() == "Copy"
+
+    app.clipboard().setText("xyz")
+    app.processEvents()
+    window.session.new_canvas(20, 20, "white")
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 1, 2)
+    window.session.add_layer(photo)
+    window.canvas.setFocus()
+    app.processEvents()
+    window._copy_shortcut()
+    assert window._layer_paste_armed
+    assert "Photo" in window.statusBar().currentMessage()
+
+    # A text field still receives Ctrl+V, and the layer copy stays armed.
+    edit = QLineEdit(window)
+    edit.show()
+    edit.setFocus(Qt.FocusReason.MouseFocusReason)
+    app.processEvents()
+    layers = len(window.session.document.layers)
+    window._paste_from_clipboard()
+    assert edit.text() == "xyz"
+    assert len(window.session.document.layers) == layers
+    assert window._layer_paste_armed
+    edit.hide()
+    window.canvas.setFocus()
+    app.processEvents()
+
+    window._paste_from_clipboard()
+    pasted = window.session.active_layer()
+    assert pasted.name == "Photo copy"
+    assert pasted.image.size == (4, 4)
+    assert pasted.image.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert (pasted.x, pasted.y) == (1, 2)
+
+    copy_image(Image.new("RGBA", (8, 8), (0, 0, 255, 255)))
+    app.processEvents()
+    assert not window._layer_paste_armed
+    window._paste_from_clipboard()
+    external = window.session.active_layer()
+    assert external.name == "Pasted"
+    assert external.image.size == (8, 8)
+    assert external.image.getpixel((0, 0))[:3] == (0, 0, 255)
+
+    # A marching-ants selection still becomes a new layer on Ctrl+C, with no paste.
+    before = len(window.session.document.layers)
+    window.session.select_all()
+    window._copy_shortcut()
+    assert len(window.session.document.layers) == before + 1
+    assert not window._layer_paste_armed
+    assert window.session.active_layer().name.endswith("copy")
 
     window.session.dirty = False
     window.close()

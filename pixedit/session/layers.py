@@ -37,6 +37,8 @@ from pixedit.model import (
     SetPageTagsCommand,
     SharedGroup,
     TransferLayersCommand,
+    contiguous_mask_span,
+    duplicate_slot,
     layers_leaving,
     mask_target,
     masks_for,
@@ -120,6 +122,87 @@ class LayersMixin:
             if layer is command.copy:
                 self.layer_index = index
                 return
+
+    def copy_active_layer(self) -> bool:
+        """Remember the active layer so a later paste can duplicate it.
+
+        The snapshot is taken now. Painting the original afterwards does not
+        change what paste inserts. This is not an undo step. False means the
+        status line already says why nothing was copied.
+        """
+        if not self.require_page():
+            return False
+        layer = self.active_layer()
+        if layer is None:
+            self.show_message("Choose a layer to copy.")
+            return False
+        self._copied_layer = layer.clone()
+        self._copied_source_id = layer.id
+        self.show_message(f'Copied "{layer.name}". Ctrl+V pastes a duplicate.')
+        return True
+
+    def paste_copied_layer(self) -> bool:
+        """Insert a duplicate of the layer stored by ``copy_active_layer``.
+
+        Flow:
+        1. Stop when no page is open, or when copy has not stored a layer.
+        2. Clone that snapshot. A second paste clones it again, so the copies
+           do not share pixels.
+        3. A picture or text layer is inserted above the active layer. The
+           index moves above a mask run so the new layer does not split a
+           picture from its masks.
+        4. A mask is inserted only when the picture it filters is on this
+           page. The original mask still on the page puts the copy directly
+           above it, which is the same slot Duplicate uses. Otherwise the
+           copy goes at the top of that picture's mask run. A picture that
+           lives on another page is refused, so the mask cannot attach to a
+           different picture.
+
+        One undo step. False means nothing was inserted.
+        """
+        if not self.require_page():
+            return False
+        source = self._copied_layer
+        if source is None:
+            self.show_message("Copy a layer first. Ctrl+C copies the active layer.")
+            return False
+        placed = source.clone()
+        placed.name = f"{source.name} copy"
+        if placed.kind == "redaction":
+            index = self._copied_mask_index(placed)
+            if index is None:
+                self.show_message("That mask's picture is not on this page.")
+                return False
+        else:
+            index = 0 if self.layer_index < 0 else self.layer_index + 1
+            index = slot_above_block(self.document.layers, index)
+        self.add_layer(placed, index, name="Paste")
+        self.show_message(f'Pasted a copy of "{source.name}".')
+        return True
+
+    def _copied_mask_index(self, copied: Layer) -> int | None:
+        """Insert slot for a copied mask, or None when its picture is absent.
+
+        ``copied.target_id`` names the picture. The id is checked on the page
+        on screen only, because each page has its own stack.
+        """
+        layers = self.document.layers
+        target = None
+        if copied.target_id:
+            for layer in layers:
+                if layer.id == copied.target_id and layer.kind in ("raster", "text"):
+                    target = layer
+                    break
+        if target is None:
+            return None
+        source_id = self._copied_source_id
+        for index, layer in enumerate(layers):
+            if layer.id == source_id and layer.kind == "redaction":
+                return duplicate_slot(layers, index)
+        span = contiguous_mask_span(layers, target)
+        if span is None:
+            return None
+        return span[1] + 1
 
     def delete_active(self) -> None:
         """Delete the active layer. A picture takes its masks with it.
@@ -686,9 +769,9 @@ class LayersMixin:
     def place_groups(self, groups: list[LayerGroup], shared_groups: list[SharedGroup] | None = None) -> None:
         """Append each page. Shared groups those pages use are copied too.
 
-        Used when placing a PDF or a project. The new pages are added in the
-        order given, and the first of them is shown. Undo removes every page
-        and group this call added.
+        Used when placing a PDF, a project, or a multi-frame image. The new
+        pages are added in the order given, and the first of them is shown.
+        Undo removes every page and shared group this call added.
         """
         if not self.require_page():
             return

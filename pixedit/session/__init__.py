@@ -75,6 +75,12 @@ class Session(
         self._text_prompter: Callable[[TextInfo | None], TextInfo | None] | None = None
         self._redact_before: RedactionInfo | None = None
         self._text_before: dict | None = None
+        # Ctrl+C snapshot of the active layer. Paste clones it again, so a
+        # second paste is independent and later edits to the original stay
+        # out of the copy. ``_copied_source_id`` is the layer that was copied;
+        # the snapshot itself has a new id.
+        self._copied_layer: Layer | None = None
+        self._copied_source_id: str | None = None
         # Set for the duration of a preview notify. The canvas reads it to
         # repaint one rectangle instead of the whole document.
         self.preview_bounds: tuple[int, int, int, int] | None = None

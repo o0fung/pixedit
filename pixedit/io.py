@@ -113,7 +113,7 @@ def limit_longest_edge(image: Image.Image, max_edge: int | None) -> Image.Image:
 
 
 def load_raster(path: str, max_edge: int | None = None) -> Document:
-    """Load a still image, or each frame of a GIF/TIFF, as its own page.
+    """Load a still image, or each frame of a GIF, animated WebP, or TIFF.
 
     A still is one page and one layer. A multi-frame file is one page per
     frame, every frame visible on its page, and one group tagging all of
@@ -125,6 +125,8 @@ def load_raster(path: str, max_edge: int | None = None) -> Document:
         dpi = image_dpi(source)
         frames: list[Image.Image] = []
         count = getattr(source, "n_frames", 1) or 1
+        # Seek in order. Pillow composites GIF disposal onto the previous
+        # frame only while moving forward, so each copy is a full page.
         for index in range(count):
             source.seek(index)
             frames.append(limit_longest_edge(source.convert("RGBA"), max_edge).copy())

@@ -1,8 +1,9 @@
 """Play and export the frames a document already has.
 
-A document with more than one page plays those pages. A single page whose
-pictures are hidden except one plays those layers: that is how a GIF or
-multi-frame TIFF opens. A normal stack of visible layers is not an animation.
+A document with more than one page plays those pages. That is how a
+multi-frame GIF, animated WebP, TIFF, or a PDF opens. A single page whose
+pictures are hidden except one also plays those layers. A normal stack of
+visible layers is not an animation.
 """
 
 from __future__ import annotations
@@ -106,7 +107,7 @@ def pad_frames(frames: list[Image.Image], labels: list[str]) -> tuple[list[Image
 
 
 def export_animated_gif(document: Document, path: str, delay_ms: int) -> list[str]:
-    """Write one GIF frame per page or hidden frame layer.
+    """Write one GIF frame per page, or per hidden picture on a single page.
 
     Frames that differ in size are padded to the largest size and named in
     the returned notes. A document that is not an animation raises ValueError.
@@ -114,7 +115,7 @@ def export_animated_gif(document: Document, path: str, delay_ms: int) -> list[st
     """
     if frame_kind(document) is None:
         raise ValueError(
-            "Nothing to export. Open a multi-page file, or a GIF whose frames are hidden layers."
+            "Nothing to export. Open a file with more than one page, or hide every picture but one."
         )
     frames, notes = pad_frames(render_frames(document), frame_labels(document))
     if not frames:

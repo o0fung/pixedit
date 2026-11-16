@@ -25,6 +25,21 @@ from pixedit.session import Session
 from pixedit.textutil import render_text
 
 
+def _assert_frame_pages(document, stem: str, first: tuple[int, int, int], second: tuple[int, int, int]) -> None:
+    """A multi-frame import is one page per frame, tagged with one group."""
+    assert [group.name for group in document.groups] == ["Page 1", "Page 2"]
+    assert document.active_group_id == document.groups[0].id
+    assert len(document.shared_groups) == 1
+    assert document.shared_groups[0].name == stem
+    assert document.groups[0].shared_ids == [document.shared_groups[0].id]
+    assert document.groups[1].shared_ids == [document.shared_groups[0].id]
+    assert [group.layers[0].name for group in document.groups] == [f"{stem} 1", f"{stem} 2"]
+    assert all(len(group.layers) == 1 and group.layers[0].visible for group in document.groups)
+    assert len(document.layers) == 1
+    assert document.groups[0].layers[0].image.getpixel((0, 0))[:3] == first
+    assert document.groups[1].layers[0].image.getpixel((0, 0))[:3] == second
+
+
 def test_roundtrip_common_rasters_and_gif_frames(tmp_path: Path):
     image = Image.new("RGBA", (6, 4), (10, 20, 30, 255))
     image.putpixel((1, 1), (9, 8, 7, 255))
@@ -37,21 +52,35 @@ def test_roundtrip_common_rasters_and_gif_frames(tmp_path: Path):
         else:
             saved.save(path)
         doc = load_raster(str(path))
-        assert doc.width >= 1 and len(doc.layers) == 1
+        assert doc.width >= 1 and len(doc.groups) == 1 and len(doc.layers) == 1
+        assert doc.groups[0].name == "Page 1"
+        assert doc.layers[0].name == path.stem
         if suffix != ".jpg":
             assert doc.layers[0].image.getpixel((1, 1))[:3] == (9, 8, 7)
 
     frames = [Image.new("RGBA", (5, 5), (255, 0, 0, 255)), Image.new("RGBA", (5, 5), (0, 0, 255, 255))]
     gif = tmp_path / "anim.gif"
     frames[0].save(gif, save_all=True, append_images=frames[1:], duration=80, disposal=2)
-    animated = load_raster(str(gif))
-    assert len(animated.groups) == 2
-    assert len(animated.shared_groups) == 1
-    assert animated.groups[0].shared_ids == [animated.shared_groups[0].id]
-    assert animated.groups[1].shared_ids == [animated.shared_groups[0].id]
-    assert len(animated.layers) == 1
-    assert animated.layers[0].visible is True
-    assert animated.groups[1].layers[0].visible is True
+    _assert_frame_pages(load_raster(str(gif)), "anim", (255, 0, 0), (0, 0, 255))
+
+    still_gif = tmp_path / "still.gif"
+    frames[0].save(still_gif)
+    still = load_raster(str(still_gif))
+    assert len(still.groups) == 1 and still.layers[0].name == "still"
+
+    webp = tmp_path / "anim.webp"
+    frames[0].save(webp, save_all=True, append_images=frames[1:], duration=80, lossless=True)
+    _assert_frame_pages(load_raster(str(webp)), "anim", (255, 0, 0), (0, 0, 255))
+
+    wide = Image.new("RGBA", (6, 4), (1, 2, 3, 255))
+    tall = Image.new("RGBA", (3, 5), (4, 5, 6, 255))
+    tiff = tmp_path / "pages.tif"
+    wide.save(tiff, save_all=True, append_images=[tall])
+    paged = load_raster(str(tiff))
+    _assert_frame_pages(paged, "pages", (1, 2, 3), (4, 5, 6))
+    assert (paged.groups[0].width, paged.groups[0].height) == (6, 4)
+    assert (paged.groups[1].width, paged.groups[1].height) == (3, 5)
+    assert (paged.width, paged.height) == (6, 4)
 
 
 def test_project_roundtrip_keeps_text_redaction_and_selection(tmp_path: Path):

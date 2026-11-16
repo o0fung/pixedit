@@ -96,6 +96,11 @@ class MainWindow(QMainWindow):
         self.session.add_listener(self._on_session)
         self.session.set_message_handler(self._toast)
         self.session.set_text_prompter(self._prompt_text)
+        # True after Ctrl+C copies a layer, until the system clipboard changes.
+        # Layer copy does not write that clipboard, so the flag is what makes
+        # Ctrl+V paste the layer instead of an older screenshot.
+        self._layer_paste_armed = False
+        QApplication.clipboard().dataChanged.connect(self._disarm_layer_paste)
         self._owned_actions: list[QAction] = []
         self._owned_shortcuts: list[QShortcut] = []
         self.tools: list[Tool] = []
@@ -338,10 +343,10 @@ class MainWindow(QMainWindow):
             file_menu,
             "Close",
             "Close",
-            self.close,
+            self._close_document,
             QKeySequence.StandardKey.Close,
             "close",
-            "Close PixEdit",
+            "Close the canvas and return to the start page",
         )
         self._action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
         self.undo_action = self._action(edit_menu, "Undo", self.session.undo, QKeySequence.StandardKey.Undo)
@@ -357,9 +362,7 @@ class MainWindow(QMainWindow):
         self._cut_action = self._make_action(
             "Cut selection to new layer", self.session.cut_selection_to_layer, QKeySequence("Ctrl+X")
         )
-        self._copy_action = self._make_action(
-            "Copy selection to new layer", self.session.copy_selection_to_layer, QKeySequence("Ctrl+C")
-        )
+        self._copy_action = self._make_action("Copy", self._copy_shortcut, QKeySequence("Ctrl+C"))
         self._deselect_action = self._make_action("Deselect", self.session.deselect, QKeySequence("Ctrl+D"))
         # Shared by Edit, Select, and Layer. The icon is set once on the action.
         self._cut_action.setIcon(icon_named("cut-to-layer"))
@@ -377,9 +380,9 @@ class MainWindow(QMainWindow):
         clear_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
         clear_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         edit_menu.addSeparator()
-        # Ctrl+C stays "copy to a new layer". Clipboard copy is a different
-        # action, so it takes Shift. Paste is the standard key. A focused
-        # text field still receives Ctrl+V.
+        # Ctrl+C copies the active layer, or the marching-ants selection when
+        # one exists. Clipboard copy is a different action, so it takes Shift.
+        # Paste is the standard key. A focused text field still receives Ctrl+V.
         self._action(edit_menu, "Copy to clipboard", self._copy_to_clipboard, QKeySequence("Ctrl+Shift+C"))
         self._action(edit_menu, "Paste", self._paste_from_clipboard, QKeySequence.StandardKey.Paste)
 
@@ -861,6 +864,24 @@ class MainWindow(QMainWindow):
     def _toast(self, text: str) -> None:
         self.statusBar().showMessage(text, 4000)
 
+    def _disarm_layer_paste(self) -> None:
+        """A system-clipboard change wins over the layer copied with Ctrl+C."""
+        self._layer_paste_armed = False
+
+    def _copy_shortcut(self) -> None:
+        """Ctrl+C. A marching-ants selection becomes a new layer immediately.
+
+        Otherwise the active layer is remembered and Ctrl+V pastes it. This
+        does not write the system clipboard, so an older screenshot stays
+        there and does not become the paste. A line edit accepts the shortcut
+        first and still copies its own text.
+        """
+        if self.session.document.selection is not None:
+            self.session.copy_selection_to_layer()
+            return
+        if self.session.copy_active_layer():
+            self._layer_paste_armed = True
+
     def _copy_to_clipboard(self) -> None:
         """Write the selection, or the active layer, to the system clipboard."""
         image = self.session.image_for_clipboard()
@@ -869,15 +890,24 @@ class MainWindow(QMainWindow):
         copy_image(image)
 
     def _paste_from_clipboard(self) -> None:
-        """Paste an image as a new layer, or text when a text field is focused.
+        """Paste text, a copied layer, or an image from the system clipboard.
 
-        The Paste shortcut belongs to this window, so it runs before a line
-        edit sees Ctrl+V. A text field still has to paste text, even when no
-        page is open. Pixel paste needs a page and does not resize that page.
+        Flow:
+        1. A focused text field pastes its own text. The shortcut belongs to
+           this window, so the field would otherwise never see Ctrl+V. This
+           still happens when no page is open.
+        2. A layer copied with Ctrl+C is pasted until the system clipboard
+           changes. Layer copy does not write that clipboard, so an older
+           screenshot does not steal the paste.
+        3. Otherwise an image on the system clipboard becomes a new layer.
+           The page size does not change.
         """
         editor = _focused_text_editor()
         if editor is not None:
             editor.paste()
+            return
+        if self._layer_paste_armed:
+            self.session.paste_copied_layer()
             return
         if not self.session.require_page():
             return
@@ -926,6 +956,20 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Save:
             return self._save()
         return True
+
+    def _close_document(self) -> None:
+        """Clear the canvas and show the startup page. The window stays open.
+
+        Nothing is open, so Close has no page to drop. Unsaved work uses the
+        same Save / Discard / Cancel question as New and Open. Quit, and the
+        window's own close button, still exit.
+        """
+        if not self.session.document.groups:
+            return
+        if not self._confirm_discard():
+            return
+        self._stop_play()
+        self.session.replace_document(empty_document())
 
     def _new(self) -> None:
         if not self._confirm_discard():
@@ -993,7 +1037,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Place failed", f"Could not place {path}\n\n{exc}")
             return
-        if Path(path).suffix.lower() == ".pdf":
+        # A PDF is one page per PDF page, including a single page, and those
+        # pages bring their shared group. A multi-frame GIF, WebP, or TIFF
+        # has that same shape. A still image stays layers on the open page.
+        if Path(path).suffix.lower() == ".pdf" or len(incoming.groups) > 1:
             self.session.place_groups(incoming.groups, incoming.shared_groups)
         else:
             self.session.place_layers(incoming.layers)
@@ -1212,10 +1259,11 @@ class MainWindow(QMainWindow):
     def _drop_paths(self, paths: list[str]) -> None:
         """Place dropped files on the open document.
 
-        An image or PDF lands on the page on screen. A ``.pix`` project is
-        appended as new groups at the end. The document already open stays
-        open, including its save path. With no page yet, the first file
-        opens a document and any further files in that drop are placed on it.
+        A still image lands on the page on screen. A PDF or a multi-frame
+        image is appended as groups, and a ``.pix`` project is appended as
+        groups too. The document already open stays open, including its save
+        path. With no page yet, the first file opens a document and any
+        further files in that drop are placed on it.
         """
         self._stop_play()
         pending = list(paths)
@@ -1249,7 +1297,7 @@ class MainWindow(QMainWindow):
             return
         kind = frame_kind(self.session.document)
         if kind is None:
-            self._toast("Nothing to play. Open a multi-page file, or a GIF whose frames are hidden layers.")
+            self._toast("Nothing to play. Open a file with more than one page, or hide every picture but one.")
             return
         self._playing = True
         self._play_kind = kind

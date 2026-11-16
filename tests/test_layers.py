@@ -1012,3 +1012,117 @@ def test_canvas_restores_zoom_for_each_group():
     assert canvas.offset_y == 18
     canvas.close()
     app.processEvents()
+
+
+def test_copy_and_paste_duplicates_the_active_layer():
+    """Ctrl+C stores the layer. Ctrl+V inserts an independent copy above the current one."""
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(8, 8, "white"))
+    back = raster_layer("Back", Image.new("RGBA", (4, 4), (0, 0, 255, 255)), 0, 0)
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 1, 2)
+    session.add_layer(back)
+    session.add_layer(photo)
+    session.select_layers([back.id, photo.id], active_id=photo.id)
+    session.active_layer().opacity = 0.5
+    session.active_layer().blend_mode = "multiply"
+    steps = len(session.history.undo_stack)
+    assert session.copy_active_layer()
+    assert len(session.history.undo_stack) == steps
+    # Paint after the copy stays on the original. The snapshot already left.
+    photo.image.putpixel((0, 0), (0, 255, 0, 255))
+    assert session.paste_copied_layer()
+    pasted = session.active_layer()
+    assert pasted.name == "Photo copy"
+    assert pasted.image.getpixel((0, 0))[:3] == (255, 0, 0)
+    assert (pasted.x, pasted.y) == (1, 2)
+    assert pasted.opacity == 0.5
+    assert pasted.blend_mode == "multiply"
+    assert pasted.id != photo.id
+    names = [layer.name for layer in session.document.layers]
+    assert names.count("Back copy") == 0
+    # A second paste clones the snapshot again, not the layer just inserted.
+    pasted.image.putpixel((0, 0), (0, 0, 255, 255))
+    assert session.paste_copied_layer()
+    second = session.active_layer()
+    assert second is not pasted
+    assert second.image.getpixel((0, 0))[:3] == (255, 0, 0)
+    session.undo()
+    assert second not in session.document.layers
+    assert pasted in session.document.layers
+
+    # A picture copy sits above that picture's masks, same as Duplicate.
+    mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
+    session.layer_index = session.document.index_of(photo.id)
+    session.add_layer(mask)
+    session.layer_index = session.document.index_of(photo.id)
+    session.copy_active_layer()
+    session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers] == [
+        "Background",
+        "Back",
+        "Photo",
+        "Blur",
+        "Photo copy",
+        "Photo copy",
+    ]
+    blur = session.document.layers[3]
+    assert blur.target_id == photo.id
+
+    # The paste above is the active layer. Copy it, then paste on another page.
+    copied_name = session.active_layer().name
+    session.copy_active_layer()
+    session.add_group()
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers] == ["Background", f"{copied_name} copy"]
+    assert session.active_layer().image.getpixel((0, 0))[:3] == (0, 255, 0)
+
+
+def test_copy_and_paste_keeps_text_editable():
+    from pixedit.factory import text_layer
+    from pixedit.model import TextInfo
+
+    session = Session(new_document(16, 16, "white"))
+    info = TextInfo("Hello", None, "Default", 18, (255, 0, 0, 255))
+    session.add_layer(text_layer("Caption", info, 3, 4))
+    assert session.copy_active_layer()
+    session.active_layer().text.text = "Changed"
+    assert session.paste_copied_layer()
+    pasted = session.active_layer()
+    assert pasted.kind == "text"
+    assert pasted.text is not None
+    assert pasted.text.text == "Hello"
+    assert (pasted.x, pasted.y) == (3, 4)
+    assert pasted.id != session.document.layers[1].id
+
+
+def test_pasted_mask_stays_on_its_picture():
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(8, 8, "white"))
+    messages: list[str] = []
+    session.set_message_handler(messages.append)
+    photo = raster_layer("Photo", Image.new("RGBA", (8, 8), (1, 2, 3, 255)))
+    session.add_layer(photo)
+    mask = redaction_layer("Blur", Image.new("L", (8, 8), 255), "blur", 4, target_id=photo.id)
+    session.add_layer(mask)
+    session.layer_index = session.document.index_of(mask.id)
+    assert session.copy_active_layer()
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Blur", "Blur copy"]
+    assert session.active_layer().kind == "redaction"
+    assert session.active_layer().target_id == photo.id
+
+    session.undo()
+    session.layer_index = session.document.index_of(mask.id)
+    session.delete_active()
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in session.document.layers] == ["Background", "Photo", "Blur copy"]
+    assert session.active_layer().target_id == photo.id
+
+    session.add_group()
+    messages.clear()
+    before = [layer.name for layer in session.document.layers]
+    assert session.paste_copied_layer() is False
+    assert [layer.name for layer in session.document.layers] == before
+    assert any("not on this page" in message for message in messages)
