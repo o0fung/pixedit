@@ -44,6 +44,7 @@ from pixedit.model import (
     masks_for,
     move_stack,
     new_id,
+    pack_layer_block,
     slot_above_block,
 )
 
@@ -498,6 +499,40 @@ class LayersMixin:
         self.commit(ReorderStackCommand(self.document, reordered, shared_id=self._editing_shared_id()))
         self.layer_index = landed
 
+    def move_layer_block(
+        self,
+        requested_ids: list[str],
+        ordered_ids: list[str],
+        active_id: str | None = None,
+    ) -> None:
+        """Move these layers as one block inside the current page or tag.
+
+        ``ordered_ids`` is the back-to-front stack with ``requested_ids``
+        already gathered into one block. A picture takes its masks. One undo
+        step. The requested layers stay selected, and ``active_id`` stays the
+        layer paint, opacity, and blend follow.
+        """
+        if not self.require_page():
+            return
+        stack = self._stack()
+        packed = pack_layer_block(stack, requested_ids, ordered_ids)
+        if packed is None:
+            return
+        if [layer.id for layer in packed] == [layer.id for layer in stack]:
+            return
+        shared_id = self._editing_shared_id()
+        command = ReorderStackCommand(self.document, packed, shared_id=shared_id)
+        command.name = "Reorder layers"
+        self.commit(command)
+        wanted = [layer.id for layer in packed if layer.id in set(requested_ids)]
+        if not wanted:
+            return
+        if shared_id:
+            self.focus_shared(shared_id, wanted, active_id)
+        else:
+            self.select_layers(wanted, active_id)
+        self.notify("change")
+
     def _next_group_name(self) -> str:
         """The next ``Page N``. N starts at the count of pages plus one.
 
@@ -549,7 +584,10 @@ class LayersMixin:
         self.notify("change")
 
     def add_group(self) -> None:
-        """Add a blank page the same pixel size as the one on screen and show it."""
+        """Add a blank page the same pixel size as the one on screen and show it.
+
+        The page starts with no tags. Tag it afterward if it should share a header or footer.
+        """
         if not self.require_page():
             return
         # The new page is what you edit next, not the group that was selected.
@@ -562,7 +600,6 @@ class LayersMixin:
             width=current.width,
             height=current.height,
             layers=[raster_layer("Background", image)],
-            shared_ids=list(current.shared_ids),
         )
         index = self.document.group_index(current.id) + 1
         self.commit(InsertGroupCommand(self.document, group, index))
@@ -703,6 +740,27 @@ class LayersMixin:
             return
         self.commit(SetPageTagsCommand(self.document, updates))
 
+    def _select_transferred(
+        self,
+        leaving: list[Layer],
+        layer_ids: list[str],
+        active_id: str | None,
+        dest_kind: str,
+        dest_id: str,
+    ) -> None:
+        """Keep the dragged layers selected on the page or tag they landed on."""
+        requested = set(layer_ids)
+        chosen = [layer.id for layer in leaving if layer.id in requested]
+        if not chosen:
+            anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
+            chosen = [anchor.id]
+        active = active_id if active_id in set(chosen) else None
+        if dest_kind == "shared":
+            self.focus_shared(dest_id, chosen, active)
+            return
+        self._shared_id = None
+        self.select_layers(chosen, active)
+
     def transfer_layers(
         self,
         layer_ids: list[str],
@@ -711,8 +769,13 @@ class LayersMixin:
         dest_kind: str,
         dest_id: str,
         dest_index: int,
+        active_id: str | None = None,
     ) -> bool:
-        """Move pictures between a page and a group. A mask follows its picture."""
+        """Move pictures between a page and a group. A mask follows its picture.
+
+        The layers named in ``layer_ids`` stay selected. ``active_id`` is the
+        one that was dragged, when it is one of them.
+        """
         source = self.document.group_by_id(source_id) if source_kind == "page" else self.document.shared_by_id(source_id)
         dest = self.document.group_by_id(dest_id) if dest_kind == "page" else self.document.shared_by_id(dest_id)
         if source is None or dest is None or source is dest or not layer_ids:
@@ -731,24 +794,21 @@ class LayersMixin:
                 dest_index,
             )
         )
-        if dest_kind == "shared":
-            anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
-            self.focus_shared(dest_id, [anchor.id], anchor.id)
-        else:
-            self._shared_id = None
-            anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
-            try:
-                self.layer_index = self.document.index_of(anchor.id)
-            except KeyError:
-                self.clamp_index()
+        self._select_transferred(leaving, layer_ids, active_id, dest_kind, dest_id)
         self.notify("change")
         return True
 
-    def move_layers_to_group(self, layer_ids: list[str], dest_group_id: str, dest_index: int) -> bool:
+    def move_layers_to_group(
+        self,
+        layer_ids: list[str],
+        dest_group_id: str,
+        dest_index: int,
+        active_id: str | None = None,
+    ) -> bool:
         """Move pictures onto another page. A mask follows its picture.
 
         Returns false when nothing eligible moved, so the layer list can snap
-        back. The destination page is shown and the moved picture is selected.
+        back. The destination page is shown and the dragged layers stay selected.
         """
         dest = self.document.group_by_id(dest_group_id)
         if dest is None or not layer_ids:
@@ -772,11 +832,7 @@ class LayersMixin:
                 dest_index,
             )
         )
-        anchor = next((layer for layer in leaving if layer.kind != "redaction"), leaving[0])
-        try:
-            self.layer_index = self.document.index_of(anchor.id)
-        except KeyError:
-            self.clamp_index()
+        self._select_transferred(leaving, layer_ids, active_id, "page", dest.id)
         self.notify("change")
         return True
 

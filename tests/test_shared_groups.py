@@ -100,11 +100,14 @@ def test_tag_toggle_flatten_and_round_trip(tmp_path: Path):
     assert composite(session.document).getpixel((0, 0))[:3] == (255, 0, 0)
 
     session.add_group()
-    assert session.document.group.shared_ids == [group.id]
-    assert composite(session.document).getpixel((0, 0))[:3] == (255, 0, 0)
+    assert session.document.group.shared_ids == []
+    assert composite(session.document).getpixel((0, 0))[:3] == (255, 255, 255)
 
     second = session.document.active_group_id
     first = session.document.groups[0].id
+    session.toggle_page_tags(group.id, [second])
+    assert session.document.group.shared_ids == [group.id]
+    assert composite(session.document).getpixel((0, 0))[:3] == (255, 0, 0)
     session.toggle_page_tags(group.id, [second])
     assert group.id not in session.document.group.shared_ids
     assert composite(session.document).getpixel((0, 0))[:3] == (255, 255, 255)
@@ -160,6 +163,12 @@ def test_moving_a_page_layer_into_a_group_shares_it_and_keeps_other_tag_order():
     assert composite(session.document).getpixel((0, 3))[:3] == (0, 0, 255)
     session.add_group()
     second = session.document.active_group_id
+    assert session.document.group.shared_ids == []
+    # The new page starts bare. Give it the first page's tags, in paint order,
+    # so the toggles below can check that an existing tag stays where it was.
+    session.toggle_page_tags(header.id, [second])
+    session.toggle_page_tags(footer.id, [second])
+    assert session.document.group.shared_ids == [header.id, footer.id]
     session.toggle_page_tags(header.id, [second])
     assert session.document.groups[0].shared_ids == [header.id, footer.id]
     assert session.document.group.shared_ids == [footer.id]
@@ -193,10 +202,10 @@ def test_group_and_tag_buttons_add_and_remove_a_tag():
     icons["Page"].click()
     app.processEvents()
     assert len(session.document.groups) == 2
-    assert session.document.group.shared_ids == [group_id]
+    assert session.document.group.shared_ids == []
     icons["Tag pages"].click()
     app.processEvents()
-    assert session.document.group.shared_ids == []
+    assert session.document.group.shared_ids == [group_id]
     assert session.document.groups[0].shared_ids == [group_id]
 
     photo = session.document.groups[0].layers[0]
@@ -227,5 +236,173 @@ def test_group_and_tag_buttons_add_and_remove_a_tag():
     app.processEvents()
     assert all(layer.id != photo.id for layer in session.document.groups[0].layers)
     assert any(layer.id == photo.id for layer in session.document.shared_groups[0].layers)
+    panel.close()
+    app.processEvents()
+
+
+def test_selected_layers_move_between_a_page_and_a_tag_together():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.document.layers[0].name = "Back"
+    mid = raster_layer("Mid", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
+    front = raster_layer("Front", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    session.add_layer(mid)
+    session.add_layer(front)
+    session.add_shared_group()
+    tag_id = session.document.shared_groups[0].id
+    session._shared_id = None
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    page = panel.list.topLevelItem(0)
+    tag = panel.groups.topLevelItem(0)
+    assert page is not None and tag is not None
+    front_row = page.child(0)
+    mid_row = page.child(1)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(front_row)
+    front_row.setSelected(True)
+    mid_row.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_drag_started()
+    assert panel.prepare_cross_drop(panel.list, tag, 0)
+    panel._apply_pending_drop()
+    app.processEvents()
+    tag_layers = session.document.shared_groups[0].layers
+    assert [layer.name for layer in tag_layers] == ["Mid", "Front"]
+    assert [layer.name for layer in session.document.layers] == ["Back"]
+    assert session._shared_id == tag_id
+    assert [layer.name for layer in session.selected_layers()] == ["Mid", "Front"]
+    assert session.active_layer().name == "Front"
+
+    panel._on_drag_started()
+    page = panel.list.topLevelItem(0)
+    assert page is not None
+    assert panel.prepare_cross_drop(panel.groups, page, 0)
+    panel._apply_pending_drop()
+    app.processEvents()
+    assert session.document.shared_groups[0].layers == []
+    assert [layer.name for layer in session.document.layers] == ["Back", "Mid", "Front"]
+    assert session._shared_id is None
+    assert [layer.name for layer in session.selected_layers()] == ["Mid", "Front"]
+    assert session.active_layer().name == "Front"
+    panel.close()
+    app.processEvents()
+
+
+def test_layers_inside_a_tag_drag_as_one_block():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.add_shared_group()
+    session.add_layer(raster_layer("Base", Image.new("RGBA", (4, 4), (0, 0, 255, 255))))
+    session.add_layer(raster_layer("Low", Image.new("RGBA", (4, 4), (255, 0, 0, 255))))
+    session.add_layer(raster_layer("High", Image.new("RGBA", (4, 4), (0, 255, 0, 255))))
+    panel = LayerPanel(session)
+    panel.refresh()
+    tag = panel.groups.topLevelItem(0)
+    assert tag is not None
+    high = tag.child(0)
+    low = tag.child(1)
+    panel.groups.blockSignals(True)
+    panel.groups.clearSelection()
+    panel.groups.setCurrentItem(high)
+    high.setSelected(True)
+    low.setSelected(True)
+    panel.groups.blockSignals(False)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.blockSignals(False)
+    panel._on_drag_started()
+    taken = tag.takeChild(0)
+    assert taken is not None
+    tag.addChild(taken)
+    panel._apply_pending_drop()
+    assert [layer.name for layer in session.document.shared_groups[0].layers] == ["Low", "High", "Base"]
+    assert [layer.name for layer in session.selected_layers()] == ["Low", "High"]
+    assert session.active_layer().name == "High"
+    panel.close()
+
+
+def test_tag_pages_uses_every_highlighted_page_header():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.rename_group(session.document.groups[0].id, "One")
+    session.add_shared_group()
+    tag_id = session.document.shared_groups[0].id
+    session.toggle_page_tags(tag_id, [session.document.groups[0].id])
+    assert session.document.groups[0].shared_ids == []
+    session.add_group()
+    session.rename_group(session.document.active_group_id, "Two")
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    tag = panel.groups.topLevelItem(0)
+    assert tag is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.blockSignals(False)
+    panel.groups.blockSignals(True)
+    panel.groups.clearSelection()
+    panel.groups.setCurrentItem(tag)
+    tag.setSelected(True)
+    panel.groups.blockSignals(False)
+    panel._on_selection()
+    assert panel._tag_group_id == tag_id
+
+    two = panel.list.topLevelItem(1)
+    assert two is not None and two.child(0) is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(two.child(0))
+    two.child(0).setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    assert panel._selected_groups == []
+    panel.tag_selection()
+    assert session.document.groups[0].shared_ids == []
+    assert session.document.groups[1].shared_ids == [tag_id]
+    session.undo()
+    assert session.document.groups[1].shared_ids == []
+
+    one = panel.list.topLevelItem(0)
+    assert one is not None
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    # setCurrentItem clears the other rows, so the headers are selected after it.
+    assert two.child(0) is not None
+    panel.list.setCurrentItem(two.child(0))
+    one.setSelected(True)
+    two.setSelected(True)
+    two.child(0).setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_selection()
+    assert panel._selected_groups == []
+    panel.tag_selection()
+    assert session.document.groups[0].shared_ids == [tag_id]
+    assert session.document.groups[1].shared_ids == [tag_id]
+    panel.refresh()
+    assert panel.list.topLevelItem(0).isSelected()
+    assert panel.list.topLevelItem(1).isSelected()
+    panel.tag_selection()
+    assert session.document.groups[0].shared_ids == []
+    assert session.document.groups[1].shared_ids == []
+    session.undo()
+    assert session.document.groups[0].shared_ids == [tag_id]
+    assert session.document.groups[1].shared_ids == [tag_id]
     panel.close()
     app.processEvents()

@@ -391,6 +391,97 @@ def move_stack(layers: list[Layer], old: int, new: int) -> tuple[list[Layer], in
     return moved, _same_layer(moved, subject)
 
 
+def _mask_block_stays_in_run(layers: list[Layer], ordered: list[Layer], requested: list[Layer]) -> bool:
+    """True when this drag only reorders masks inside one picture's run.
+
+    The picture stays put. ``ordered`` is the stack after the drop, so the
+    run check uses that order. Ownership still comes from the stack before
+    the drop, because a mask's picture does not change just because the
+    rows moved.
+    """
+    if not requested or any(layer.kind != "redaction" for layer in requested):
+        return False
+    owner_ids: list[str] = []
+    for mask in requested:
+        owner = mask_target(layers, mask)
+        if owner is None:
+            return False
+        owner_ids.append(owner.id)
+    if len(set(owner_ids)) != 1:
+        return False
+    owner = next(layer for layer in ordered if layer.id == owner_ids[0])
+    span = contiguous_mask_span(ordered, owner)
+    if span is None:
+        return False
+    start, end = span
+    inside = {ordered[index].id for index in range(start, end + 1)}
+    return all(mask.id in inside for mask in requested)
+
+
+def _drag_block_ids(layers: list[Layer], requested: list[Layer]) -> set[str]:
+    """Requested layers plus the picture or masks that have to travel with them."""
+    moving: set[str] = set()
+    for layer in requested:
+        if layer.kind == "redaction":
+            owner = mask_target(layers, layer)
+            if owner is None:
+                moving.add(layer.id)
+                continue
+            moving.add(owner.id)
+            for mask in masks_for(layers, owner):
+                moving.add(mask.id)
+            continue
+        moving.add(layer.id)
+        if layer.kind in ("raster", "text"):
+            for mask in masks_for(layers, layer):
+                moving.add(mask.id)
+    return moving
+
+
+def pack_layer_block(
+    layers: list[Layer],
+    requested_ids: list[str],
+    ordered_ids: list[str],
+) -> list[Layer] | None:
+    """Stack after a multi-layer drag. Pictures and their masks stay together.
+
+    ``ordered_ids`` is back to front. The requested layers are already one
+    contiguous block, in their previous order. ``None`` means those ids are
+    not this stack, or the requested layers are not one block.
+
+    Flow:
+    1. Masks of one picture that still sit inside that picture's run keep
+       ``ordered_ids``. The picture stays where it is.
+    2. Otherwise each requested picture takes the masks that filter it, and
+       each requested mask takes its picture and that picture's masks.
+    3. The block is rewritten in the old stack order, picture then masks,
+       and inserted where the requested block started.
+    4. That insert is pushed out of any picture/mask run that is staying
+       behind, so the drop cannot split that run.
+    """
+    by_id = {layer.id: layer for layer in layers}
+    if len(ordered_ids) != len(by_id) or set(ordered_ids) != set(by_id):
+        return None
+    requested_set = {layer_id for layer_id in requested_ids if layer_id in by_id}
+    if not requested_set:
+        return None
+    positions = [index for index, layer_id in enumerate(ordered_ids) if layer_id in requested_set]
+    if positions[-1] - positions[0] + 1 != len(positions):
+        return None
+    requested = [by_id[layer_id] for layer_id in ordered_ids if layer_id in requested_set]
+    ordered = [by_id[layer_id] for layer_id in ordered_ids]
+    if _mask_block_stays_in_run(layers, ordered, requested):
+        return ordered
+    moving = _drag_block_ids(layers, requested)
+    block = [layer for layer in layers if layer.id in moving]
+    stationary = [by_id[layer_id] for layer_id in ordered_ids if layer_id not in moving]
+    # Companions that sat behind the requested rows move with the block, so
+    # they do not count as layers the block landed behind.
+    before = sum(1 for layer_id in ordered_ids[: positions[0]] if layer_id not in moving)
+    before = slot_above_block(stationary, before)
+    return stationary[:before] + block + stationary[before:]
+
+
 @dataclass
 class LayerGroup:
     """One page. Its own layers do not composite with any other page.

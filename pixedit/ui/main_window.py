@@ -879,8 +879,11 @@ class MainWindow(QMainWindow):
             page = f"{doc.group.name}  {index} of {len(doc.groups)} · "
         else:
             page = f"{doc.group.name} · "
+        # The active layer is where paint and Ctrl+V land, including when a
+        # page or tag row is the highlighted selection in the list.
         self._status_label.setText(
-            f"{page}{doc.width} × {doc.height} px · {_format_dpi(doc.dpi)} dpi    {x:.0f}, {y:.0f}    {zoom}%    {tool}"
+            f"{page}{_status_target(doc, self.session)}"
+            f"{doc.width} × {doc.height} px · {_format_dpi(doc.dpi)} dpi    {x:.0f}, {y:.0f}    {zoom}%    {tool}"
         )
 
     def _on_cursor(self, x: float, y: float, zoom: float) -> None:
@@ -1569,6 +1572,28 @@ def _tool_separator() -> QFrame:
     line.setFixedHeight(1)
     line.setAccessibleName("Tool group separator")
     return line
+
+
+def _status_line(text: str) -> str:
+    """One status-bar token. A layer or tag name must not add a second line."""
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _status_target(doc, session) -> str:
+    """The layer Ctrl+V will paste onto, after the page name.
+
+    A layer that lives in a tag is ``Tag / Layer``. No active layer leaves
+    this empty, so a page with nothing to paste onto keeps the old readout.
+    """
+    layer = session.active_layer()
+    if layer is None:
+        return ""
+    name = _status_line(layer.name)
+    shared_id = session._shared_id
+    shared = doc.shared_by_id(shared_id) if shared_id else None
+    if shared is not None:
+        return f"{_status_line(shared.name)} / {name} · "
+    return f"{name} · "
 
 
 def _format_dpi(dpi: float) -> str:

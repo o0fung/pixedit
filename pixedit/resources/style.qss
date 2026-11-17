@@ -156,6 +156,17 @@ QListWidget::item:selected {
     color: #f3fbff;
 }
 
+/* The same fill when the list has focus and when the canvas has taken it. */
+QTreeWidget {
+    show-decoration-selected: 1;
+}
+
+QTreeWidget::item:selected,
+QTreeWidget::item:selected:!active {
+    background: #1e4d66;
+    color: #f4fbff;
+}
+
 QSlider::groove:horizontal {
     height: 4px;
     background: #2c3642;

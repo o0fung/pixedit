@@ -381,6 +381,161 @@ def test_row_paint_keeps_the_name_brighter_than_the_caption():
     panel.close()
 
 
+def test_selected_layer_row_shows_the_fill_and_the_bar():
+    """A selected layer is filled and barred. A layer that is not selected is plain."""
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import _SELECT_FILL, _TARGET_BAR, _TARGET_BAR_WIDTH, LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(16, 16, "white"))
+    session.document.layers[0].name = "Back"
+    session.add_blank_layer()
+    session.rename_active("Photo")
+    panel = LayerPanel(session)
+    panel.resize(360, 240)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+    page = panel.list.topLevelItem(0)
+    photo = page.child(0)
+    back = page.child(1)
+    assert photo.text(0).startswith("Photo")
+    assert photo.isSelected()
+    assert not back.isSelected()
+
+    chosen = _chrome_pixels(panel, photo, selected=True)
+    assert _bar_columns(chosen, _TARGET_BAR) == _TARGET_BAR_WIDTH
+    assert _has_color(chosen[:, _TARGET_BAR_WIDTH:], _SELECT_FILL)
+
+    plain = _chrome_pixels(panel, back, selected=False)
+    assert _bar_columns(plain, _TARGET_BAR) == 0
+    assert not _has_color(plain, _SELECT_FILL)
+    panel.close()
+
+
+def test_selected_page_keeps_the_paste_target_visible():
+    """Clicking a page fills that row. The layer Ctrl+V uses keeps the bar only."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QColor
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import (
+        _ITEM_TARGET,
+        _SELECT_FILL,
+        _TARGET_BAR,
+        _TARGET_BAR_WIDTH,
+        LayerPanel,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(16, 16, "white"))
+    session.document.layers[0].name = "Back"
+    session.add_blank_layer()
+    session.rename_active("Photo")
+    panel = LayerPanel(session)
+    panel.resize(360, 280)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+    # The page on the canvas is washed until it is the selected row.
+    assert panel.list.topLevelItem(0).background(0).color() == QColor("#1c3a4a")
+    panel.list.setCurrentItem(panel.list.topLevelItem(0))
+    app.processEvents()
+
+    page = panel.list.topLevelItem(0)
+    photo = page.child(0)
+    back = page.child(1)
+    assert page.isSelected()
+    assert panel._selected_groups == [session.document.active_group_id]
+    assert not photo.isSelected()
+    assert not back.isSelected()
+    assert photo.data(0, _ITEM_TARGET) is True
+    assert not back.data(0, _ITEM_TARGET)
+    # The selection fill replaces the wash, so the two cues do not stack.
+    assert page.background(0).style() == Qt.BrushStyle.NoBrush
+
+    filled = _chrome_pixels(panel, page, selected=True)
+    assert _bar_columns(filled, _TARGET_BAR) == _TARGET_BAR_WIDTH
+    assert _has_color(filled[:, _TARGET_BAR_WIDTH:], _SELECT_FILL)
+
+    target = _chrome_pixels(panel, photo, selected=False)
+    assert _bar_columns(target, _TARGET_BAR) == _TARGET_BAR_WIDTH
+    assert not _has_color(target, _SELECT_FILL)
+
+    other = _chrome_pixels(panel, back, selected=False)
+    assert _bar_columns(other, _TARGET_BAR) == 0
+    assert not _has_color(other, _SELECT_FILL)
+    panel.close()
+
+
+def test_selected_tag_keeps_the_paste_target_visible():
+    """Clicking a tag fills that row. Its active layer keeps the bar only."""
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import (
+        _ITEM_TARGET,
+        _SELECT_FILL,
+        _TARGET_BAR,
+        _TARGET_BAR_WIDTH,
+        LayerPanel,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(16, 16, "white"))
+    session.add_shared_group()
+    session.add_blank_layer()
+    session.rename_active("Footer")
+    panel = LayerPanel(session)
+    panel.resize(360, 420)
+    panel.show()
+    panel.refresh()
+    app.processEvents()
+    panel.groups.setCurrentItem(panel.groups.topLevelItem(0))
+    app.processEvents()
+
+    tag = panel.groups.topLevelItem(0)
+    footer = tag.child(0)
+    assert tag.isSelected()
+    assert panel._selected_shared == [session.document.shared_groups[0].id]
+    assert not footer.isSelected()
+    assert footer.data(0, _ITEM_TARGET) is True
+    assert footer.text(0).startswith("Footer")
+
+    filled = _chrome_pixels(panel, tag, selected=True)
+    assert _bar_columns(filled, _TARGET_BAR) == _TARGET_BAR_WIDTH
+    assert _has_color(filled[:, _TARGET_BAR_WIDTH:], _SELECT_FILL)
+
+    target = _chrome_pixels(panel, footer, selected=False)
+    assert _bar_columns(target, _TARGET_BAR) == _TARGET_BAR_WIDTH
+    assert not _has_color(target, _SELECT_FILL)
+    panel.close()
+
+
+def test_status_names_the_layer_ctrl_v_will_paste():
+    """The status line names the paste target, including when it lives in a tag."""
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    window.session.new_canvas(16, 16, "white")
+    window.session.rename_active("Photo")
+    app.processEvents()
+    assert window._status_label.text().startswith("Page 1 · Photo · 16 × 16")
+    window.session.add_shared_group()
+    window.session.add_blank_layer()
+    window.session.rename_active("Footer")
+    app.processEvents()
+    assert window._status_label.text().startswith("Page 1 · Tag 1 / Footer · 16 × 16")
+    window.session.dirty = False
+    window.close()
+    app.processEvents()
+
+
 def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
     import numpy as np
     from PyQt6.QtGui import QFontMetrics
@@ -406,7 +561,6 @@ def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
     session.add_shared_group()
     assert [group.name for group in session.document.shared_groups] == ["Tag 1", "Tag 2", "Tag 3"]
     session.add_group()
-    session.document.group.shared_ids = []
     panel = LayerPanel(session)
     panel.resize(320, 640)
     panel.show()
@@ -491,6 +645,76 @@ def _row_pixels(panel, item, selected: bool, height: int = 72, point_size: int =
     pixels = np.frombuffer(pointer, np.uint8).reshape((view.height(), row_stride, 4))[:, : view.width(), :3]
     box = text.intersected(QRect(0, 0, view.width(), view.height()))
     return np.array(pixels[box.top() : box.bottom() + 1, box.left() : box.right() + 1], copy=True)
+
+
+def _chrome_pixels(panel, item, selected: bool, height: int = 72, point_size: int = 15):
+    """RGB pixels of the text rectangle the delegate fills.
+
+    The crop clears the display string first, matching ``LayerRowDelegate.paint``,
+    so the bar at the left of that rectangle is column 0.
+    """
+    import numpy as np
+    from PyQt6.QtCore import QRect
+    from PyQt6.QtGui import QColor, QImage, QPainter
+    from PyQt6.QtWidgets import QStyle, QStyleOptionViewItem
+
+    tree = item.treeWidget() or panel.list
+    image = QImage(420, height, QImage.Format.Format_RGB32)
+    image.fill(QColor("#1a1f26"))
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, image.width(), image.height())
+    option.font = panel.font()
+    option.font.setPointSize(point_size)
+    option.widget = tree
+    option.decorationSize = tree.iconSize()
+    option.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Active
+    if selected:
+        option.state |= QStyle.StateFlag.State_Selected
+    index = tree.indexFromItem(item, 0)
+    painter = QPainter(image)
+    tree.itemDelegate().paint(painter, option, index)
+    painter.end()
+    probe = QStyleOptionViewItem(option)
+    tree.itemDelegate().initStyleOption(probe, index)
+    probe.text = ""
+    probe.features &= ~QStyleOptionViewItem.ViewItemFeature.HasDisplay
+    text = tree.style().subElementRect(QStyle.SubElement.SE_ItemViewItemText, probe, tree)
+    view = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    pointer = view.bits()
+    pointer.setsize(view.sizeInBytes())
+    row_stride = view.bytesPerLine() // 4
+    pixels = np.frombuffer(pointer, np.uint8).reshape((view.height(), row_stride, 4))[:, : view.width(), :3]
+    box = text.intersected(QRect(0, 0, view.width(), view.height()))
+    return np.array(pixels[box.top() : box.bottom() + 1, box.left() : box.right() + 1], copy=True)
+
+
+def _column_is(pixels, color, column: int, tolerance: int = 2) -> bool:
+    """True when every pixel in one column is ``color``."""
+    import numpy as np
+
+    if pixels.size == 0 or column < 0 or column >= pixels.shape[1]:
+        return False
+    rgb = pixels[:, column].astype(np.int16)
+    wanted = np.array((color.red(), color.green(), color.blue()), np.int16)
+    return bool(np.max(np.abs(rgb - wanted), axis=-1).max() <= tolerance)
+
+
+def _bar_columns(pixels, color) -> int:
+    """How many columns at the left edge are the paste-target bar."""
+    width = 0
+    while _column_is(pixels, color, width):
+        width += 1
+    return width
+
+
+def _has_color(pixels, color, tolerance: int = 2) -> bool:
+    import numpy as np
+
+    if pixels.size == 0:
+        return False
+    rgb = pixels.astype(np.int16)
+    wanted = np.array((color.red(), color.green(), color.blue()), np.int16)
+    return bool((np.max(np.abs(rgb - wanted), axis=-1) <= tolerance).any())
 
 
 def _nearest_mask(pixels, color, other, tolerance: int = 36):
@@ -975,6 +1199,84 @@ def test_folded_pages_stay_folded_and_drag_as_a_block():
     app.processEvents()
 
 
+def test_arrow_folds_every_selected_page_and_tag():
+    """A triangle on one selected row sets every selected header in that list.
+
+    A row that is not selected still folds alone. Refresh keeps the folded ids.
+    """
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    def header(tree, name: str):
+        for index in range(tree.topLevelItemCount()):
+            row = tree.topLevelItem(index)
+            if row is not None and row.text(0).startswith(name):
+                return row
+        raise AssertionError(name)
+
+    def expanded_names(tree) -> list[str]:
+        names = []
+        for index in range(tree.topLevelItemCount()):
+            row = tree.topLevelItem(index)
+            if row is not None and row.isExpanded():
+                names.append(row.text(0).split()[0])
+        return names
+
+    def select_headers(panel: LayerPanel, tree, names: list[str]) -> None:
+        tree.blockSignals(True)
+        tree.clearSelection()
+        tree.setCurrentItem(header(tree, names[-1]))
+        for name in names:
+            header(tree, name).setSelected(True)
+        tree.blockSignals(False)
+        # _on_selection reads the list that has focus when it is called directly.
+        tree.setFocus(Qt.FocusReason.OtherFocusReason)
+        panel._on_selection()
+        panel.refresh()
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    names = ["A", "B", "C", "D"]
+    session.rename_group(session.document.groups[0].id, names[0])
+    for name in names[1:]:
+        session.add_group()
+        session.rename_group(session.document.active_group_id, name)
+    for name in ("One", "Two", "Three"):
+        session.add_shared_group()
+        session.add_blank_layer()
+        session.rename_shared_group(session.document.shared_groups[-1].id, name)
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+
+    select_headers(panel, panel.list, ["B", "C", "D"])
+    header(panel.list, "B").setExpanded(False)
+    app.processEvents()
+    assert expanded_names(panel.list) == ["A"]
+    panel.refresh()
+    assert expanded_names(panel.list) == ["A"]
+
+    header(panel.list, "C").setExpanded(True)
+    app.processEvents()
+    assert expanded_names(panel.list) == ["A", "B", "C", "D"]
+
+    header(panel.list, "A").setExpanded(False)
+    app.processEvents()
+    assert expanded_names(panel.list) == ["B", "C", "D"]
+
+    select_headers(panel, panel.groups, ["One", "Two"])
+    header(panel.groups, "One").setExpanded(False)
+    app.processEvents()
+    assert expanded_names(panel.groups) == ["Three"]
+    panel.refresh()
+    assert expanded_names(panel.groups) == ["Three"]
+    panel.close()
+    app.processEvents()
+
+
 def test_delete_key_removes_a_selected_open_group():
     from PyQt6.QtCore import QEvent, Qt
     from PyQt6.QtGui import QKeyEvent
@@ -1417,3 +1719,269 @@ def test_pasted_mask_stays_on_its_picture():
     assert session.paste_copied_layer() is False
     assert [layer.name for layer in session.document.layers] == before
     assert any("not on this page" in message for message in messages)
+
+
+def test_move_layer_block_lands_above_below_and_at_the_back():
+    session = Session(new_document(4, 4, "white"))
+    back = session.document.layers[0]
+    back.name = "Back"
+    left = raster_layer("Left", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
+    right = raster_layer("Right", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    target = raster_layer("Target", Image.new("RGBA", (4, 4), (0, 0, 255, 255)))
+    session.add_layer(left)
+    session.add_layer(right)
+    session.add_layer(target)
+    ids = {layer.name: layer.id for layer in session.document.layers}
+    # Left and Right start below Target. The block moves to sit above it.
+    above = [ids["Back"], ids["Target"], ids["Left"], ids["Right"]]
+    session.move_layer_block([ids["Left"], ids["Right"]], above, ids["Right"])
+    assert [layer.name for layer in session.document.layers] == ["Back", "Target", "Left", "Right"]
+    assert session.selected_ids() == [ids["Left"], ids["Right"]]
+    assert session.active_layer().id == ids["Right"]
+    assert session.history.undo_stack[-1].name == "Reorder layers"
+    # Same order again is not a second undo step.
+    depth = len(session.history.undo_stack)
+    session.move_layer_block([ids["Left"], ids["Right"]], above, ids["Right"])
+    assert len(session.history.undo_stack) == depth
+    below = [ids["Back"], ids["Left"], ids["Right"], ids["Target"]]
+    session.move_layer_block([ids["Left"], ids["Right"]], below, ids["Right"])
+    assert [layer.name for layer in session.document.layers] == ["Back", "Left", "Right", "Target"]
+    jumped = [ids["Left"], ids["Right"], ids["Back"], ids["Target"]]
+    session.move_layer_block([ids["Left"], ids["Right"]], jumped, ids["Right"])
+    assert [layer.name for layer in session.document.layers] == ["Left", "Right", "Back", "Target"]
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Back", "Left", "Right", "Target"]
+
+
+def test_pack_layer_block_keeps_masks_with_their_picture():
+    from pixedit.factory import redaction_layer
+    from pixedit.model import pack_layer_block
+
+    session = Session(new_document(4, 4, "white"))
+    other = session.document.layers[0]
+    other.name = "Other"
+    picture = raster_layer("Picture", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    session.add_layer(picture)
+    mask = redaction_layer("Mask", Image.new("L", (4, 4), 255), "solid", 1, target_id=picture.id)
+    friend = raster_layer("Friend", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
+    session.add_layer(mask)
+    session.add_layer(friend)
+    layers = session.document.layers
+    ids = {layer.name: layer.id for layer in layers}
+    # Picture and Friend drop to the back. The unselected mask was left behind them.
+    ordered = [ids["Picture"], ids["Friend"], ids["Other"], ids["Mask"]]
+    packed = pack_layer_block(layers, [ids["Picture"], ids["Friend"]], ordered)
+    assert packed is not None
+    assert [layer.name for layer in packed] == ["Picture", "Mask", "Friend", "Other"]
+
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (0, 0, 255, 255)))
+    session.add_layer(photo)
+    cover = redaction_layer("Cover", Image.new("L", (4, 4), 255), "solid", 1, target_id=photo.id)
+    session.add_layer(cover)
+    layers = session.document.layers
+    ids = {layer.name: layer.id for layer in layers}
+    # A and Friend are not this picture. Landing between Photo and Cover is pushed above the run.
+    # Use Picture's neighbors that are not masks: Other, Picture, Mask, Friend are already there,
+    # plus Photo and Cover. Drop Friend and Other between Photo and Cover.
+    ordered = [
+        ids["Picture"],
+        ids["Mask"],
+        ids["Photo"],
+        ids["Other"],
+        ids["Friend"],
+        ids["Cover"],
+    ]
+    packed = pack_layer_block(layers, [ids["Other"], ids["Friend"]], ordered)
+    assert packed is not None
+    assert [layer.name for layer in packed] == ["Picture", "Mask", "Photo", "Cover", "Other", "Friend"]
+
+
+def test_mask_selection_reorders_inside_the_run_and_takes_the_picture_outside_it():
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(4, 4, "white"))
+    below = session.document.layers[0]
+    below.name = "Below"
+    picture = raster_layer("Picture", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    session.add_layer(picture)
+    masks = [
+        redaction_layer(name, Image.new("L", (4, 4), 255), "solid", 1, target_id=picture.id)
+        for name in ("A", "B", "C")
+    ]
+    for mask in masks:
+        session.add_layer(mask)
+    ids = {layer.name: layer.id for layer in session.document.layers}
+    inside = [ids["Below"], ids["Picture"], ids["C"], ids["A"], ids["B"]]
+    session.move_layer_block([ids["A"], ids["B"]], inside, ids["B"])
+    assert [layer.name for layer in session.document.layers] == ["Below", "Picture", "C", "A", "B"]
+    assert session.selected_ids() == [ids["A"], ids["B"]]
+    assert session.active_layer().id == ids["B"]
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Below", "Picture", "A", "B", "C"]
+    outside = [ids["A"], ids["B"], ids["Below"], ids["Picture"], ids["C"]]
+    session.move_layer_block([ids["A"], ids["B"]], outside, ids["A"])
+    assert [layer.name for layer in session.document.layers] == ["Picture", "A", "B", "C", "Below"]
+    assert session.selected_ids() == [ids["A"], ids["B"]]
+    session.undo()
+    assert [layer.name for layer in session.document.layers] == ["Below", "Picture", "A", "B", "C"]
+
+
+def test_layer_list_drags_a_selection_above_below_and_to_the_back():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.document.layers[0].name = "Back"
+    session.add_layer(raster_layer("Left", Image.new("RGBA", (4, 4), (0, 255, 0, 255))))
+    session.add_layer(raster_layer("Right", Image.new("RGBA", (4, 4), (255, 0, 0, 255))))
+    session.add_layer(raster_layer("Target", Image.new("RGBA", (4, 4), (0, 0, 255, 255))))
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    assert "together" in panel.list.toolTip()
+    panel.refresh()
+    group = panel.list.topLevelItem(0)
+    # Visual order is Target, Right, Left, Back.
+    right = group.child(1)
+    left = group.child(2)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(right)
+    right.setSelected(True)
+    left.setSelected(True)
+    panel.list.blockSignals(False)
+
+    def drag_current_to(index: int) -> None:
+        panel._on_drag_started()
+        assert right_name_selected()
+        header = panel.list.topLevelItem(0)
+        current = panel.list.currentItem()
+        assert current is not None
+        row = header.indexOfChild(current)
+        taken = header.takeChild(row)
+        assert taken is not None
+        if index >= header.childCount():
+            header.addChild(taken)
+        else:
+            header.insertChild(index, taken)
+        panel._apply_pending_drop()
+        app.processEvents()
+
+    def right_name_selected() -> bool:
+        header = panel.list.topLevelItem(0)
+        selected = [
+            header.child(row).text(0).split()[0]
+            for row in range(header.childCount())
+            if header.child(row).isSelected()
+        ]
+        return selected == ["Right", "Left"] or selected == ["Left", "Right"]
+
+    def names() -> list[str]:
+        return [layer.name for layer in session.document.layers]
+
+    # Only the Right row moves in the tree. Left is selected, so it follows, above Target.
+    drag_current_to(0)
+    assert names() == ["Back", "Target", "Left", "Right"]
+    assert session.active_layer().name == "Right"
+    assert [layer.name for layer in session.selected_layers()] == ["Left", "Right"]
+    # Below Target.
+    drag_current_to(2)
+    assert names() == ["Back", "Left", "Right", "Target"]
+    # To the back of the stack.
+    drag_current_to(99)
+    assert names() == ["Left", "Right", "Back", "Target"]
+    assert [layer.name for layer in session.selected_layers()] == ["Left", "Right"]
+    session.undo()
+    assert names() == ["Back", "Left", "Right", "Target"]
+    panel.close()
+    app.processEvents()
+
+
+def test_dragging_one_row_moves_the_rest_of_the_selection_onto_another_page():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.document.layers[0].name = "Back"
+    mid = raster_layer("Mid", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
+    front = raster_layer("Front", Image.new("RGBA", (4, 4), (255, 0, 0, 255)))
+    session.add_layer(mid)
+    session.add_layer(front)
+    first = session.document.groups[0].id
+    session.add_group()
+    session.rename_group(session.document.active_group_id, "Two")
+    session.document.layers[0].name = "Base"
+    session.activate_group(first)
+    panel = LayerPanel(session)
+    panel.show()
+    app.processEvents()
+    panel.refresh()
+    source = panel.list.topLevelItem(0)
+    dest = panel.list.topLevelItem(1)
+    front_row = source.child(0)
+    mid_row = source.child(1)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(front_row)
+    front_row.setSelected(True)
+    mid_row.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_drag_started()
+    assert front_row.isSelected() and mid_row.isSelected()
+    taken = source.takeChild(0)
+    assert taken is not None and dest is not None
+    dest.insertChild(0, taken)
+    panel._apply_pending_drop()
+    app.processEvents()
+    assert [layer.name for layer in session.document.groups[0].layers] == ["Back"]
+    assert [layer.name for layer in session.document.groups[1].layers] == ["Base", "Mid", "Front"]
+    assert session.document.active_group_id == session.document.groups[1].id
+    assert [layer.name for layer in session.selected_layers()] == ["Mid", "Front"]
+    assert session.active_layer().name == "Front"
+    panel.close()
+    app.processEvents()
+
+
+def test_a_mask_selected_without_its_picture_does_not_follow_the_block():
+    from PyQt6.QtWidgets import QApplication
+
+    from pixedit.factory import redaction_layer
+    from pixedit.ui.layers_panel import LayerPanel
+
+    app = QApplication.instance() or QApplication([])
+    session = Session(new_document(4, 4, "white"))
+    session.document.layers[0].name = "Back"
+    photo = raster_layer("Photo", Image.new("RGBA", (4, 4), (0, 0, 255, 255)))
+    session.add_layer(photo)
+    mask = redaction_layer("Mask", Image.new("L", (4, 4), 255), "solid", 1, target_id=photo.id)
+    session.add_layer(mask)
+    other = raster_layer("Other", Image.new("RGBA", (4, 4), (0, 255, 0, 255)))
+    session.add_layer(other)
+    first = session.document.groups[0].id
+    session.add_group()
+    session.activate_group(first)
+    panel = LayerPanel(session)
+    panel.refresh()
+    source = panel.list.topLevelItem(0)
+    dest = panel.list.topLevelItem(1)
+    # Visual order: Other, Mask, Photo, Back.
+    other_row = source.child(0)
+    mask_row = source.child(1)
+    panel.list.blockSignals(True)
+    panel.list.clearSelection()
+    panel.list.setCurrentItem(other_row)
+    other_row.setSelected(True)
+    mask_row.setSelected(True)
+    panel.list.blockSignals(False)
+    panel._on_drag_started()
+    taken = source.takeChild(source.indexOfChild(other_row))
+    assert taken is not None and dest is not None
+    dest.addChild(taken)
+    panel._apply_pending_drop()
+    assert [layer.name for layer in session.document.groups[0].layers] == ["Back", "Photo", "Mask", "Other"]
+    assert [layer.name for layer in session.document.groups[1].layers] == ["Background"]
+    panel.close()

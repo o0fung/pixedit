@@ -77,12 +77,19 @@ def _text_mark_pixmap(pixels: int) -> QPixmap:
 _NAME_COLOR = QColor("#f4fbff")
 _CAPTION_COLOR = QColor("#9aabba")
 _CAPTION_SELECTED = QColor("#d5e4ee")
+# Filled row: Delete and drag. The bar: the layer paint and Ctrl+V use.
+# The fill is distinct from the panel (#1a1f26) and the open-page wash (#1c3a4a).
+_SELECT_FILL = QColor("#1e4d66")
+_TARGET_BAR = QColor("#3ec6ff")
+_TARGET_BAR_WIDTH = 3
 
 _ITEM_ID = Qt.ItemDataRole.UserRole
 _ITEM_KIND = Qt.ItemDataRole.UserRole + 1
 _ITEM_NAME = Qt.ItemDataRole.UserRole + 2
 _ITEM_META = Qt.ItemDataRole.UserRole + 3
 _ITEM_TAGS = Qt.ItemDataRole.UserRole + 4
+# Set on the active layer while a page or tag row owns the highlight.
+_ITEM_TARGET = Qt.ItemDataRole.UserRole + 5
 
 
 def _name_font(base: QFont) -> QFont:
@@ -223,6 +230,23 @@ def _paint_tagged_page(
         )
 
 
+def _row_chrome(painter: QPainter, rect: QRect, selected: bool, target: bool) -> QRect:
+    """Fill a selected row, and bar the layer Ctrl+V will paste onto.
+
+    The fill is the row Delete and drag use. The bar is the paste target.
+    A selected layer is both, so it gets the fill and the bar. When a page
+    or tag row is selected, the active layer stays unselected and gets only
+    the bar. The returned rectangle is the text area to the right of the bar.
+    """
+    if rect.width() <= 0 or rect.height() <= 0 or not (selected or target):
+        return rect
+    if selected:
+        painter.fillRect(rect, _SELECT_FILL)
+    bar_width = min(_TARGET_BAR_WIDTH, rect.width())
+    painter.fillRect(QRect(rect.left(), rect.top(), bar_width, rect.height()), _TARGET_BAR)
+    return rect.adjusted(bar_width, 0, 0, 0)
+
+
 def _tag_names(index) -> list[str]:
     tags = index.data(_ITEM_TAGS)
     if isinstance(tags, str) or tags is None:
@@ -274,9 +298,11 @@ class LayerRowDelegate(QStyledItemDelegate):
         return hint
 
     def paint(self, painter: QPainter, option, index) -> None:
-        # The style draws the checkbox, the icon, and the highlight.
+        # The style draws the checkbox, the icon, and the platform highlight.
         # 1. Clear the display string so that chrome is not also drawn in one color.
-        # 2. Paint the name and the caption in the text rectangle.
+        # 2. Paint our own fill and paste-target bar. They stay put when the
+        #    list loses focus, which is when the platform highlight fades.
+        # 3. Paint the name and the caption to the right of that bar.
         # A selected row keeps the bright name and lightens the caption.
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
@@ -295,11 +321,13 @@ class LayerRowDelegate(QStyledItemDelegate):
         if not isinstance(meta, str):
             meta = ""
         selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        target = bool(index.data(_ITEM_TARGET))
         name_font = _name_font(opt.font)
         meta_font = _caption_font(opt.font)
         meta_color = _CAPTION_SELECTED if selected else _CAPTION_COLOR
         painter.save()
         painter.setClipRect(option.rect)
+        rect = _row_chrome(painter, rect, selected, target)
         tags = _tag_names(index)
         if index.data(_ITEM_KIND) == "layer":
             _paint_stacked(painter, rect, name, meta, name_font, meta_font, _NAME_COLOR, meta_color)
@@ -583,6 +611,9 @@ class LayerPanel(QWidget):
         # Group ids the user folded. Refresh rebuilds the rows, so the arrow
         # state has to be put back or every page opens again.
         self._collapsed: set[str] = set()
+        # True while one arrow is copying its open or folded state onto the
+        # other selected rows. Their setExpanded calls emit this handler again.
+        self._folding = False
         # Page ids highlighted as pages. Empty means the highlight is layers.
         self._selected_groups: list[str] = []
         # Shared group ids highlighted as groups.
@@ -591,6 +622,7 @@ class LayerPanel(QWidget):
         self._tag_group_id: str | None = None
         self._drag_groups: list[str] = []
         self._drag_shared: list[str] = []
+        self._drag_layers: list[str] = []
         self._drag_current: str | None = None
         # Set while a layer is dragged from one list into the other.
         # (layer ids, "page" or "shared", destination id, bottom-to-top index)
@@ -603,10 +635,11 @@ class LayerPanel(QWidget):
         self.list = self._make_tree(
             "Click a page, or a layer in it, to show that page. "
             "Double-click a page or a layer to rename it. "
-            "The arrow folds a page. Shift-click or Command-click folded pages, "
+            "The arrow folds a page. With several pages selected, the arrow folds or opens all of them. "
+            "Shift-click or Command-click folded pages, "
             "then drag them to change the page order. "
             "Drag a layer to restack it, onto another page, or into the Tags list. "
-            "Shift-click selects a range inside one page. "
+            "Shift-click selects a range inside one page, then drag that selection together. "
             "Delete or Backspace removes the highlighted row."
         )
         layout.addWidget(self.list, 3)
@@ -620,6 +653,7 @@ class LayerPanel(QWidget):
         self.groups = self._make_tree(
             "A tag's layers are drawn on every page that has it. "
             "Double-click a tag or a layer to rename it. "
+            "The arrow folds a tag. With several tags selected, the arrow folds or opens all of them. "
             "Drag a layer here from a page, or drag layers to restack them. "
             "Shift-click selects a range inside one tag. "
             "Delete or Backspace removes the highlighted row."
@@ -633,7 +667,7 @@ class LayerPanel(QWidget):
             group_buttons,
             "Page",
             self._page_action(self.session.add_group),
-            "New page. It has its own canvas and does not mix with the other pages.",
+            "New page. It has its own canvas, starts with no tags, and does not mix with the other pages.",
             icon="new",
         )
         self._add_button(
@@ -776,6 +810,18 @@ class LayerPanel(QWidget):
         active = self.session.active_layer()
         active_layer_id = None if active is None else active.id
         chosen = set(self.session.selected_ids())
+        # Drop ids for pages and tags that are gone before the rows are built,
+        # so the open-page wash and the paste-target bar use the same set as
+        # the highlight applied below.
+        page_ids = [group_id for group_id in self._selected_groups if document.group_by_id(group_id) is not None]
+        self._selected_groups = page_ids
+        shared_ids = [group_id for group_id in self._selected_shared if document.shared_by_id(group_id) is not None]
+        self._selected_shared = shared_ids
+        if self._tag_group_id and document.shared_by_id(self._tag_group_id) is None:
+            self._tag_group_id = None
+        # A page or tag row owns the highlight. The active layer is not
+        # selected, but paint and Ctrl+V still use it, so the row is marked.
+        headers_selected = bool(page_ids or shared_ids)
         current_item = None
         rows: list[tuple[QTreeWidgetItem, str, str]] = []
         shared_rows: list[tuple[QTreeWidgetItem, str, str]] = []
@@ -787,7 +833,10 @@ class LayerPanel(QWidget):
                 font = QFont()
                 font.setBold(True)
                 header.setFont(0, font)
-                header.setBackground(0, QBrush(QColor("#1c3a4a")))
+                # The wash marks the page on the canvas. A selected page uses
+                # the selection fill instead, so the wash does not cover it.
+                if group.id not in page_ids:
+                    header.setBackground(0, QBrush(QColor("#1c3a4a")))
             self.list.addTopLevelItem(header)
             for layer in reversed(group.layers):
                 item = self._layer_item(layer, group.layers)
@@ -795,6 +844,8 @@ class LayerPanel(QWidget):
                 rows.append((item, layer.id, group.id))
                 if active_shared_id is None and group.id == active_group_id and layer.id == active_layer_id:
                     current_item = item
+                    if headers_selected:
+                        item.setData(0, _ITEM_TARGET, True)
             header.setExpanded(group.id not in self._collapsed)
         for shared in document.shared_groups:
             tagged = sum(1 for page in document.groups if shared.id in page.shared_ids)
@@ -813,15 +864,11 @@ class LayerPanel(QWidget):
                 shared_rows.append((item, layer.id, shared.id))
                 if shared.id == active_shared_id and layer.id == active_layer_id:
                     current_item = item
+                    if headers_selected:
+                        item.setData(0, _ITEM_TARGET, True)
             header.setExpanded(shared.id not in self._collapsed)
         # setCurrentItem clears every other row. The selection flags are
         # applied after that, or a multi-selection would collapse to one layer.
-        page_ids = [group_id for group_id in self._selected_groups if document.group_by_id(group_id) is not None]
-        self._selected_groups = page_ids
-        shared_ids = [group_id for group_id in self._selected_shared if document.shared_by_id(group_id) is not None]
-        self._selected_shared = shared_ids
-        if self._tag_group_id and document.shared_by_id(self._tag_group_id) is None:
-            self._tag_group_id = None
         if page_ids:
             current_page = active_group_id if active_group_id in page_ids else page_ids[-1]
             self._select_headers(self.list, "group", page_ids, current_page)
@@ -971,41 +1018,78 @@ class LayerPanel(QWidget):
         return QIcon(pixmap)
 
     def _on_group_folded(self, item: QTreeWidgetItem) -> None:
-        if self._building or item.data(0, _ITEM_KIND) not in ("group", "shared"):
+        # A triangle click toggles this row, then this runs.
+        # 1. Remember that row. Refresh rebuilds the list from ``_collapsed``.
+        # 2. If this row is one of several selected pages or tags, give the
+        #    others the same open or folded state. ``_folding`` stops the
+        #    ``setExpanded`` signals from doing that step again.
+        if self._building or self._folding or item.data(0, _ITEM_KIND) not in ("group", "shared"):
             return
         group_id = item.data(0, _ITEM_ID)
         if not isinstance(group_id, str):
             return
-        if item.isExpanded():
+        expanded = item.isExpanded()
+        self._set_folded(group_id, expanded)
+        self._fold_selected_with(item, expanded)
+
+    def _set_folded(self, group_id: str, expanded: bool) -> None:
+        if expanded:
             self._collapsed.discard(group_id)
         else:
             self._collapsed.add(group_id)
+
+    def _fold_selected_with(self, item: QTreeWidgetItem, expanded: bool) -> None:
+        """One selected arrow sets every selected header in that list.
+
+        A row outside the selection changes only itself, matching a checkbox
+        on a layer that is not selected. The clicked row already has the new
+        state. The others are written into ``_collapsed`` before
+        ``setExpanded``, because that call emits this handler and the
+        ``_folding`` guard returns before the usual record step.
+        """
+        if not item.isSelected():
+            return
+        tree = item.treeWidget()
+        if not isinstance(tree, LayerTree):
+            return
+        kind = item.data(0, _ITEM_KIND)
+        selected = [
+            other
+            for other in tree.selectedItems()
+            if other.data(0, _ITEM_KIND) == kind and isinstance(other.data(0, _ITEM_ID), str)
+        ]
+        if len(selected) <= 1:
+            return
+        self._folding = True
+        try:
+            for other in selected:
+                if other is item:
+                    continue
+                self._set_folded(other.data(0, _ITEM_ID), expanded)
+                if other.isExpanded() != expanded:
+                    other.setExpanded(expanded)
+        finally:
+            self._folding = False
 
     def _on_drag_started(self) -> None:
         self._reordering = True
         self._pending_cross = None
         self._drag_groups = []
         self._drag_shared = []
+        self._drag_layers = []
         self._drag_current = None
         tree = self._event_tree()
         selected = tree.selectedItems()
-        # Folded pages are the rows. Several of them move as one block.
-        # A layer multi-selection still drags only the current row, because
-        # restack records one layer move.
+        # Folded pages, folded tags, and a layer multi-selection each move
+        # as one block. The row under the pointer marks where that block lands.
         if selected and all(item.data(0, _ITEM_KIND) == "shared" for item in selected):
             self._drag_shared, self._drag_current = self._drag_block(tree, selected)
             return
         if selected and all(item.data(0, _ITEM_KIND) == "group" for item in selected):
             self._drag_groups, self._drag_current = self._drag_block(tree, selected)
             return
-        current = tree.currentItem()
-        if current is None or len(selected) <= 1:
-            return
-        tree.blockSignals(True)
-        for item in selected:
-            if item is not current:
-                item.setSelected(False)
-        tree.blockSignals(False)
+        if selected and all(item.data(0, _ITEM_KIND) == "layer" for item in selected):
+            self._drag_layers, self._drag_current = self._drag_layer_block(tree, selected)
 
     def _drag_block(self, tree: LayerTree, selected: list[QTreeWidgetItem]) -> tuple[list[str], str | None]:
         chosen = {item.data(0, _ITEM_ID) for item in selected if isinstance(item.data(0, _ITEM_ID), str)}
@@ -1014,6 +1098,27 @@ class LayerPanel(QWidget):
             for index in range(tree.topLevelItemCount())
             if (item := tree.topLevelItem(index)) is not None and item.data(0, _ITEM_ID) in chosen
         ]
+        current = tree.currentItem()
+        current_id = current.data(0, _ITEM_ID) if current is not None else None
+        if current_id not in chosen:
+            current_id = ordered[-1] if ordered else None
+        return ordered, current_id if isinstance(current_id, str) else None
+
+    def _drag_layer_block(self, tree: LayerTree, selected: list[QTreeWidgetItem]) -> tuple[list[str], str | None]:
+        """Selected layer ids in stack order, and the row under the pointer.
+
+        The parent lists the front layer first. Stack order is the reverse,
+        which is the order a block keeps when it lands.
+        """
+        chosen = {item.data(0, _ITEM_ID) for item in selected if isinstance(item.data(0, _ITEM_ID), str)}
+        parent = selected[0].parent()
+        ordered: list[str] = []
+        if parent is not None:
+            for index in range(parent.childCount() - 1, -1, -1):
+                child = parent.child(index)
+                layer_id = child.data(0, _ITEM_ID)
+                if isinstance(layer_id, str) and layer_id in chosen:
+                    ordered.append(layer_id)
         current = tree.currentItem()
         current_id = current.data(0, _ITEM_ID) if current is not None else None
         if current_id not in chosen:
@@ -1070,6 +1175,50 @@ class LayerPanel(QWidget):
             return None
         return pages, shared
 
+    def _apply_stack_drop(self, kind: str, group_id: str, visual_front: list[str]) -> None:
+        """Restack one page or one tag after a drop inside it.
+
+        One dragged layer is a single move, and its masks follow. Two or more
+        keep their old order and land as one block where the dragged row sits.
+        """
+        document = self.session.document
+        if kind == "page":
+            self.session.activate_group(group_id)
+            group = document.group_by_id(group_id)
+        else:
+            group = document.shared_by_id(group_id)
+            if group is None:
+                return
+            # Structural edits follow the focused tag. Passing the dragged ids
+            # keeps that selection when the drop does not change the order.
+            # An empty call would replace it with the front layer.
+            known = {layer.id for layer in group.layers}
+            chosen = [layer_id for layer_id in self._drag_layers if layer_id in known]
+            active = self._drag_current if self._drag_current in known else None
+            if chosen or active:
+                self.session.focus_shared(group_id, chosen, active)
+            else:
+                self.session.focus_shared(group_id)
+        if group is None:
+            return
+        model_ids = [layer.id for layer in group.layers]
+        if len(self._drag_layers) > 1 and isinstance(self._drag_current, str):
+            ordered = place_group_block(
+                model_ids,
+                list(reversed(visual_front)),
+                self._drag_layers,
+                self._drag_current,
+            )
+            if ordered is None or ordered == model_ids:
+                return
+            self.session.move_layer_block(self._drag_layers, ordered, self._drag_current)
+            return
+        move = stack_move(model_ids, visual_front)
+        if move is None:
+            return
+        old_index, new_index = move
+        self.session.move_layer(old_index, new_index)
+
     def prepare_cross_drop(self, source: LayerTree, dest_header: QTreeWidgetItem, child_index: int) -> bool:
         """Remember a layer dragged from one list onto a header in the other.
 
@@ -1096,6 +1245,16 @@ class LayerPanel(QWidget):
         layer_ids = [item.data(0, _ITEM_ID) for item in selected if isinstance(item.data(0, _ITEM_ID), str)]
         if not layer_ids:
             return False
+        # The rows stay selected, but the remembered list is stack order and
+        # still names every layer if the tree selection shrinks during the drag.
+        child_ids: set[str] = set()
+        for index in range(parent.childCount()):
+            child = parent.child(index)
+            child_id = child.data(0, _ITEM_ID)
+            if isinstance(child_id, str):
+                child_ids.add(child_id)
+        if self._drag_layers and set(self._drag_layers) <= child_ids and set(layer_ids) <= set(self._drag_layers):
+            layer_ids = list(self._drag_layers)
         dest_index = max(0, dest_header.childCount() - int(child_index))
         self._pending_cross = (layer_ids, dest_kind, dest_id, dest_index)
         return True
@@ -1119,18 +1278,26 @@ class LayerPanel(QWidget):
         if source_kind is None or source_id is None or source_id == dest_id:
             return
         if source_kind == "page" and dest_kind == "page":
-            self.session.move_layers_to_group(layer_ids, dest_id, dest_index)
+            self.session.move_layers_to_group(layer_ids, dest_id, dest_index, active_id=self._drag_current)
             return
-        self.session.transfer_layers(layer_ids, source_kind, source_id, dest_kind, dest_id, dest_index)
+        self.session.transfer_layers(
+            layer_ids,
+            source_kind,
+            source_id,
+            dest_kind,
+            dest_id,
+            dest_index,
+            active_id=self._drag_current,
+        )
 
     def _apply_pending_drop(self) -> None:
         # One drag does one thing, then the lists are rebuilt from the document.
         # 1. A layer dropped into the other list: that move was recorded at the drop.
         # 2. Page headers reordered, layers unmoved: that becomes the page order.
         # 3. Group headers reordered: catalog order only. Paint order stays on each page.
-        # 4. One layer moved inside its page or its group: restack.
-        # 5. A picture dropped on another page.
-        # A mask dropped without its picture snaps back.
+        # 4. Layers reordered inside one page or one tag: one row, or a block.
+        # 5. A picture dropped on another page or tag. A remembered multi-selection
+        #    follows the dragged row. A mask without its picture snaps back.
         try:
             pending = self._pending_cross
             self._pending_cross = None
@@ -1211,14 +1378,7 @@ class LayerPanel(QWidget):
                     and not shared_reordered
                 ):
                     group_id, visual_front = page_layer_changes[0]
-                    self.session.activate_group(group_id)
-                    group = document.group_by_id(group_id)
-                    if group is None:
-                        return
-                    move = stack_move([layer.id for layer in group.layers], visual_front)
-                    if move is not None:
-                        old_index, new_index = move
-                        self.session.move_layer(old_index, new_index)
+                    self._apply_stack_drop("page", group_id, visual_front)
                     return
                 if (
                     len(shared_layer_changes) == 1
@@ -1227,14 +1387,7 @@ class LayerPanel(QWidget):
                     and not shared_reordered
                 ):
                     group_id, visual_front = shared_layer_changes[0]
-                    group = document.shared_by_id(group_id)
-                    if group is None:
-                        return
-                    self.session.focus_shared(group_id)
-                    move = stack_move([layer.id for layer in group.layers], visual_front)
-                    if move is not None:
-                        old_index, new_index = move
-                        self.session.move_layer(old_index, new_index)
+                    self._apply_stack_drop("shared", group_id, visual_front)
                     return
                 return
             if pages_reordered or shared_reordered or len(page_layer_changes) + len(shared_layer_changes) == 0:
@@ -1254,20 +1407,38 @@ class LayerPanel(QWidget):
             if source_bucket is None:
                 return
             source_layers = source_bucket.layers
-            leaving = layers_leaving(source_layers, moved)
+            # Qt may have moved only the row under the pointer. The layers
+            # remembered at drag start still share that source, so they follow.
+            dragged = list(moved)
+            if (
+                len(self._drag_layers) > 1
+                and self._drag_current in dragged
+                and all(model_owner.get(layer_id) == (source_kind, source_id) for layer_id in self._drag_layers)
+            ):
+                dragged = list(self._drag_layers)
+            leaving = layers_leaving(source_layers, dragged)
             leaving_ids = {layer.id for layer in leaving}
-            if not leaving or not set(moved) <= leaving_ids:
+            if not leaving or not set(dragged) <= leaving_ids:
                 return
             dest_rows = visual_pages if dest_kind == "page" else visual_shared
             dest_visual = next(layer_ids for row_id, layer_ids in dest_rows if row_id == dest_id)
-            index = _drop_index(dest_visual, set(moved))
+            index = _drop_index(dest_visual, set(dragged))
             if source_kind == "page" and dest_kind == "page":
-                self.session.move_layers_to_group(moved, dest_id, index)
+                self.session.move_layers_to_group(dragged, dest_id, index, active_id=self._drag_current)
                 return
-            self.session.transfer_layers(moved, source_kind, source_id, dest_kind, dest_id, index)
+            self.session.transfer_layers(
+                dragged,
+                source_kind,
+                source_id,
+                dest_kind,
+                dest_id,
+                index,
+                active_id=self._drag_current,
+            )
         finally:
             self._drag_groups = []
             self._drag_shared = []
+            self._drag_layers = []
             self._drag_current = None
             self._reordering = False
             # Rebuild from the document so a rejected drop snaps back, and
@@ -1308,7 +1479,13 @@ class LayerPanel(QWidget):
         self.refresh()
 
     def tag_selection(self) -> None:
-        """Tag the selected pages with the selected group, or remove that tag."""
+        """Tag every highlighted page with the chosen tag, or remove that tag.
+
+        Open pages pull their layer rows into a shift-click. Those rows used
+        to hide the page headers from this button, so only the page on screen
+        changed. Headers that are still highlighted are the pages to tag.
+        With no page header highlighted, the page on screen is tagged.
+        """
         shared_id = None
         if self._selected_shared:
             shared_id = self._selected_shared[-1]
@@ -1319,8 +1496,12 @@ class LayerPanel(QWidget):
         if not isinstance(shared_id, str) or self.session.document.shared_by_id(shared_id) is None:
             self.session.show_message("Select a tag, then tag the pages.")
             return
-        page_ids = list(self._selected_groups)
-        if not page_ids and self.session.document.groups:
+        page_ids = self._selected_row_ids(self.list, "group")
+        if page_ids:
+            # The refresh after this edit rebuilds the rows. Remembering the
+            # headers keeps that highlight instead of jumping to one layer.
+            self._selected_groups = list(page_ids)
+        elif self.session.document.groups:
             page_ids = [self.session.document.active_group_id]
         self._tag_group_id = shared_id
         self.session.toggle_page_tags(shared_id, page_ids)
