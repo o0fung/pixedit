@@ -8,7 +8,7 @@ from PIL import Image
 from pixedit.adjust import brightness_contrast, desaturate, hue_saturation, invert, levels
 from pixedit.factory import raster_layer, redaction_layer, text_layer
 from pixedit.geom import hit_layer
-from pixedit.model import Layer, TextInfo, new_document
+from pixedit.model import Document, Layer, LayerGroup, SharedGroup, TextInfo, new_document, new_id
 from pixedit.plugins.examples.basic import MarkerTool, apply_vignette, vignette_image
 from pixedit.plugins.loader import load_plugins, reset_plugins
 from pixedit.session import Session
@@ -145,6 +145,58 @@ def test_text_tool_edits_from_a_click_in_the_box():
     assert edited.id == layer.id
     assert edited.kind == "text"
     assert edited.text is not None and edited.text.text == "Edited"
+
+
+def _two_frames_sharing(layers: list[Layer]) -> tuple[Document, SharedGroup]:
+    """Two pages and one tag, the shape a multi-frame GIF opens as."""
+    shared = SharedGroup(id=new_id(), name="Frames", layers=list(layers))
+    pages = []
+    for index, color in enumerate(((20, 20, 20, 255), (40, 80, 120, 255))):
+        frame = raster_layer(f"Frame {index + 1}", Image.new("RGBA", (200, 200), color))
+        pages.append(
+            LayerGroup(
+                id=new_id(),
+                name=f"Page {index + 1}",
+                width=200,
+                height=200,
+                layers=[frame],
+                shared_ids=[shared.id],
+            )
+        )
+    document = Document(
+        width=200,
+        height=200,
+        groups=pages,
+        active_group_id=pages[0].id,
+        shared_groups=[shared],
+    )
+    return document, shared
+
+
+def test_text_tool_edits_text_that_lives_on_a_tag():
+    layer = text_layer("Greeting", TextInfo("Hello", None, "Default", 28, (0, 0, 0, 255)), 30, 30)
+    document, shared = _two_frames_sharing([layer])
+    session = Session(document)
+    page_id = document.active_group_id
+    px, py = _empty_pixel(layer)
+
+    session.set_text_prompter(lambda _initial: None)
+    TextTool().pointer_down(session, PointerEvent(px, py))
+    assert layer.text is not None and layer.text.text == "Hello"
+    assert session._shared_id == shared.id
+    assert session.active_layer() is layer
+    assert session.document.active_group_id == page_id
+    assert [item.name for item in session.document.layers] == ["Frame 1"]
+    assert [item.name for item in session.document.groups[1].layers] == ["Frame 2"]
+
+    session.set_text_prompter(_accept("Edited"))
+    TextTool().pointer_down(session, PointerEvent(px, py))
+    assert layer.text is not None and layer.text.text == "Edited"
+    assert session.active_layer() is layer
+    assert session._shared_id == shared.id
+    assert session.document.active_group_id == page_id
+    assert [item.name for item in session.document.layers] == ["Frame 1"]
+    assert [item.name for item in session.document.groups[1].layers] == ["Frame 2"]
 
 
 def test_text_tool_adds_when_the_click_misses_every_text_box():

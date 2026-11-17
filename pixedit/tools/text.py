@@ -62,8 +62,9 @@ class TextTool(Tool):
         else:
             # Load this layer into the panel before the word dialog. The dialog
             # keeps that style, so a click does not restyle it from the previous
-            # panel values. Cancel still leaves the layer selected.
-            session.layer_index = session.document.index_of(target.id)
+            # panel values. Cancel still leaves the layer selected. The layer
+            # may live on the page or in a tag; a tag is not in the frame list.
+            session.focus_layer(target)
             session.adopt_text_style(target.text)
             session.notify("change")
             initial = target.text

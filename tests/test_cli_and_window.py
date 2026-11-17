@@ -69,6 +69,8 @@ def test_window_menus_plugins_and_open(tmp_path: Path):
     assert any(label == "Feather…" for label in labels)
     assert "example.marker" in window.tool_by_id
     assert "mask" in window.tool_by_id
+    assert window.current is not None and window.current.id == "hand"
+    assert window._buttons["hand"].isChecked()
     for tool_id, button in window._buttons.items():
         assert not button.icon().isNull(), tool_id
         tool = window.tool_by_id[tool_id]
@@ -575,8 +577,8 @@ def test_file_toolbar_and_tool_groups():
         elif isinstance(widget, QToolButton):
             order.append(widget.text().replace("&&", "&"))
     assert order == [
-        "Transform (V)",
         "Hand (H)",
+        "Transform (V)",
         "Zoom (Z)",
         "Select (S)",
         "|",

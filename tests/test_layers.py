@@ -538,8 +538,9 @@ def test_status_names_the_layer_ctrl_v_will_paste():
 
 def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
     import numpy as np
+    from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QFontMetrics
-    from PyQt6.QtWidgets import QApplication, QLabel, QToolButton
+    from PyQt6.QtWidgets import QApplication, QLabel, QSplitter, QToolButton
 
     from pixedit.ui.icons import icon_named
     from pixedit.ui.layers_panel import (
@@ -567,7 +568,11 @@ def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
     panel.refresh()
     app.processEvents()
 
-    sections = [label.text() for label in panel.findChildren(QLabel) if label.objectName() == "section"]
+    section_labels = [label for label in panel.findChildren(QLabel) if label.objectName() == "section"]
+    sections = [
+        label.text()
+        for label in sorted(section_labels, key=lambda label: label.mapTo(panel, label.rect().topLeft()).y())
+    ]
     assert sections == ["Pages", "Tags"]
     buttons = {button.accessibleName(): button for button in panel.findChildren(QToolButton)}
     row = buttons["Page"].y()
@@ -610,6 +615,38 @@ def test_page_tags_each_get_a_line_and_the_buttons_share_a_row():
     for top, bottom in bands[1:]:
         assert top > previous_bottom
         previous_bottom = bottom
+
+    # The bar only moves space between the two panes. Buttons stay under both.
+    split = panel.findChild(QSplitter, "layerSplit")
+    assert split is not None
+    assert split.orientation() == Qt.Orientation.Vertical
+    assert not split.childrenCollapsible()
+    pages_pane = split.widget(0)
+    tags_pane = split.widget(1)
+    assert pages_pane.objectName() == "layerPane"
+    assert tags_pane.objectName() == "layerPane"
+    assert pages_pane.findChild(QLabel, "section").text() == "Pages"
+    assert tags_pane.findChild(QLabel, "section").text() == "Tags"
+    assert pages_pane.mapTo(panel, pages_pane.rect().bottomLeft()).y() < tags_pane.mapTo(
+        panel, tags_pane.rect().topLeft()
+    ).y()
+    sizes = split.sizes()
+    assert sum(sizes) > 0
+    assert 0.7 <= sizes[0] / sum(sizes) <= 0.8
+    button_y = buttons["Page"].y()
+    assert button_y > split.mapTo(panel, split.rect().bottomLeft()).y()
+    split.moveSplitter(sizes[0] - 48, 1)
+    app.processEvents()
+    moved = split.sizes()
+    assert moved[0] < sizes[0]
+    assert moved[1] > sizes[1]
+    assert abs(sum(moved) - sum(sizes)) <= 1
+    assert buttons["Page"].y() == button_y
+    panel.resize(320, 760)
+    app.processEvents()
+    grown = split.sizes()
+    assert abs(moved[0] / sum(moved) - grown[0] / sum(grown)) < 0.05
+    assert buttons["Page"].y() > split.mapTo(panel, split.rect().bottomLeft()).y()
     panel.close()
 
 
@@ -1719,6 +1756,36 @@ def test_pasted_mask_stays_on_its_picture():
     assert session.paste_copied_layer() is False
     assert [layer.name for layer in session.document.layers] == before
     assert any("not on this page" in message for message in messages)
+
+
+def test_paste_into_a_tag_uses_that_tags_stack():
+    from pixedit.factory import redaction_layer
+
+    session = Session(new_document(16, 16, "white"))
+    stamp = raster_layer("Stamp", Image.new("RGBA", (4, 4), (9, 9, 9, 255)), 1, 1)
+    session.add_layer(stamp)
+    assert session.copy_active_layer()
+
+    session.add_shared_group()
+    shared = session.document.shared_groups[-1]
+    photo = raster_layer("Photo", Image.new("RGBA", (8, 8), (1, 2, 3, 255)))
+    session.add_layer(photo)
+    mask = redaction_layer("Blur", Image.new("L", (16, 16), 255), "blur", 4, target_id=photo.id)
+    session.add_layer(mask)
+    session.focus_shared(shared.id, [photo.id], photo.id)
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in shared.layers] == ["Photo", "Blur", "Stamp copy"]
+    assert [layer.name for layer in session.document.layers] == ["Background", "Stamp"]
+
+    session.focus_shared(shared.id, [mask.id], mask.id)
+    assert session.copy_active_layer()
+    assert session.paste_copied_layer()
+    assert [layer.name for layer in shared.layers] == ["Photo", "Blur", "Blur copy", "Stamp copy"]
+    pasted = session.active_layer()
+    assert pasted is not None and pasted.kind == "redaction"
+    assert pasted.target_id == photo.id
+    assert session._shared_id == shared.id
+    assert [layer.name for layer in session.document.layers] == ["Background", "Stamp"]
 
 
 def test_move_layer_block_lands_above_below_and_at_the_back():

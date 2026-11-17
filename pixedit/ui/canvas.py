@@ -39,6 +39,10 @@ _BOX_HALO = QColor("#0c1014")
 _BOX_ACCENT = QColor("#3ec6ff")
 _BOX_HALO_PX = 3.0
 _BOX_ACCENT_PX = 1.5
+# Screen pixels past a patched bitmap. The rotate handle sits 28 above the
+# box and the corner marks stick out about 6. The picture patch stays the
+# tight rectangle; only the widget redraw grows, which erases the old frame.
+_FRAME_PAD = 40
 _HANDLE_FACE = QColor("#f4fbff")
 _HANDLE_ROTATE = QColor("#ffb020")
 _ANT_LIGHT = QColor("#f4fbff")
@@ -1738,18 +1742,13 @@ class CanvasView(QWidget):
         return True
 
     def _update_region(self, bounds: tuple[int, int, int, int]) -> None:
-        ruler = self.ruler()
-        x0, y0, x1, y1 = bounds
-        left = ruler + self.offset_x + x0 * self.zoom
-        top = ruler + self.offset_y + y0 * self.zoom
-        right = ruler + self.offset_x + x1 * self.zoom
-        bottom = ruler + self.offset_y + y1 * self.zoom
         self.update(
-            QRect(
-                int(math.floor(min(left, right))) - 2,
-                int(math.floor(min(top, bottom))) - 2,
-                int(math.ceil(abs(right - left))) + 4,
-                int(math.ceil(abs(bottom - top))) + 4,
+            frame_update_rect(
+                bounds,
+                ruler=self.ruler(),
+                offset_x=self.offset_x,
+                offset_y=self.offset_y,
+                zoom=self.zoom,
             )
         )
 
@@ -1784,6 +1783,34 @@ class CanvasView(QWidget):
     def _is_hand(self) -> bool:
         tool = self.tool_getter()
         return tool is not None and tool.id == "hand"
+
+
+def frame_update_rect(
+    bounds: tuple[int, int, int, int],
+    *,
+    ruler: float,
+    offset_x: float,
+    offset_y: float,
+    zoom: float,
+    pad: int = _FRAME_PAD,
+) -> QRect:
+    """Widget rectangle covering ``bounds`` and the transform frame around it.
+
+    ``bounds`` is the document box that changed. The frame is drawn on top of
+    the picture, so the screen redraw has to reach the rotate handle and the
+    corner marks or the previous frame stays on screen.
+    """
+    x0, y0, x1, y1 = bounds
+    left = ruler + offset_x + x0 * zoom
+    top = ruler + offset_y + y0 * zoom
+    right = ruler + offset_x + x1 * zoom
+    bottom = ruler + offset_y + y1 * zoom
+    return QRect(
+        int(math.floor(min(left, right))) - pad,
+        int(math.floor(min(top, bottom))) - pad,
+        int(math.ceil(abs(right - left))) + pad * 2,
+        int(math.ceil(abs(bottom - top))) + pad * 2,
+    )
 
 
 def plate_visible_source(

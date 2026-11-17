@@ -245,15 +245,16 @@ class LayersMixin:
         1. Stop when no page is open, or when copy has not stored a layer.
         2. Clone that snapshot. A second paste clones it again, so the copies
            do not share pixels.
-        3. A picture or text layer is inserted above the active layer. The
-           index moves above a mask run so the new layer does not split a
-           picture from its masks.
-        4. A mask is inserted only when the picture it filters is on this
-           page. The original mask still on the page puts the copy directly
+        3. A picture or text layer is inserted above the active layer, in the
+           stack being edited (the page, or the tag). The index moves above a
+           mask run in that stack so the new layer does not split a picture
+           from its masks.
+        4. A mask is inserted only when the picture it filters is in that
+           same stack. The original mask still there puts the copy directly
            above it, which is the same slot Duplicate uses. Otherwise the
            copy goes at the top of that picture's mask run. A picture that
-           lives on another page is refused, so the mask cannot attach to a
-           different picture.
+           lives on another page or tag is refused, so the mask cannot attach
+           to a different picture.
 
         One undo step. False means nothing was inserted.
         """
@@ -276,7 +277,7 @@ class LayersMixin:
                 return False
         else:
             index = 0 if self.layer_index < 0 else self.layer_index + 1
-            index = slot_above_block(self.document.layers, index)
+            index = slot_above_block(self._stack(), index)
         self.add_layer(placed, index, name="Paste")
         self.show_message(f'Pasted a copy of "{source.name}".')
         return True
@@ -407,10 +408,10 @@ class LayersMixin:
     def _copied_mask_index(self, copied: Layer) -> int | None:
         """Insert slot for a copied mask, or None when its picture is absent.
 
-        ``copied.target_id`` names the picture. The id is checked on the page
-        on screen only, because each page has its own stack.
+        ``copied.target_id`` names the picture. The id is checked in the stack
+        being edited: the page on screen, or the tag when one is selected.
         """
-        layers = self.document.layers
+        layers = self._stack()
         target = None
         if copied.target_id:
             for layer in layers:

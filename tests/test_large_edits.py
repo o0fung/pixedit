@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import numpy as np
 from PIL import Image
+from PyQt6.QtCore import QRect
 from PyQt6.QtWidgets import QApplication
 
 from pixedit.adjust import color_grade
 from pixedit.composite import composite, composite_region, redaction_padding
-from pixedit.factory import raster_layer, redaction_layer
+from pixedit.factory import raster_layer, redaction_layer, text_layer
 from pixedit.geom import scale_visual_in_box
 from pixedit.io import limit_longest_edge
-from pixedit.model import Document, new_document, visual_state
+from pixedit.model import Document, TextInfo, new_document, visual_state
 from pixedit.proxy import PREVIEW_MAX_EDGE, preview_scale, rotated_size
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.brush import BrushTool
 from pixedit.tools.shape import ShapeTool
 from pixedit.tools.transform import TransformTool
-from pixedit.ui.canvas import CanvasView
+from pixedit.ui.canvas import CanvasView, frame_update_rect
 from pixedit.ui.dialogs import PdfImportDialog, RasterSizeDialog
 from pixedit.ui.layers_panel import LayerPanel
 
@@ -398,6 +399,108 @@ def test_transform_drag_paints_the_stand_in_without_reflattening(monkeypatch):
     assert canvas.paints > painted
     assert calls["n"] == after_plates
     assert photo.image is _original
+    tool.pointer_cancel(session)
+    canvas.close()
+    app.processEvents()
+
+
+def test_small_text_on_a_large_page_slides_until_release():
+    """A text box is small, but the page is not. The drag slides a full-size plate."""
+    photo = raster_layer("Photo", Image.new("RGBA", (1200, 800), (20, 40, 200, 255)))
+    label = text_layer("Label", TextInfo("Hello", None, "Default", 48, (255, 255, 0, 255)), 40, 50)
+    words = label.image
+    session = Session(Document(1200, 800, [photo, label]))
+    assert session.selected_ids() == [label.id]
+    tool = TransformTool()
+    tool.pointer_down(session, PointerEvent(50, 60))
+    tool.pointer_move(session, PointerEvent(80, 105))
+    proxy = tool.drag_proxy()
+    assert proxy is not None
+    assert proxy.image.size == words.size
+    assert proxy.image.getextrema()[3][1] > 0
+    assert proxy.live_box[0] == 70
+    assert proxy.live_box[1] == 95
+    assert (label.x, label.y) == (40, 50)
+    assert label.image is words
+    assert label.text is not None and label.text.text == "Hello"
+    tool.pointer_up(session, PointerEvent(80, 105))
+    assert tool.drag_proxy() is None
+    assert (label.x, label.y) == (70, 95)
+    assert label.image is words
+    assert label.text is not None and label.text.text == "Hello"
+
+
+def test_masked_text_on_a_large_page_keeps_resampling():
+    """A mask has to follow the real pixels, so the text is moved on each sample."""
+    photo = raster_layer("Photo", Image.new("RGBA", (1200, 800), (20, 40, 200, 255)))
+    label = text_layer("Label", TextInfo("Hi", None, "Default", 32, (255, 255, 255, 255)), 40, 50)
+    mask = Image.new("L", label.image.size, 255)
+    session = Session(
+        Document(
+            1200,
+            800,
+            [photo, label, redaction_layer("Blur", mask, "blur", 2, target_id=label.id)],
+        )
+    )
+    session.select_layers([label.id])
+    tool = TransformTool()
+    tool.pointer_down(session, PointerEvent(50, 60))
+    tool.pointer_move(session, PointerEvent(70, 80))
+    assert tool.drag_proxy() is None
+    assert (label.x, label.y) == (60, 70)
+    tool.pointer_cancel(session)
+    assert (label.x, label.y) == (40, 50)
+
+
+def test_frame_update_covers_the_rotate_handle():
+    """The screen redraw reaches 28 px above the box, and stops short of a full window."""
+    rect = frame_update_rect((100, 80, 180, 120), ruler=0, offset_x=0, offset_y=0, zoom=1)
+    assert rect.contains(140, 80 - 28)
+    assert rect.contains(100 - 6, 80 - 6)
+    assert not rect.contains(140, 80 - 80)
+
+
+def test_live_drag_update_covers_the_rotate_handle():
+    app = QApplication.instance() or QApplication([])
+    layer = raster_layer("Chip", Image.new("RGBA", (40, 20), (255, 0, 0, 255)), 30, 40)
+    session = Session(Document(200, 160, [layer]))
+    tool = TransformTool()
+
+    class RecordingCanvas(CanvasView):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.rects: list[QRect] = []
+
+        def update(self, *args):
+            if len(args) == 1 and isinstance(args[0], QRect):
+                self.rects.append(args[0])
+            super().update(*args)
+
+    canvas = RecordingCanvas(session, lambda: tool, lambda *_args: None)
+    canvas.resize(320, 240)
+
+    def on_note(kind: str) -> None:
+        if kind == "preview":
+            canvas.invalidate(session.preview_bounds)
+
+    session.add_listener(on_note)
+    canvas.show()
+    app.processEvents()
+    canvas.zoom = 1.0
+    canvas.offset_x = 16
+    canvas.offset_y = 20
+    canvas.invalidate()
+    app.processEvents()
+    canvas.rects.clear()
+
+    tool.pointer_down(session, PointerEvent(40, 50))
+    tool.pointer_move(session, PointerEvent(55, 70))
+    app.processEvents()
+    top = canvas.ruler() + canvas.offset_y + 40 * canvas.zoom
+    center_x = int(canvas.ruler() + canvas.offset_x + 50 * canvas.zoom)
+    assert any(rect.contains(center_x, int(top - 28)) for rect in canvas.rects)
+    assert canvas.rects
+    assert all(not rect.contains(center_x, int(top - 80)) for rect in canvas.rects)
     tool.pointer_cancel(session)
     canvas.close()
     app.processEvents()

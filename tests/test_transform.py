@@ -31,7 +31,7 @@ from pixedit.geom import (
     size_from_anchor,
     trim_rect,
 )
-from pixedit.model import Document, TextInfo, new_document, visual_state
+from pixedit.model import Document, LayerGroup, SharedGroup, TextInfo, new_document, new_id, visual_state
 from pixedit.session import Session
 from pixedit.tools.base import PointerEvent
 from pixedit.tools.crop import CropTool
@@ -352,6 +352,44 @@ def test_rotate_drag_keeps_the_frame_size():
     assert abs(released.rect[2] - 10) <= 1 and abs(released.rect[3] - 40) <= 1
 
 
+def test_small_page_move_updates_the_bitmap_before_release():
+    image = Image.new("RGBA", (20, 10), (0, 0, 255, 255))
+    layer = raster_layer("Chip", image, 4, 6)
+    bitmap = layer.image
+    session = Session(Document(80, 60, [layer]))
+    tool = TransformTool()
+    # The center, clear of the corner handles, so this drag moves rather than scales.
+    tool.pointer_down(session, PointerEvent(14, 11))
+    tool.pointer_move(session, PointerEvent(22, 17))
+    assert tool.drag_proxy() is None
+    assert (layer.x, layer.y) == (12, 12)
+    assert layer.image is bitmap
+
+
+def test_live_rotate_keeps_the_widest_frame():
+    """A 45° turn is larger than the start and the later 90° box. Both stay covered."""
+    image = Image.new("RGBA", (80, 72), (255, 0, 0, 255))
+    layer = raster_layer("Tile", image, 100, 80)
+    session = Session(Document(400, 300, [layer]))
+    boxes: list[tuple[int, int, int, int]] = []
+
+    def listen(kind: str) -> None:
+        if kind == "preview" and session.preview_bounds is not None:
+            boxes.append(session.preview_bounds)
+
+    session.add_listener(listen)
+    tool = TransformTool()
+    # The rotate handle is 28 px above the top edge. Center is (140, 116).
+    tool.pointer_down(session, PointerEvent(140, 52))
+    tool.pointer_move(session, PointerEvent(185.25, 70.75))
+    assert boxes
+    mid = boxes[-1]
+    tool.pointer_move(session, PointerEvent(204, 116))
+    last = boxes[-1]
+    assert last[0] <= mid[0] and last[1] <= mid[1]
+    assert last[2] >= mid[2] and last[3] >= mid[3]
+
+
 def test_transform_hover_cursor_follows_the_handle():
     image = Image.new("RGBA", (40, 30), (255, 0, 0, 255))
     layer = raster_layer("A", image, 10, 20)
@@ -511,6 +549,61 @@ def test_clicking_changes_the_layer_selection():
     tool.pointer_down(session, PointerEvent(60, 50, ctrl=True))
     tool.pointer_up(session, PointerEvent(60, 50, ctrl=True))
     assert session.selected_ids() == [left.id]
+
+
+def test_transform_moves_a_layer_that_lives_on_a_tag():
+    stroke = raster_layer("Stroke", Image.new("RGBA", (20, 20), (255, 0, 0, 255)), 12, 16)
+    other = raster_layer("Other", Image.new("RGBA", (20, 20), (0, 255, 0, 255)), 50, 16)
+    shared = SharedGroup(id=new_id(), name="Tag", layers=[stroke, other])
+    pages = []
+    for index, color in enumerate(((10, 10, 10, 255), (30, 30, 30, 255))):
+        frame = raster_layer(f"Frame {index + 1}", Image.new("RGBA", (80, 80), color))
+        pages.append(
+            LayerGroup(
+                id=new_id(),
+                name=f"Page {index + 1}",
+                width=80,
+                height=80,
+                layers=[frame],
+                shared_ids=[shared.id],
+            )
+        )
+    session = Session(
+        Document(
+            width=80,
+            height=80,
+            groups=pages,
+            active_group_id=pages[0].id,
+            shared_groups=[shared],
+        )
+    )
+    session.focus_shared(shared.id, [stroke.id], stroke.id)
+    page_id = session.document.active_group_id
+    frame = session.document.layers[0]
+    tool = TransformTool()
+    # Center of the 20×20 stroke. A corner handle is more than 8px away.
+    tool.pointer_down(session, PointerEvent(22, 26))
+    tool.pointer_up(session, PointerEvent(30, 32))
+    assert (stroke.x, stroke.y) == (20, 22)
+    assert (other.x, other.y) == (50, 16)
+    assert (frame.x, frame.y) == (0, 0)
+    assert session.document.active_group_id == page_id
+    assert session._shared_id == shared.id
+    session.undo()
+    assert (stroke.x, stroke.y) == (12, 16)
+    assert session._shared_id == shared.id
+
+    session.focus_shared(shared.id, [stroke.id], stroke.id)
+    tool.pointer_down(session, PointerEvent(60, 26, shift=True))
+    tool.pointer_up(session, PointerEvent(60, 26, shift=True))
+    assert set(session.selected_ids()) == {stroke.id, other.id}
+    assert session.active_layer() is other
+    assert session._shared_id == shared.id
+    assert (stroke.x, stroke.y) == (12, 16)
+    tool.pointer_down(session, PointerEvent(60, 26, ctrl=True))
+    tool.pointer_up(session, PointerEvent(60, 26, ctrl=True))
+    assert session.selected_ids() == [stroke.id]
+    assert session._shared_id == shared.id
 
 
 def test_scale_dialog_stays_on_the_active_layer():

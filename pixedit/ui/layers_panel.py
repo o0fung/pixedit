@@ -14,11 +14,14 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
+    QSplitter,
     QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
@@ -428,6 +431,14 @@ class LayerTree(QTreeWidget):
         self.setColumnCount(1)
         self.setHeaderHidden(True)
         self.setIndentation(16)
+        # The drag bar between Pages and Tags sizes these lists. A tall hint
+        # would pin that bar, so the floor is one short row and the pane
+        # around the list is what keeps it from being dragged away.
+        self.setMinimumHeight(48)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 48)
 
     def drawBranches(self, painter, rect, index) -> None:
         # A tagged page is several lines tall. Qt would center the arrow on
@@ -627,11 +638,14 @@ class LayerPanel(QWidget):
         # Set while a layer is dragged from one list into the other.
         # (layer ids, "page" or "shared", destination id, bottom-to-top index)
         self._pending_cross: tuple[list[str], str, str, int] | None = None
+        # Pages' share of the list region. A drag replaces this. Resizing the
+        # window puts the same share back and leaves the controls below put.
+        self._pages_share = 0.75
+        self._applied_inner = -1
+        self._applying_split = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        pages_title = QLabel("Pages")
-        pages_title.setObjectName("section")
-        layout.addWidget(pages_title)
+        self._pages_pane = self._list_pane("Pages")
         self.list = self._make_tree(
             "Click a page, or a layer in it, to show that page. "
             "Double-click a page or a layer to rename it. "
@@ -642,14 +656,12 @@ class LayerPanel(QWidget):
             "Shift-click selects a range inside one page, then drag that selection together. "
             "Delete or Backspace removes the highlighted row."
         )
-        layout.addWidget(self.list, 3)
+        self._pages_pane.layout().addWidget(self.list, 1)
 
-        groups_title = QLabel("Tags")
-        groups_title.setObjectName("section")
-        layout.addWidget(groups_title)
+        self._tags_pane = self._list_pane("Tags")
         self._groups_empty = QLabel("No tags yet.")
         self._groups_empty.setObjectName("hint")
-        layout.addWidget(self._groups_empty)
+        self._tags_pane.layout().addWidget(self._groups_empty)
         self.groups = self._make_tree(
             "A tag's layers are drawn on every page that has it. "
             "Double-click a tag or a layer to rename it. "
@@ -661,7 +673,20 @@ class LayerPanel(QWidget):
         self.groups.setMinimumHeight(72)
         # Hidden until a tag exists. The empty line is the list until then.
         self.groups.setVisible(False)
-        layout.addWidget(self.groups, 1)
+        self._tags_pane.layout().addWidget(self.groups, 1)
+
+        # Only these two panes move. The buttons, opacity, and blend stay below.
+        self._lists = QSplitter(Qt.Orientation.Vertical)
+        self._lists.setObjectName("layerSplit")
+        self._lists.setChildrenCollapsible(False)
+        self._lists.setHandleWidth(5)
+        self._lists.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._lists.addWidget(self._pages_pane)
+        self._lists.addWidget(self._tags_pane)
+        self._lists.setStretchFactor(0, 3)
+        self._lists.setStretchFactor(1, 1)
+        self._lists.splitterMoved.connect(self._remember_list_split)
+        layout.addWidget(self._lists, 1)
         group_buttons = QHBoxLayout()
         self._add_button(
             group_buttons,
@@ -709,6 +734,79 @@ class LayerPanel(QWidget):
         self.blend.currentIndexChanged.connect(self._blend_changed)
         layout.addWidget(QLabel("Blend"))
         layout.addWidget(self.blend)
+
+    def _list_pane(self, title: str) -> QFrame:
+        pane = QFrame()
+        pane.setObjectName("layerPane")
+        pane.setMinimumHeight(72)
+        pane.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        pane_layout = QVBoxLayout(pane)
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.setSpacing(4)
+        label = QLabel(title)
+        label.setObjectName("section")
+        pane_layout.addWidget(label)
+        return pane
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_list_split()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_list_split()
+
+    def _apply_list_split(self) -> None:
+        """Keep the Pages/Tags share when the list region changes height.
+
+        1. Skip until the splitter has a real height, and skip when that
+           height is already applied. Dragging the bar does not change it.
+        2. Turn the saved share into pixel sizes. Each pane stays at least
+           its minimum, so neither one can be pushed out of the region.
+        3. Record the height only once those sizes stick. A window resize
+           is a new height and puts the same share back. The buttons below
+           the region are outside this splitter, so they stay put.
+        """
+        if self._applying_split:
+            return
+        available = sum(self._lists.sizes())
+        if available < 80 or available == self._applied_inner:
+            return
+        pages_min = self._pages_pane.minimumSize().height()
+        tags_min = self._tags_pane.minimumSize().height()
+        if pages_min + tags_min >= available:
+            return
+        pages = int(round(available * self._pages_share))
+        pages = max(pages_min, min(pages, available - tags_min))
+        tags = available - pages
+        self._applying_split = True
+        try:
+            self._lists.setSizes([pages, tags])
+            applied = self._lists.sizes()
+            if abs(applied[0] - pages) > 2 or abs(applied[1] - tags) > 2:
+                return
+            self._applied_inner = sum(applied)
+            # Pixel stretch keeps this share if Qt resizes the bar before
+            # the next pass of this method can put the sizes back.
+            self._lists.setStretchFactor(0, max(1, applied[0]))
+            self._lists.setStretchFactor(1, max(1, applied[1]))
+        finally:
+            self._applying_split = False
+
+    def _remember_list_split(self, *_args) -> None:
+        """Store the share left by the drag bar.
+
+        The stretch factors are the pixel sizes, so the next window resize
+        hands out new space in that same share instead of sliding back to
+        the starting three quarters.
+        """
+        sizes = self._lists.sizes()
+        total = sum(sizes)
+        if total <= 0 or sizes[0] <= 0 or sizes[1] <= 0:
+            return
+        self._pages_share = sizes[0] / total
+        self._lists.setStretchFactor(0, sizes[0])
+        self._lists.setStretchFactor(1, sizes[1])
 
     def _page_action(self, callback):
         """Run a layer command only when a page is open."""

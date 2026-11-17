@@ -82,7 +82,7 @@ _PLACE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pd
 
 # Toolbar clusters. Anything not listed (Marker, other plugins) follows in its own group.
 _TOOL_GROUPS = (
-    ("transform", "hand", "zoom", "select"),
+    ("hand", "transform", "zoom", "select"),
     ("brush", "eraser", "fill", "shape", "text"),
     ("color", "crop", "mask"),
 )
@@ -201,7 +201,7 @@ class MainWindow(QMainWindow):
         row.addWidget(splitter)
 
     def _rebuild_tools(self) -> None:
-        current_id = self.current.id if self.current else "transform"
+        current_id = self.current.id if self.current else "hand"
         builtin_ids = {tool.id for tool in builtin_tools()}
         extras = [tool for tool in get_api().tools if tool.id not in builtin_ids]
         self.tools = [*builtin_tools(), *extras]
@@ -214,7 +214,7 @@ class MainWindow(QMainWindow):
         for button in list(self._buttons.values()):
             self._button_group.removeButton(button)
         self._buttons.clear()
-        # Transform/Hand/Zoom/Select, then paint tools, then Image & Eyedrop,
+        # Hand/Transform/Zoom/Select, then paint tools, then Image & Eyedrop,
         # Sizes & Crop, and Mask, then Marker and any other plugins. A line
         # separates groups.
         grouped: list[list[Tool]] = []

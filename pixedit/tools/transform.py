@@ -9,7 +9,6 @@ from pixedit.geom import (
     _orbit_point,
     _place_from_corner,
     clip_box,
-    hit_layer,
     top_layer_at,
     layer_union_bounds,
     placed_box,
@@ -80,11 +79,15 @@ class TransformTool(Tool):
         self._start_angle = 0.0
         self._angle = 0.0
         self._start_box: tuple[float, float, float, float] | None = None
-        # Set for a large picture. The layer itself stays full resolution
-        # until the handle is released.
+        # Set when the drag slides a flatten instead of rewriting the bitmap.
+        # That is a large selection, or a small one on a large page. The
+        # layer itself stays full resolution until the handle is released.
         self._stand_in: DragProxy | None = None
         self._live_box: tuple[float, float, float, float] | None = None
         self._proxy_active = False
+        # Live resamples only. The widest box of this gesture, including a
+        # turn that was larger than both the start and the current angle.
+        self._seen_box: tuple[int, int, int, int] | None = None
 
     def pointer_down(self, session, event: PointerEvent) -> None:
         # The layers already selected are the only ones that move. Where the
@@ -102,25 +105,32 @@ class TransformTool(Tool):
                 return
         if event.ctrl or event.shift:
             top = top_layer_at(session.document, event.x, event.y)
-            if top is not None and not any(item is top for item in session.document.layers):
-                session.focus_layer(top)
-            else:
-                hit = hit_layer(session.document, event.x, event.y)
-                if hit is not None:
-                    self._apply_click_selection(session, hit, event)
+            if top is not None:
+                self._apply_click_selection(session, top, event)
         if not session.selected_layers():
             self._mode = None
             return
         self._begin(session, "move", event)
 
-    def _apply_click_selection(self, session, hit: int, event: PointerEvent) -> None:
+    def _apply_click_selection(self, session, layer: Layer, event: PointerEvent) -> None:
         """Edit the selection from a Shift or Command/Ctrl click.
 
         Shift adds the layer under the pointer. Command or Ctrl toggles it,
         and the last remaining layer stays selected. A plain click never
         reaches here, so it cannot swap in the layer under the pointer.
+
+        Add and toggle stay in the stack being edited, which is the page or
+        one tag. A hit on the other stack switches to that layer. One
+        selection cannot mix a frame layer with a tag layer.
         """
-        layer = session.document.layers[hit]
+        stack = session._stack()
+        if not any(item is layer for item in stack):
+            before = (tuple(session.selected_ids()), session.layer_index, session._editing_shared_id())
+            session.focus_layer(layer)
+            after = (tuple(session.selected_ids()), session.layer_index, session._editing_shared_id())
+            if after != before:
+                session.notify("change")
+            return
         before = (tuple(session.selected_ids()), session.layer_index)
         selected = list(before[0])
         selected_set = set(selected)
@@ -129,14 +139,22 @@ class TransformTool(Tool):
                 remaining = [layer_id for layer_id in selected if layer_id != layer.id]
                 active = session.active_layer()
                 active_id = active.id if active is not None and active.id in remaining else None
-                session.select_layers(remaining, active_id=active_id)
+                self._select_current_stack(session, remaining, active_id)
             elif layer.id not in selected_set:
-                session.select_layers([*selected, layer.id], active_id=layer.id)
+                self._select_current_stack(session, [*selected, layer.id], layer.id)
         elif event.shift:
-            session.select_layers([*selected, layer.id], active_id=layer.id)
+            self._select_current_stack(session, [*selected, layer.id], layer.id)
         after = (tuple(session.selected_ids()), session.layer_index)
         if after != before:
             session.notify("change")
+
+    def _select_current_stack(self, session, layer_ids: list[str], active_id: str | None) -> None:
+        """Select these ids in the page, or in the tag that is being edited."""
+        shared_id = session._editing_shared_id()
+        if shared_id:
+            session.focus_shared(shared_id, layer_ids, active_id)
+            return
+        session.select_layers(layer_ids, active_id=active_id)
 
     def _begin(self, session, mode: str, event: PointerEvent) -> None:
         layers = session.selected_layers()
@@ -158,10 +176,20 @@ class TransformTool(Tool):
             self._start_angle = math.degrees(
                 math.atan2(event.y - (y + height / 2.0), event.x - (x + width / 2.0))
             )
-        # One screen-sized flatten. Move and scale draw it; release resamples.
-        self._stand_in = flatten_for_drag(layers, session._stack(), self._start_box, event.zoom)
+        # One flatten. A large selection is screen-sized. A small selection on
+        # a large page stays full resolution. Move and scale draw it; release
+        # writes the real pixels. A small page resamples on each move instead.
+        doc = session.document
+        self._stand_in = flatten_for_drag(
+            layers,
+            session._stack(),
+            self._start_box,
+            event.zoom,
+            page_edge=max(doc.width, doc.height),
+        )
         self._live_box = self._start_box
         self._proxy_active = False
+        self._seen_box = None
 
     def drag_proxy(self) -> DragProxy | None:
         """The stand-in the canvas draws, or None when this drag resamples."""
@@ -180,7 +208,10 @@ class TransformTool(Tool):
             return
         self._apply(session, event, final=False)
         rows = self._rows(session, self._ids, self._starts, self._origins)
-        session.preview(self._changed_box(session, rows))
+        # Start and current miss a turn's widest frame. Keep every box from
+        # this gesture so the in-between pixels are repainted too.
+        self._seen_box = union_boxes(self._seen_box, self._changed_box(session, rows))
+        session.preview(self._seen_box)
 
     def _changed_box(self, session, rows) -> tuple[int, int, int, int] | None:
         """Document rectangle covering where the layers were and where they are."""
@@ -485,11 +516,13 @@ class TransformTool(Tool):
         starts: list[dict],
         origins: list[tuple[int, int]],
     ) -> list[tuple[Layer, dict, tuple[int, int]]]:
+        # Ids were taken from the stack being edited. A tag layer is not on
+        # the frame, so a page-only lookup would drop the drag on release.
+        by_id = {layer.id: layer for layer in session._stack()}
         rows = []
         for layer_id, start, origin in zip(ids, starts, origins):
-            try:
-                layer = session.document.layer_by_id(layer_id)
-            except KeyError:
+            layer = by_id.get(layer_id)
+            if layer is None:
                 continue
             rows.append((layer, start, origin))
         return rows
@@ -504,3 +537,4 @@ class TransformTool(Tool):
         self._stand_in = None
         self._live_box = None
         self._proxy_active = False
+        self._seen_box = None

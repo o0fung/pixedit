@@ -4,8 +4,9 @@ The stored pixels stay full resolution. A live grade, resample, or gradient
 runs on a screen-sized stand-in when the layer is large, and the release
 computes the real bitmap once. A transform drag flattens the selected layers
 into one of those stand-ins so the canvas can move it without rebuilding the
-document. A picture that already fits on screen is left alone, so a small
-edit stays exact the whole way through.
+document. A small selection on a small page is left alone, so that edit stays
+exact. A small selection on a large page still gets a stand-in: patching a
+growing strip of the photo is what leaves a trail.
 """
 
 from __future__ import annotations
@@ -155,8 +156,10 @@ def set_preview_source(layer, image: Image.Image | None) -> None:
 
 @dataclass
 class DragProxy:
-    """Low-resolution flatten of the layers a transform drag is moving.
+    """Flatten of the layers a transform drag is moving.
 
+    A large selection is reduced to the screen. A small selection on a large
+    page stays full resolution, so the letters are not resampled on each move.
     ``image`` covers ``box`` (x, y, width, height) in document pixels at
     mouse-down. ``live_box`` is where that picture is drawn for a move or a
     scale. Rotation leaves ``live_box`` on ``box`` and sets ``angle`` in
@@ -223,13 +226,17 @@ def flatten_for_drag(
     stack: list,
     box: tuple[float, float, float, float],
     zoom: float,
+    *,
+    page_edge: int = 0,
 ) -> DragProxy | None:
     """Flatten ``layers`` once for a transform drag, or None to keep resampling.
 
-    The stand-in is the union of the selected layers, gaps included, at the
-    on-screen size capped by ``PREVIEW_MAX_EDGE``. None means the pictures
-    already fit that cap, or a mask is in the drag: those keep the per-move
-    resample so the preview and the release stay the same.
+    The stand-in is the union of the selected layers, gaps included. A large
+    selection is capped by ``PREVIEW_MAX_EDGE``. A small selection on a page
+    longer than that cap is kept at full resolution: the canvas slides that
+    plate instead of repainting a growing strip of the photo. None means a
+    small page, or a mask is in the drag. Those keep the per-move resample so
+    the preview and the release stay the same.
     """
     if not layers or box[2] < 1 or box[3] < 1:
         return None
@@ -238,10 +245,18 @@ def flatten_for_drag(
     pixel_w = max(1, int(round(box[2])))
     pixel_h = max(1, int(round(box[3])))
     scale = preview_scale(pixel_w, pixel_h, zoom)
-    if scale >= 1.0:
+    # A small box on a small page is resampled live, so the drag stays exact.
+    # The same box on a large page still needs a plate. Patching the photo on
+    # every move is what leaves the frame behind, and a zoomed-out paste does
+    # not land the letters on the cached pixels.
+    page_large = int(page_edge) > PREVIEW_MAX_EDGE
+    if scale >= 1.0 and not page_large:
         return None
-    small_w = max(1, int(round(box[2] * scale)))
-    small_h = max(1, int(round(box[3] * scale)))
+    if scale >= 1.0:
+        small_w, small_h = pixel_w, pixel_h
+    else:
+        small_w = max(1, int(round(box[2] * scale)))
+        small_h = max(1, int(round(box[3] * scale)))
     import numpy as np
 
     from pixedit.composite import float_to_pil

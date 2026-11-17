@@ -208,6 +208,17 @@ QSplitter::handle {
     background: #2a313a;
 }
 
+/* Pages and Tags only. A 1px line inside the 5px grab strip. */
+QSplitter#layerSplit {
+    background: transparent;
+}
+
+QSplitter#layerSplit::handle {
+    background: #2a313a;
+    height: 1px;
+    margin: 2px 0;
+}
+
 QLabel#hint {
     color: #93a4b3;
 }
